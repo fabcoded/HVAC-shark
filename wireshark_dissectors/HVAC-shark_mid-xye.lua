@@ -1,60 +1,164 @@
--- HVAC Shark Dissector
+-- HVAC Shark Dissector — XYE (RS-485) + Midea UART (SmartKey) protocols
+-- Protocol auto-detection via byte 1 of protocol data:
+--   XYE commands (0xC0-0xCD range) → XYE decoder
+--   UART length  (0x0D-0x40 range) → UART decoder
+-- See: PI HVAC databridge docs/protocol_vs_xye.md section 11
+
 hvac_shark_proto = Proto("HVAC_Shark", "HVAC Shark Protocol")
 
--- Define the fields for the protocol
+-- ── Proto fields ─────────────────────────────────────────────────────────────
 local f = hvac_shark_proto.fields
-f.start_sequence = ProtoField.string("hvac_shark.start_sequence", "Start Sequence")
-f.manufacturer = ProtoField.uint8("hvac_shark.manufacturer", "Manufacturer")
-f.bus_type = ProtoField.uint8("hvac_shark.bus_type", "Bus Type")
-f.reserved = ProtoField.uint8("hvac_shark.reserved", "Reserved")
-f.command_code = ProtoField.uint8("hvac_shark.command_code", "Command Code", base.HEX)
-f.data = ProtoField.bytes("hvac_shark.data", "Data")
-f.command_length = ProtoField.uint8("hvac_shark.command_length", "Command Length")
+-- HVAC_shark header
+f.start_sequence  = ProtoField.string("hvac_shark.start_sequence",  "Start Sequence")
+f.manufacturer    = ProtoField.uint8 ("hvac_shark.manufacturer",    "Manufacturer")
+f.bus_type        = ProtoField.uint8 ("hvac_shark.bus_type",        "Bus Type")
+f.header_version  = ProtoField.uint8 ("hvac_shark.header_version",  "Header Version")
+f.logic_channel   = ProtoField.string("hvac_shark.logic_channel",   "Logic Channel")
+f.circuit_board   = ProtoField.string("hvac_shark.circuit_board",   "Circuit Board")
+f.channel_comment = ProtoField.string("hvac_shark.channel_comment", "Comment")
+-- shared
+f.protocol_type   = ProtoField.string("hvac_shark.protocol_type",   "Protocol")
+f.command_code    = ProtoField.uint8 ("hvac_shark.command_code",    "Command Code", base.HEX)
+f.data            = ProtoField.bytes ("hvac_shark.data",            "Data")
+f.command_length  = ProtoField.uint16("hvac_shark.command_length",  "Frame Length")
+-- UART-specific header fields
+f.uart_length     = ProtoField.uint8 ("hvac_shark.uart.length",     "Length")
+f.uart_appliance  = ProtoField.uint8 ("hvac_shark.uart.appliance",  "Appliance Type", base.HEX)
+f.uart_sync       = ProtoField.uint8 ("hvac_shark.uart.sync",       "Sync Byte", base.HEX)
+f.uart_protocol   = ProtoField.uint8 ("hvac_shark.uart.protocol",   "Protocol Version")
+f.uart_msg_type   = ProtoField.uint8 ("hvac_shark.uart.msg_type",   "Message Type", base.HEX)
 
--- Shared decoder functions
 
--- Define the fan decode function
+-- ── XYE lookup tables ────────────────────────────────────────────────────────
+
+local XYE_COMMANDS = {
+    [0xC0] = "Query",    [0xC3] = "Set",    [0xC4] = "Ext.Query",
+    [0xC6] = "FollowMe", [0xCC] = "Lock",   [0xCD] = "Unlock",
+}
+
 function getFanString(fan)
-    local fan_str = ""
-    if fan == 0x80 then
-        fan_str = "Auto"
-    elseif fan == 0x01 then
-        fan_str = "High"
-    elseif fan == 0x02 then
-        fan_str = "Medium"
-    elseif fan == 0x04 then
-        fan_str = "Low"
-    elseif fan == 0x00 then
-        fan_str = "Off"
-    else
-        fan_str = "Unknown"
-    end
-    return fan_str
+    if fan == 0x80 then return "Auto"
+    elseif fan == 0x01 then return "High"
+    elseif fan == 0x02 then return "Medium"
+    elseif fan == 0x04 then return "Low"
+    elseif fan == 0x00 then return "Off"
+    else return string.format("Unknown (0x%02X)", fan) end
 end
 
 function getOperModeString(oper_mode)
-    local oper_mode_str = ""
-    if oper_mode == 0x00 then
-        oper_mode_str = "Off"
-    elseif oper_mode == 0x80 then
-        oper_mode_str = "Auto"
-    elseif oper_mode == 0x88 then
-        oper_mode_str = "Cool"
-    elseif oper_mode == 0x82 then
-        oper_mode_str = "Dry"
-    elseif oper_mode == 0x84 then
-        oper_mode_str = "Heat"
-    elseif oper_mode == 0x81 then
-        oper_mode_str = "Fan"
-    else
-        oper_mode_str = "Unknown"
-    end
-    return oper_mode_str
+    if oper_mode == 0x00 then return "Off"
+    elseif oper_mode == 0x80 then return "Auto"
+    elseif oper_mode == 0x88 then return "Cool"
+    elseif oper_mode == 0x82 then return "Dry"
+    elseif oper_mode == 0x84 then return "Heat"
+    elseif oper_mode == 0x81 then return "Fan"
+    else return string.format("Unknown (0x%02X)", oper_mode) end
 end
 
 
--- Calculate and validate CRC
--- Data is summarized up to the last byte before the CRC-field, as well as the following byte after the crc-field
+-- ── UART lookup tables ───────────────────────────────────────────────────────
+
+local UART_MSG_TYPES = {
+    [0x02] = "Command",  [0x03] = "Response/Notification",
+    [0x04] = "Network",  [0x05] = "Handshake/ACK",
+    [0x07] = "Device ID", [0x63] = "Network Status Request",
+}
+
+local UART_COMMAND_IDS = {
+    [0x40] = "Set Status",   [0x41] = "Query",
+    [0xB5] = "Capabilities", [0xC0] = "Status Response",
+    [0xC1] = "Power Response",
+}
+
+local function getUartModeString(mode_bits)
+    if mode_bits == 1 then return "Auto"
+    elseif mode_bits == 2 then return "Cool"
+    elseif mode_bits == 3 then return "Dry"
+    elseif mode_bits == 4 then return "Heat"
+    elseif mode_bits == 5 then return "Fan Only"
+    else return string.format("Unknown (%d)", mode_bits) end
+end
+
+local function getUartFanString(fan)
+    if fan == 102 then return "Auto"
+    elseif fan == 100 then return "Turbo"
+    elseif fan == 80 then return "High"
+    elseif fan == 60 then return "Medium"
+    elseif fan == 40 then return "Low"
+    elseif fan == 20 then return "Silent"
+    elseif fan == 30 then return "Low (variant)"     -- hardware variant per dudanov
+    elseif fan == 50 then return "Medium (variant)"   -- hardware variant per dudanov
+    else return string.format("Unknown (%d)", fan) end
+end
+
+local function getUartSwingString(nibble)
+    if nibble == 0x00 then return "Off"
+    elseif nibble == 0x03 then return "Horizontal"
+    elseif nibble == 0x0C then return "Vertical"
+    elseif nibble == 0x0F then return "Both"
+    else return string.format("0x%02X", nibble) end
+end
+
+
+-- ── CRC-8/854 lookup table (from PI HVAC databridge / all Midea UART sources) ──
+
+local CRC8_TABLE = {
+    0x00, 0x5E, 0xBC, 0xE2, 0x61, 0x3F, 0xDD, 0x83,
+    0xC2, 0x9C, 0x7E, 0x20, 0xA3, 0xFD, 0x1F, 0x41,
+    0x9D, 0xC3, 0x21, 0x7F, 0xFC, 0xA2, 0x40, 0x1E,
+    0x5F, 0x01, 0xE3, 0xBD, 0x3E, 0x60, 0x82, 0xDC,
+    0x23, 0x7D, 0x9F, 0xC1, 0x42, 0x1C, 0xFE, 0xA0,
+    0xE1, 0xBF, 0x5D, 0x03, 0x80, 0xDE, 0x3C, 0x62,
+    0xBE, 0xE0, 0x02, 0x5C, 0xDF, 0x81, 0x63, 0x3D,
+    0x7C, 0x22, 0xC0, 0x9E, 0x1D, 0x43, 0xA1, 0xFF,
+    0x46, 0x18, 0xFA, 0xA4, 0x27, 0x79, 0x9B, 0xC5,
+    0x84, 0xDA, 0x38, 0x66, 0xE5, 0xBB, 0x59, 0x07,
+    0xDB, 0x85, 0x67, 0x39, 0xBA, 0xE4, 0x06, 0x58,
+    0x19, 0x47, 0xA5, 0xFB, 0x78, 0x26, 0xC4, 0x9A,
+    0x65, 0x3B, 0xD9, 0x87, 0x04, 0x5A, 0xB8, 0xE6,
+    0xA7, 0xF9, 0x1B, 0x45, 0xC6, 0x98, 0x7A, 0x24,
+    0xF8, 0xA6, 0x44, 0x1A, 0x99, 0xC7, 0x25, 0x7B,
+    0x3A, 0x64, 0x86, 0xD8, 0x5B, 0x05, 0xE7, 0xB9,
+    0x8C, 0xD2, 0x30, 0x6E, 0xED, 0xB3, 0x51, 0x0F,
+    0x4E, 0x10, 0xF2, 0xAC, 0x2F, 0x71, 0x93, 0xCD,
+    0x11, 0x4F, 0xAD, 0xF3, 0x70, 0x2E, 0xCC, 0x92,
+    0xD3, 0x8D, 0x6F, 0x31, 0xB2, 0xEC, 0x0E, 0x50,
+    0xAF, 0xF1, 0x13, 0x4D, 0xCE, 0x90, 0x72, 0x2C,
+    0x6D, 0x33, 0xD1, 0x8F, 0x0C, 0x52, 0xB0, 0xEE,
+    0x32, 0x6C, 0x8E, 0xD0, 0x53, 0x0D, 0xEF, 0xB1,
+    0xF0, 0xAE, 0x4C, 0x12, 0x91, 0xCF, 0x2D, 0x73,
+    0xCA, 0x94, 0x76, 0x28, 0xAB, 0xF5, 0x17, 0x49,
+    0x08, 0x56, 0xB4, 0xEA, 0x69, 0x37, 0xD5, 0x8B,
+    0x57, 0x09, 0xEB, 0xB5, 0x36, 0x68, 0x8A, 0xD4,
+    0x95, 0xCB, 0x29, 0x77, 0xF4, 0xAA, 0x48, 0x16,
+    0xE9, 0xB7, 0x55, 0x0B, 0x88, 0xD6, 0x34, 0x6A,
+    0x2B, 0x75, 0x97, 0xC9, 0x4A, 0x14, 0xF6, 0xA8,
+    0x74, 0x2A, 0xC8, 0x96, 0x15, 0x4B, 0xA9, 0xF7,
+    0xB6, 0xE8, 0x0A, 0x54, 0xD7, 0x89, 0x6B, 0x35,
+}
+
+local function uart_crc8(buf, offset, length)
+    -- CRC-8/854 over body bytes (frame[10..N-3])
+    local crc = 0
+    for i = 0, length - 1 do
+        -- Lua table is 1-indexed, CRC8_TABLE[0] → CRC8_TABLE[1]
+        crc = CRC8_TABLE[bit.bxor(crc, buf(offset + i, 1):uint()) + 1]
+    end
+    return crc
+end
+
+local function uart_checksum(buf, from_offset, to_offset)
+    -- Additive checksum: (256 - sum(frame[1..N-2])) & 0xFF
+    local s = 0
+    for i = from_offset, to_offset do
+        s = s + buf(i, 1):uint()
+    end
+    return bit.band(256 - s, 0xFF)
+end
+
+
+-- ── XYE CRC (two's complement sum) ──────────────────────────────────────────
+
 local function validate_crc(crc_input_data, length)
     local sum = 0
     for i = 0, length - 3 do
@@ -64,591 +168,578 @@ local function validate_crc(crc_input_data, length)
     return 255 - (sum % 256)
 end
 
--- Define the dissector function
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- ── UART BODY DECODERS ──────────────────────────────────────────────────────
+-- ══════════════════════════════════════════════════════════════════════════════
+
+local function decode_uart_c0_status(body_tree, buf, body_off, body_len)
+    -- C0 Status Response (body[0] = 0xC0)
+    -- Reference: PI HVAC databridge docs/protocol_uart.md section 6
+
+    body_tree:add(buf(body_off + 0, 1), "Command ID: 0xC0 (Status Response)")
+
+    -- body[1]: power/error flags
+    local b1 = buf(body_off + 1, 1):uint()
+    local power = bit.band(b1, 0x01) == 1
+    local in_error = bit.band(b1, 0x80) ~= 0
+    body_tree:add(buf(body_off + 1, 1), string.format("Power: %s, Error: %s",
+        power and "ON" or "OFF", in_error and "YES" or "no"))
+
+    -- body[2]: mode + temperature
+    local b2 = buf(body_off + 2, 1):uint()
+    local mode_bits = bit.rshift(bit.band(b2, 0xE0), 5)
+    local temp_int = bit.band(b2, 0x0F) + 16
+    local temp_half = bit.band(b2, 0x10) ~= 0
+    local set_temp = temp_int + (temp_half and 0.5 or 0)
+    body_tree:add(buf(body_off + 2, 1), string.format("Mode: %s, Set Temp: %.1f C",
+        getUartModeString(mode_bits), set_temp))
+
+    -- body[3]: fan speed
+    local fan = buf(body_off + 3, 1):uint()
+    body_tree:add(buf(body_off + 3, 1), string.format("Fan Speed: %d (%s)",
+        fan, getUartFanString(fan)))
+
+    -- body[4-6]: timer fields
+    body_tree:add(buf(body_off + 4, 3), "Timer bytes: " ..
+        tostring(buf(body_off + 4, 3):bytes()))
+
+    -- body[7]: swing mode
+    local swing_val = bit.band(buf(body_off + 7, 1):uint(), 0x0F)
+    body_tree:add(buf(body_off + 7, 1), string.format("Swing: %s",
+        getUartSwingString(swing_val)))
+
+    -- body[8]: cosy sleep, turbo (location 2), save
+    local b8 = buf(body_off + 8, 1):uint()
+    local turbo2 = bit.band(b8, 0x20) ~= 0
+    body_tree:add(buf(body_off + 8, 1), string.format("Cosy Sleep: %d, Save: %s, Turbo2: %s",
+        bit.band(b8, 0x03),
+        bit.band(b8, 0x08) ~= 0 and "yes" or "no",
+        turbo2 and "yes" or "no"))
+
+    -- body[9]: eco, child sleep, PTC, dry clean
+    -- *** CONTROVERSY: ECO bit position ***
+    -- dudanov + midea-local: bit 4 (0x10) ← consensus
+    -- PI HVAC databridge response.py: bit 7 (0x80) ← confirmed bug
+    -- SET command (0x40) uses bit 7 — different bit for set vs response!
+    local b9 = buf(body_off + 9, 1):uint()
+    local eco_bit4 = bit.band(b9, 0x10) ~= 0   -- consensus: bit 4
+    local eco_bit7 = bit.band(b9, 0x80) ~= 0   -- bug: bit 7
+    local eco_str = ""
+    if eco_bit4 then eco_str = "ECO(bit4)" end
+    if eco_bit7 then eco_str = eco_str .. (eco_str ~= "" and "+ECO(bit7)" or "ECO(bit7)") end
+    if eco_str == "" then eco_str = "no" end
+    body_tree:add(buf(body_off + 9, 1), string.format(
+        "ECO: %s, ChildSleep: %s, DryClean: %s, PTC: %s   [NOTE: ECO bit controversial - bit4=dudanov/midea-local, bit7=set-cmd]",
+        eco_str,
+        bit.band(b9, 0x01) ~= 0 and "yes" or "no",
+        bit.band(b9, 0x04) ~= 0 and "yes" or "no",
+        bit.band(b9, 0x08) ~= 0 and "yes" or "no"))
+
+    -- body[10]: sleep, turbo (primary), temp unit
+    local b10 = buf(body_off + 10, 1):uint()
+    local sleep = bit.band(b10, 0x01) ~= 0
+    local turbo = bit.band(b10, 0x02) ~= 0
+    local temp_unit = bit.band(b10, 0x04) ~= 0 and "F" or "C"
+    body_tree:add(buf(body_off + 10, 1), string.format(
+        "Sleep: %s, Turbo: %s, Temp Unit: %s",
+        sleep and "yes" or "no", turbo and "yes" or "no", temp_unit))
+
+    -- body[11]: indoor temperature
+    if body_len > 11 then
+        local indoor_raw = buf(body_off + 11, 1):uint()
+        local indoor_temp = (indoor_raw - 50) / 2.0
+        body_tree:add(buf(body_off + 11, 1), string.format(
+            "Indoor Temp: %.1f C (raw: %d)", indoor_temp, indoor_raw))
+    end
+
+    -- body[12]: outdoor temperature
+    if body_len > 12 then
+        local outdoor_raw = buf(body_off + 12, 1):uint()
+        local outdoor_temp = (outdoor_raw - 50) / 2.0
+        body_tree:add(buf(body_off + 12, 1), string.format(
+            "Outdoor Temp: %.1f C (raw: %d)", outdoor_temp, outdoor_raw))
+    end
+
+    -- body[13]: new temperature + dust full
+    if body_len > 13 then
+        local b13 = buf(body_off + 13, 1):uint()
+        local new_temp_raw = bit.band(b13, 0x1F)
+        if new_temp_raw > 0 then
+            body_tree:add(buf(body_off + 13, 1), string.format(
+                "New Temp Override: %d C, Dust Full: %s",
+                new_temp_raw + 12, bit.band(b13, 0x20) ~= 0 and "yes" or "no"))
+        else
+            body_tree:add(buf(body_off + 13, 1), string.format(
+                "No temp override, Dust Full: %s",
+                bit.band(b13, 0x20) ~= 0 and "yes" or "no"))
+        end
+    end
+
+    -- body[14]: display state
+    -- *** CONTROVERSY: display ON condition ***
+    -- This doc: bits[6:4] == 0x7 → ON
+    -- midea-local: bits[6:4] != 0x7 → ON (inverted!) + gated on power
+    if body_len > 14 then
+        local b14 = buf(body_off + 14, 1):uint()
+        local disp_bits = bit.band(bit.rshift(b14, 4), 0x07)
+        body_tree:add(buf(body_off + 14, 1), string.format(
+            "Display bits: 0x%X (%s=ON, %s=ON)   [CONTROVERSIAL: interpretation inverted between sources]",
+            disp_bits,
+            disp_bits == 0x07 and "this-doc" or "midea-local",
+            disp_bits ~= 0x07 and "this-doc=OFF" or "midea-local=OFF"))
+    end
+
+    -- body[16]: error code
+    if body_len > 16 then
+        local err = buf(body_off + 16, 1):uint()
+        if err > 0 then
+            body_tree:add(buf(body_off + 16, 1), string.format("Error Code: E%d", err))
+        else
+            body_tree:add(buf(body_off + 16, 1), "Error Code: none")
+        end
+    end
+
+    -- body[19]: humidity
+    if body_len > 19 then
+        local hum = bit.band(buf(body_off + 19, 1):uint(), 0x7F)
+        body_tree:add(buf(body_off + 19, 1), string.format("Humidity Setpoint: %d%%", hum))
+    end
+
+    -- body[21]: frost protection
+    if body_len > 21 then
+        local b21 = buf(body_off + 21, 1):uint()
+        body_tree:add(buf(body_off + 21, 1), string.format("Frost Protection: %s",
+            bit.band(b21, 0x80) ~= 0 and "yes" or "no"))
+    end
+end
+
+
+local function decode_uart_c1_power(body_tree, buf, body_off, body_len)
+    -- C1 Power Response — BCD-encoded kWh
+    -- *** CONTROVERSY: subbody format ***
+    -- Only 0x44 format documented. midea-local has 3 parsing methods (BCD/binary/raw).
+    body_tree:add(buf(body_off + 0, 1), "Command ID: 0xC1 (Power Response)")
+
+    if body_len >= 19 then
+        -- BCD decode bytes 16-18 (documented format for subbody type 0x44)
+        local power = 0
+        local multiplier = 1
+        for i = 18, 16, -1 do
+            local byte = buf(body_off + i, 1):uint()
+            local lo = bit.band(byte, 0x0F)
+            local hi = bit.band(bit.rshift(byte, 4), 0x0F)
+            power = power + lo * multiplier + hi * multiplier * 10
+            multiplier = multiplier * 100
+        end
+        body_tree:add(buf(body_off + 16, 3), string.format(
+            "Power Usage: %d (BCD)   [NOTE: only 0x44 subbody format decoded, see protocol_uart.md 12.2]",
+            power))
+    end
+end
+
+
+local function decode_uart_40_set(body_tree, buf, body_off, body_len)
+    -- 0x40 Set Command
+    body_tree:add(buf(body_off + 0, 1), "Command ID: 0x40 (Set Status)")
+
+    -- body[1]: power + beep
+    local b1 = buf(body_off + 1, 1):uint()
+    body_tree:add(buf(body_off + 1, 1), string.format("Power: %s, Beep: %s",
+        bit.band(b1, 0x01) ~= 0 and "ON" or "OFF",
+        bit.band(b1, 0x40) ~= 0 and "yes" or "no"))
+
+    -- body[2]: mode + temp
+    local b2 = buf(body_off + 2, 1):uint()
+    local mode_bits = bit.rshift(bit.band(b2, 0xE0), 5)
+    local temp_int = bit.band(b2, 0x0F) + 16
+    local temp_half = bit.band(b2, 0x10) ~= 0
+    body_tree:add(buf(body_off + 2, 1), string.format("Mode: %s, Temp: %.1f C",
+        getUartModeString(mode_bits), temp_int + (temp_half and 0.5 or 0)))
+
+    -- body[3]: fan
+    local fan = buf(body_off + 3, 1):uint()
+    body_tree:add(buf(body_off + 3, 1), string.format("Fan: %d (%s)",
+        fan, getUartFanString(fan)))
+
+    -- body[7]: swing
+    if body_len > 7 then
+        local swing = bit.band(buf(body_off + 7, 1):uint(), 0x0F)
+        body_tree:add(buf(body_off + 7, 1), string.format("Swing: %s",
+            getUartSwingString(swing)))
+    end
+
+    -- body[9]: eco (SET uses bit 7 — this is correct for set direction!)
+    if body_len > 9 then
+        local b9 = buf(body_off + 9, 1):uint()
+        body_tree:add(buf(body_off + 9, 1), string.format("ECO (set): %s",
+            bit.band(b9, 0x80) ~= 0 and "yes" or "no"))
+    end
+
+    -- body[10]: sleep, turbo
+    if body_len > 10 then
+        local b10 = buf(body_off + 10, 1):uint()
+        body_tree:add(buf(body_off + 10, 1), string.format("Sleep: %s, Turbo: %s",
+            bit.band(b10, 0x01) ~= 0 and "yes" or "no",
+            bit.band(b10, 0x02) ~= 0 and "yes" or "no"))
+    end
+
+    -- body[18]: new temp field (extended range 12-43C)
+    if body_len > 18 then
+        local new_temp_raw = bit.band(buf(body_off + 18, 1):uint(), 0x1F)
+        if new_temp_raw > 0 then
+            body_tree:add(buf(body_off + 18, 1), string.format("New Temp (ext): %d C",
+                new_temp_raw + 12))
+        end
+    end
+end
+
+
+local function decode_uart_41_query(body_tree, buf, body_off, body_len)
+    -- 0x41 Query (status or power, distinguished by body[1])
+    local sub = buf(body_off + 1, 1):uint()
+    if sub == 0x81 then
+        body_tree:add(buf(body_off + 0, 2), "Command: 0x41/0x81 (Query Status)")
+    elseif sub == 0x21 then
+        body_tree:add(buf(body_off + 0, 2), "Command: 0x41/0x21 (Query Power)")
+    elseif sub == 0x61 then
+        body_tree:add(buf(body_off + 0, 2), "Command: 0x41/0x61 (Display Toggle)")
+    else
+        body_tree:add(buf(body_off + 0, 2), string.format(
+            "Command: 0x41/0x%02X (Unknown sub-command)", sub))
+    end
+end
+
+
+-- ══════════════════════════════════════════════════════════════════════════════
+-- ── MAIN DISSECTOR ──────────────────────────────────────────────────────────
+-- ══════════════════════════════════════════════════════════════════════════════
+
 function hvac_shark_proto.dissector(udp_payload_buffer, pinfo, tree)
     pinfo.cols.protocol = hvac_shark_proto.name
 
     local subtree = tree:add(hvac_shark_proto, udp_payload_buffer(), "HVAC Shark Protocol Data")
 
     -- Check for the start sequence "HVAC_shark"
-    if udp_payload_buffer(0, 10):string() == "HVAC_shark" then
-        subtree:add(f.start_sequence, udp_payload_buffer(0, 10))
-        
-        local manufacturer = udp_payload_buffer(10, 1):uint()
-        local bus_type = udp_payload_buffer(11, 1):uint()
-        
-        if manufacturer == 1 then
-            subtree:add(f.manufacturer, udp_payload_buffer(10, 1)):append_text(" (Midea)")
-        else
-            subtree:add(f.manufacturer, udp_payload_buffer(10, 1))
+    if udp_payload_buffer(0, 10):string() ~= "HVAC_shark" then return end
+
+    subtree:add(f.start_sequence, udp_payload_buffer(0, 10))
+
+    local manufacturer = udp_payload_buffer(10, 1):uint()
+    local bus_type = udp_payload_buffer(11, 1):uint()
+    local version = udp_payload_buffer(12, 1):uint()
+
+    if manufacturer == 1 then
+        subtree:add(f.manufacturer, udp_payload_buffer(10, 1)):append_text(" (Midea)")
+    else
+        subtree:add(f.manufacturer, udp_payload_buffer(10, 1))
+    end
+
+    if bus_type == 0 then
+        subtree:add(f.bus_type, udp_payload_buffer(11, 1)):append_text(" (Bus = XYE)")
+    elseif bus_type == 1 then
+        subtree:add(f.bus_type, udp_payload_buffer(11, 1)):append_text(" (Bus = UART)")
+    else
+        subtree:add(f.bus_type, udp_payload_buffer(11, 1))
+    end
+
+    -- ── Header version & extended metadata ──────────────────────────────
+    local data_offset = 13
+
+    if version == 0x00 then
+        subtree:add(f.header_version, udp_payload_buffer(12, 1)):append_text(" (Legacy)")
+    elseif version == 0x01 then
+        subtree:add(f.header_version, udp_payload_buffer(12, 1)):append_text(" (Extended)")
+        local pos = 13
+        -- logicChannel
+        local ch_len = udp_payload_buffer(pos, 1):uint()
+        pos = pos + 1
+        if ch_len > 0 then
+            subtree:add(f.logic_channel, udp_payload_buffer(pos, ch_len))
+            pinfo.cols.info:append(" [" .. udp_payload_buffer(pos, ch_len):string() .. "]")
+            pos = pos + ch_len
         end
-        
-        if bus_type == 0 then
-            subtree:add(f.bus_type, udp_payload_buffer(11, 1)):append_text(" (Bus = XYE)")
-        else
-            subtree:add(f.bus_type, udp_payload_buffer(11, 1))
+        -- circuitBoard
+        local board_len = udp_payload_buffer(pos, 1):uint()
+        pos = pos + 1
+        if board_len > 0 then
+            subtree:add(f.circuit_board, udp_payload_buffer(pos, board_len))
+            pos = pos + board_len
         end
-        
-        subtree:add(f.reserved, udp_payload_buffer(12, 1))
+        -- comment
+        local comment_len = udp_payload_buffer(pos, 1):uint()
+        pos = pos + 1
+        if comment_len > 0 then
+            subtree:add(f.channel_comment, udp_payload_buffer(pos, comment_len))
+            pos = pos + comment_len
+        end
+        data_offset = pos
+    else
+        subtree:add(f.header_version, udp_payload_buffer(12, 1)):append_text(" (Unknown)")
+    end
 
-        -- Only further decode if manufacturer is Midea (1) and bus type is XYE (0)
-        if manufacturer == 1 and bus_type == 0 then
-            
-            -- Add Command Code field to the protocol tree
-            subtree:add(f.command_code, udp_payload_buffer(14, 1))
-            
-            -- Decode the XYE protocol data
-            local protocol_buffer = udp_payload_buffer(13, udp_payload_buffer:len() - 13)
+    -- ── Helper: buffer slice relative to protocol data start ─────────────
+    local function pbuf(offset, length)
+        return udp_payload_buffer(data_offset + offset, length)
+    end
 
-            -- Add buffer length information
-            local protocol_length = protocol_buffer:len()
-            subtree:add(f.command_length, protocol_length)
-            local protocol_buffer_anotation_string = string.format("(Length: %d bytes - ", protocol_buffer:len())
-            
-            -- Early protocol validation
-            if protocol_buffer:len() >= 3 then
-                -- Extract and validate CRC
-                local protocol_crc = protocol_buffer(protocol_buffer:len() - 2, 1):uint()
-                local calculated_protocol_crc = validate_crc(protocol_buffer, protocol_buffer:len())
-                
-                protocol_buffer_anotation_string = protocol_buffer_anotation_string .. string.format("CRC: 0x%02X %s", 
-                    protocol_crc,
-                    calculated_protocol_crc == protocol_crc and " valid" or 
-                    string.format(" invalid, calculated: 0x%02X", calculated_protocol_crc))
-            end
+    local proto_len = udp_payload_buffer:len() - data_offset
+    if proto_len < 2 then return end
 
+    local protocol_buffer = udp_payload_buffer(data_offset, proto_len)
 
-            local data_subtree = subtree:add(f.data, udp_payload_buffer(13, udp_payload_buffer:len() - 13)):append_text(" " .. protocol_buffer_anotation_string .. ")")
+    -- ── Protocol auto-detection ─────────────────────────────────────────
+    -- Byte 0 is always 0xAA for both protocols.
+    -- Byte 1 disambiguates:
+    --   XYE:  command byte in {0xC0, 0xC3, 0xC4, 0xC6, 0xCC, 0xCD}
+    --   UART: length field in range 0x0D–0x40 (13–64)
+    -- These ranges never overlap.
 
-            local protocol_length = protocol_buffer:len()
-            if protocol_length == 16 then
-                -- Decode frames with destination other than 0x80
+    local byte1 = protocol_buffer(1, 1):uint()
+    local is_xye = XYE_COMMANDS[byte1] ~= nil
+    local is_uart = (byte1 >= 0x0D and byte1 <= 0x40)
 
-                data_subtree:add(udp_payload_buffer(13, 1), "0x00 Preamble: " .. string.format("0x%02X", protocol_buffer(0, 1):uint()))
-				
-				local command_code = protocol_buffer(1, 1):uint()
-            
-				local command_name = "Unknown"
-				
-				if command_code == 0xc0 then
-					command_name = "Query"
-				elseif command_code == 0xc3 then
-					command_name = "Set"
-                elseif command_code == 0xc6 then
-					command_name = "FollowMe"
-				elseif command_code == 0xcc then
-					command_name = "Lock"
-				elseif command_code == 0xcd then
-					command_name = "Unlock"
-				end
-	
-				data_subtree:add(udp_payload_buffer(14, 1), "0x01 Command: " .. string.format("0x%02X", command_code) .. " (" .. command_name .. ")")
-                
-                data_subtree:add(udp_payload_buffer(15, 1), "0x02 Destination: " .. string.format("0x%02X", protocol_buffer(2, 1):uint()))
-                data_subtree:add(udp_payload_buffer(16, 1), "0x03 Source / Own ID: " .. string.format("0x%02X", protocol_buffer(3, 1):uint()))
-                data_subtree:add(udp_payload_buffer(17, 1), "0x04 From Master: " .. string.format("0x%02X", protocol_buffer(4, 1):uint()))
-                data_subtree:add(udp_payload_buffer(18, 1), "0x05 Source / Own ID: " .. string.format("0x%02X", protocol_buffer(5, 1):uint()))
+    if is_uart then
+        -- ══════════════════════════════════════════════════════════════════
+        -- ── MIDEA UART (SmartKey) PROTOCOL ──────────────────────────────
+        -- ══════════════════════════════════════════════════════════════════
+        subtree:add(f.protocol_type, "Midea UART (SmartKey)")
+        pinfo.cols.info:prepend("UART ")
 
-                -- Decode payload if command is 0xc3 (set command)
-                if protocol_buffer(1, 1):uint() == 0xc3 then
-                    -- Decode byte 0x06
-                    -- Decode the oper_mode field
-                    local oper_mode = protocol_buffer(6, 1):uint()
-                    data_subtree:add(udp_payload_buffer(19, 1), "0x06 Operating Mode: " .. string.format("0x%02X", oper_mode) .. " (" .. getOperModeString(oper_mode) .. ")")
+        local frame_len = byte1 + 1  -- total frame = LENGTH + 1 (byte 0)
 
-                    -- Decode byte 0x07
-                    -- Decode the fan field
-                    local fan = protocol_buffer(7, 1):uint()
-                    data_subtree:add(udp_payload_buffer(20, 1), "0x07 Fan: " .. string.format("0x%02X", fan) .. " (" .. getFanString(fan) .. ")")
+        -- Frame header
+        subtree:add(f.command_length, frame_len)
+        local hdr_tree = subtree:add(pbuf(0, math.min(10, proto_len)), "UART Frame Header")
+        hdr_tree:add(pbuf(0, 1), string.format("Start: 0x%02X", protocol_buffer(0, 1):uint()))
+        hdr_tree:add(f.uart_length, pbuf(1, 1))
+        hdr_tree:add(f.uart_appliance, pbuf(2, 1)):append_text(
+            protocol_buffer(2, 1):uint() == 0xAC and " (Air Conditioner)" or "")
 
-                    -- Decode byte 0x08
-                    data_subtree:add(udp_payload_buffer(21, 1), "0x08 Set Temp: " .. string.format("0x%02X", protocol_buffer(8, 1):uint()) .. " °C")
+        -- Sync validation
+        local sync_val = protocol_buffer(3, 1):uint()
+        local sync_expected = bit.bxor(byte1, protocol_buffer(2, 1):uint())
+        local sync_ok = sync_val == sync_expected
+        hdr_tree:add(f.uart_sync, pbuf(3, 1)):append_text(
+            sync_ok and " (Valid)" or string.format(" (INVALID, expected 0x%02X)", sync_expected))
 
-                    -- Decode byte 0x09
-                    -- Decode the mode_flags field
-                    local mode_flags = protocol_buffer(9, 1):uint()
-                    local mode_flags_str = ""
-                    if mode_flags == 0x02 then
-                        mode_flags_str = "Aux Heat (Turbo)"
-                    elseif mode_flags == 0x00 then
-                        mode_flags_str = "Normal"
-                    elseif mode_flags == 0x01 then
-                        mode_flags_str = "ECO Mode (Sleep)"
-                    elseif mode_flags == 0x04 then
-                        mode_flags_str = "Swing"
-                    elseif mode_flags == 0x88 then
-                        mode_flags_str = "Ventilate"
-                    else
-                        mode_flags_str = "Unknown"
-                    end
-                    data_subtree:add(udp_payload_buffer(22, 1), "0x09 Mode Flags: " .. string.format("0x%02X", mode_flags) .. " (" .. mode_flags_str .. ")")
+        hdr_tree:add(pbuf(4, 4), "Reserved: " .. tostring(protocol_buffer(4, 4):bytes()))
 
-                    -- Decode byte 0x0A
-                    -- Decode the timer_start field
-                    data_subtree:add(udp_payload_buffer(23, 1), "0x0A Timer Start: " .. string.format("0x%02X", protocol_buffer(10, 1):uint()))
-                    -- Decode byte 0x0B
-                    -- Decode the timer_stop field
-                    data_subtree:add(udp_payload_buffer(24, 1), "0x0B Timer Stop: " .. string.format("0x%02X", protocol_buffer(11, 1):uint()))
-                    -- Decode byte 0x0C
-                    -- Decode the run field
-                    data_subtree:add(udp_payload_buffer(25, 1), "0x0C Unknown: " .. string.format("0x%02X", protocol_buffer(12, 1):uint()))
+        if proto_len >= 10 then
+            hdr_tree:add(f.uart_protocol, pbuf(8, 1))
+            local msg_type = protocol_buffer(9, 1):uint()
+            local msg_type_str = UART_MSG_TYPES[msg_type] or "Unknown"
+            hdr_tree:add(f.uart_msg_type, pbuf(9, 1)):append_text(" (" .. msg_type_str .. ")")
+        end
+
+        -- Body + integrity
+        if proto_len >= frame_len and frame_len >= 12 then
+            local body_off = data_offset + 10
+            local body_len = frame_len - 12  -- minus header(10) + CRC(1) + checksum(1)
+
+            -- CRC-8 validation (over body bytes)
+            local crc_offset = data_offset + frame_len - 2
+            local crc_val = udp_payload_buffer(crc_offset, 1):uint()
+            local crc_calc = uart_crc8(udp_payload_buffer, body_off, body_len)
+            local crc_ok = crc_val == crc_calc
+
+            -- Checksum validation (over bytes 1..N-2)
+            local cksum_offset = data_offset + frame_len - 1
+            local cksum_val = udp_payload_buffer(cksum_offset, 1):uint()
+            local cksum_calc = uart_checksum(udp_payload_buffer, data_offset + 1, crc_offset)
+            local cksum_ok = cksum_val == cksum_calc
+
+            local integrity_str = string.format("CRC8: 0x%02X %s, Checksum: 0x%02X %s",
+                crc_val, crc_ok and "(Valid)" or string.format("(INVALID, calc 0x%02X)", crc_calc),
+                cksum_val, cksum_ok and "(Valid)" or string.format("(INVALID, calc 0x%02X)", cksum_calc))
+
+            -- Body tree
+            local body_tree = subtree:add(udp_payload_buffer(body_off, body_len),
+                string.format("Body (%d bytes) — %s", body_len, integrity_str))
+
+            if body_len > 0 then
+                local cmd_id = udp_payload_buffer(body_off, 1):uint()
+                local cmd_str = UART_COMMAND_IDS[cmd_id] or string.format("Unknown (0x%02X)", cmd_id)
+                pinfo.cols.info:append(" " .. cmd_str)
+
+                if cmd_id == 0xC0 then
+                    decode_uart_c0_status(body_tree, udp_payload_buffer, body_off, body_len)
+                elseif cmd_id == 0xC1 then
+                    decode_uart_c1_power(body_tree, udp_payload_buffer, body_off, body_len)
+                elseif cmd_id == 0x40 then
+                    decode_uart_40_set(body_tree, udp_payload_buffer, body_off, body_len)
+                elseif cmd_id == 0x41 then
+                    decode_uart_41_query(body_tree, udp_payload_buffer, body_off, body_len)
+                elseif cmd_id == 0xB5 then
+                    body_tree:add(udp_payload_buffer(body_off, 1), "Command ID: 0xB5 (Capabilities Query/Response)")
+                    body_tree:add(udp_payload_buffer(body_off + 1, body_len - 1),
+                        "Capability Data: " .. tostring(udp_payload_buffer(body_off + 1, body_len - 1):bytes()))
                 else
-                    data_subtree:add(udp_payload_buffer(19, 7), "Payload: " .. tostring(protocol_buffer(6, 7):bytes()))
-                end -- end of if protocol_buffer(1, 1):uint() == 0xc3
-
-                -- Decode byte 0x0D
-                -- Decode command check field
-                data_subtree:add(udp_payload_buffer(26, 1), "0x0D Command Check: " .. string.format("0x%02X", protocol_buffer(13, 1):uint()))
-
-                -- Decode byte 0x0E
-                -- Decode and validate the crc field
-                local calculated_crc = validate_crc(udp_payload_buffer(13, 16), 16)
-                local crc_value = protocol_buffer(14, 1):uint()
-                if calculated_crc == crc_value then
-                    data_subtree:add(udp_payload_buffer(27, 1), "0x0E CRC: " .. string.format("0x%02X", crc_value) .. " (Valid)")
-                else
-                    data_subtree:add(udp_payload_buffer(27, 1), "0x0E CRC: " .. string.format("0x%02X", crc_value) .. " (Invalid, calculated: 0x%02X)", calculated_crc)
+                    body_tree:add(udp_payload_buffer(body_off, body_len),
+                        "Raw Body: " .. tostring(udp_payload_buffer(body_off, body_len):bytes()))
                 end
-                -- Decode byte 0x0F
-                -- Decode the end of frame field
-                data_subtree:add(udp_payload_buffer(28, 1), "0x0F EndOfFrame: " .. string.format("0x%02X", protocol_buffer(15, 1):uint()))
-            
-            
-            elseif protocol_length == 32 then
-                -- for 32-byte frames at least 2 versions are existing, 0xc4 is at least decoded differently than other commands
-                local command_code = protocol_buffer(1, 1):uint()
-                if command_code == 0xc0 or command_code == 0xc3 then
-                    -- Decode byte 0x00 (Preamble)
-                    data_subtree:add(udp_payload_buffer(13, 1), "0x00 Preamble: " .. string.format("0x%02X", protocol_buffer(0, 1):uint()))
-                    
-                    -- Decode byte 0x01
-                    -- Decode the response code field
-                    data_subtree:add(udp_payload_buffer(14, 1), "0x01 Response Code: " .. string.format("0x%02X", protocol_buffer(1, 1):uint()))
-
-                    -- Decode byte 0x02
-                    -- Decode the to_master field
-                    data_subtree:add(udp_payload_buffer(15, 1), "0x02 To Master: " .. string.format("0x%02X", protocol_buffer(2, 1):uint()))
-
-                    -- Decode byte 0x03
-                    -- Decode the destination field
-                    data_subtree:add(udp_payload_buffer(16, 1), "0x03 Destination: " .. string.format("0x%02X", protocol_buffer(3, 1):uint()))
-
-                    -- Decode byte 0x04
-                    -- Decode the source/own ID field
-                    data_subtree:add(udp_payload_buffer(17, 1), "0x04 Source/Own ID: " .. string.format("0x%02X", protocol_buffer(4, 1):uint()))
-
-                    -- Decode byte 0x05
-                    -- Decode the destination (masterID) field
-                    data_subtree:add(udp_payload_buffer(18, 1), "0x05 Destination (masterID): " .. string.format("0x%02X", protocol_buffer(5, 1):uint()))
-                    
-                    -- Decode byte 0x06
-                    -- Decode the unknown field as single bits
-                    local unknown_field = protocol_buffer(6, 1):uint()
-                    data_subtree:add(udp_payload_buffer(19, 1), "0x06 Unknown field: " .. string.format("0x%02X", unknown_field))
-                    for i = 0, 7 do
-                        local bit_value = bit.band(bit.rshift(unknown_field, i), 0x01)
-                        data_subtree:add(udp_payload_buffer(19, 1), string.format("Bit %d: %d", i, bit_value))
-                    end
-
-                    -- Decode byte 0x07
-                    -- Decode the capabilities field as single bits
-                    local capabilities = protocol_buffer(7, 1):uint()
-                    data_subtree:add(udp_payload_buffer(20, 1), "0x07 Capabilities: " .. string.format("0x%02X", capabilities))
-                    for i = 0, 7 do
-                        local bit_value = bit.band(bit.rshift(capabilities, i), 0x01)
-                        data_subtree:add(udp_payload_buffer(20, 1), string.format("Bit %d: %d", i, bit_value))
-                    end
-
-                    -- Decode byte 0x08
-                    -- Decode the oper_mode field
-                    local oper_mode = protocol_buffer(8, 1):uint()
-                    data_subtree:add(udp_payload_buffer(21, 1), "0x08 Operating Mode: " .. string.format("0x%02X", oper_mode) .. " (" .. getOperModeString(oper_mode) .. ")")
-
-                    -- Decode byte 0x09
-                    -- Decode the fan field
-                    local fan = protocol_buffer(9, 1):uint()
-                    data_subtree:add(udp_payload_buffer(22, 1), "0x09 Fan: " .. string.format("0x%02X", fan) .. " (" .. getFanString(fan) .. ")")
-                    
-                    -- Decode byte 0x0A (dec 10)
-                    -- Decode the set_temp field
-                    data_subtree:add(udp_payload_buffer(23, 1), "0x0A Set Temp: " .. string.format("0x%02X", protocol_buffer(10, 1):uint()))
-
-                    -- Decode byte 0x0B (dec 11)
-                    -- Decode the T1_temp field
-                    data_subtree:add(udp_payload_buffer(24, 1), "0x0B T1 Temp: " .. string.format("0x%02X", protocol_buffer(11, 1):uint()))
-
-                    -- Decode byte 0x0C (dec 12)
-                    -- Decode the T2A_temp field
-                    data_subtree:add(udp_payload_buffer(25, 1), "0x0C T2A Temp: " .. string.format("0x%02X", protocol_buffer(12, 1):uint()))
-
-                    -- Decode byte 0x0D (dec 13)
-                    -- Decode the T2B_temp field
-                    data_subtree:add(udp_payload_buffer(26, 1), "0X0D T2B Temp: " .. string.format("0x%02X", protocol_buffer(13, 1):uint()))
-
-                    -- Decode byte 0x0E (dec 14)
-                    -- Decode the T3_temp field
-                    data_subtree:add(udp_payload_buffer(27, 1), "0X0E T3 Temp: " .. string.format("0x%02X", protocol_buffer(14, 1):uint()))
-
-                    -- Decode byte 0x0F (dec 15)
-                    -- Decode the current field
-                    data_subtree:add(udp_payload_buffer(28, 1), "0X0F Current: " .. string.format("0x%02X", protocol_buffer(15, 1):uint()))
-
-                    -- Decode byte 0x10 (dec 16)
-                    -- Decode the unknown field
-                    data_subtree:add(udp_payload_buffer(29, 1), "0x10 Unknown: " .. string.format("0x%02X", protocol_buffer(16, 1):uint()))
-    
-                    -- Decode byte 0x11 (dec 17)
-                    -- Decode the timer_start field
-                    local timer_start = protocol_buffer(17, 1):uint()
-                    local hours_start = math.floor((timer_start % 128) * 15 / 60)
-                    local minutes_start = (timer_start % 128) * 15 % 60
-                    data_subtree:add(udp_payload_buffer(30, 1), "0x11 Timer Start: " .. string.format("0x%02X", timer_start) .. 
-                        string.format(" (Hours: %d, Minutes: %d)", hours_start, minutes_start))
-                    
-                    -- Decode byte 0x12 (dec 18)
-                    -- Decode the timer_stop field
-                    local timer_stop = protocol_buffer(18, 1):uint()
-                    local hours_stop = math.floor((timer_stop % 128) * 15 / 60)
-                    local minutes_stop = (timer_stop % 128) * 15 % 60
-                    data_subtree:add(udp_payload_buffer(31, 1), "0x12 Timer Stop: " .. string.format("0x%02X", timer_stop) .. 
-                        string.format(" (Hours: %d, Minutes: %d)", hours_stop, minutes_stop))
-                    
-                    -- Decode byte 0x13 (dec 19)
-                    -- Decode the run field
-                    data_subtree:add(udp_payload_buffer(32, 1), "0x13 Run: " .. string.format("0x%02X", protocol_buffer(19, 1):uint()))
-
-                    -- Decode byte 0x14 (dec 20)
-                    -- Decode the mode_flags field
-                    data_subtree:add(udp_payload_buffer(33, 1), "0x14 Mode Flags: " .. string.format("0x%02X", protocol_buffer(20, 1):uint()))
-
-                    -- Decode byte 0x15 (dec 21)
-                    -- Decode the operating_flags field
-                    data_subtree:add(udp_payload_buffer(34, 1), "0x15 Operating Flags: " .. string.format("0x%02X", protocol_buffer(21, 1):uint()))
-
-                    -- Decode byte 0x16 (dec 22)
-                    -- Decode the error E (0..7) field
-                    data_subtree:add(udp_payload_buffer(35, 1), "0x16 Error E (0..7): " .. string.format("0x%02X", protocol_buffer(22, 1):uint()))
-
-                    -- Decode byte 0x17 (dec 23)
-                    -- Decode the error E (7..f) field
-                    data_subtree:add(udp_payload_buffer(36, 1), "0x17 Error E (7..f): " .. string.format("0x%02X", protocol_buffer(23, 1):uint()))
-
-                    -- Decode byte 0x18 (dec 24)
-                    -- Decode the protect P (0..7) field
-                    data_subtree:add(udp_payload_buffer(37, 1), "0x18 Protect P (0..7): " .. string.format("0x%02X", protocol_buffer(24, 1):uint()))
-
-                    -- Decode byte 0x19 (dec 25)
-                    -- Decode the protect P (7..f) field
-                    data_subtree:add(udp_payload_buffer(38, 1), "0x19 Protect P (7..f): " .. string.format("0x%02X", protocol_buffer(25, 1):uint()))
-
-                    -- Decode byte 0x1A (dec 26)
-                    -- Decode the CCM Comm Error field
-                    data_subtree:add(udp_payload_buffer(39, 1), "0x1A CCM Comm Error: " .. string.format("0x%02X", protocol_buffer(26, 1):uint()))
-
-                    -- Decode byte 0x1B (dec 27)
-                    -- Decode unknown field 1
-                    data_subtree:add(udp_payload_buffer(40, 1), "0x1B Unknown 1: " .. string.format("0x%02X", protocol_buffer(27, 1):uint()))
-
-                    -- Decode byte 0x1C (dec 28)
-                    -- Decode unknown field 2
-                    data_subtree:add(udp_payload_buffer(41, 1), "0x1C Unknown 2: " .. string.format("0x%02X", protocol_buffer(28, 1):uint()))
-                
-                    -- Decode byte 0x1D (dec 29)
-                    -- Decode unknown field 3
-                    data_subtree:add(udp_payload_buffer(42, 1), "0x1D Unknown 3: " .. string.format("0x%02X", protocol_buffer(29, 1):uint()))
-
-                    -- Decode byte 0x1E (dec 30) (CRC)
-                    -- Validate CRC for 32-byte protocol length
-                    local crc_80 = protocol_buffer(30, 1):uint()
-                    local calculated_crc_80 = validate_crc(udp_payload_buffer(13, 32), 32)
-
-                    if calculated_crc_80 == crc_80 then
-                        data_subtree:add(udp_payload_buffer(43, 1), "0x1E CRC: " .. string.format("0x%02X", crc_80) .. " (Valid)")
-                    else
-                        data_subtree:add(udp_payload_buffer(43, 1), "0x1E CRC: " .. string.format("0x%02X", crc_80) .. " (Invalid, calculated: 0x%02X)", calculated_crc_80)
-                    end
-
-                    -- Add EndOfFrame field
-                    data_subtree:add(udp_payload_buffer(44, 1), "0x1F EndOfFrame: " .. string.format("0x%02X", protocol_buffer(31, 1):uint()))
-
-                elseif command_code == 0xc4 or command_code == 0xc6 then
-
-                    -- Decode byte 0x00 (Preamble)
-                    data_subtree:add(udp_payload_buffer(13, 1), "0x00 Preamble: " .. string.format("0x%02X", protocol_buffer(0, 1):uint()))
-                
-                    -- Decode byte 0x01 (dec 1)
-                    -- Decode the response code field
-                    data_subtree:add(udp_payload_buffer(14, 1), "0x01 Response Code: " .. string.format("0x%02X", protocol_buffer(1, 1):uint()))
-               
-                    -- Decode byte 0x02 (dec 2)
-                    -- Decode unknown field
-                    data_subtree:add(udp_payload_buffer(15, 1), "Unknown byte 0x02 (02): " .. string.format("0x%02X", protocol_buffer(2, 1):uint()))
-                    
-                    -- Decode byte 0x03 (dec 3)
-                    -- Decode unknown field
-                    data_subtree:add(udp_payload_buffer(16, 1), "Unknown byte 0x03 (03): " .. string.format("0x%02X", protocol_buffer(3, 1):uint()))
-                    
-                    -- Decode byte 0x04 (dec 4)
-                    -- Decode unknown field
-                    data_subtree:add(udp_payload_buffer(17, 1), "Unknown byte 0x04 (04): " .. string.format("0x%02X", protocol_buffer(4, 1):uint()))
-                    
-                    -- Decode byte 0x05 (dec 5)
-                    -- Decode unknown field
-                    data_subtree:add(udp_payload_buffer(18, 1), "Unknown byte 0x05 (05): " .. string.format("0x%02X", protocol_buffer(5, 1):uint()))
-                    
-                    -- Decode byte 0x06 (dec 6)
-                    -- Decode unknown field
-                    data_subtree:add(udp_payload_buffer(19, 1), "Unknown byte 0x06 (06): " .. string.format("0x%02X", protocol_buffer(6, 1):uint()))
-                    
-                    -- Decode byte 0x07 (dec 7)
-                    -- Decode unknown field
-                    data_subtree:add(udp_payload_buffer(20, 1), "Unknown byte 0x07 (07): " .. string.format("0x%02X", protocol_buffer(7, 1):uint()))
-                    
-                    -- Decode byte 0x08 (dec 8)
-                    -- Decode unknown field
-                    data_subtree:add(udp_payload_buffer(21, 1), "Unknown byte 0x08 (08): " .. string.format("0x%02X", protocol_buffer(8, 1):uint()))
-                    
-                    -- Decode byte 0x09 (dec 9)
-                    -- Decode unknown field
-                    data_subtree:add(udp_payload_buffer(22, 1), "Unknown byte 0x09 (09): " .. string.format("0x%02X", protocol_buffer(9, 1):uint()))
-                    
-                    -- Decode byte 0x0A (dec 10)
-                    -- Decode unknown field
-                    data_subtree:add(udp_payload_buffer(23, 1), "Unknown byte 0x0A (10): " .. string.format("0x%02X", protocol_buffer(10, 1):uint()))
-                    
-                    -- Decode byte 0x0B (dec 11)
-                    -- Decode unknown field
-                    data_subtree:add(udp_payload_buffer(24, 1), "Unknown byte 0x0B (11): " .. string.format("0x%02X", protocol_buffer(11, 1):uint()))
-                    
-                    -- Decode byte 0x0C (dec 12)
-                    -- Decode unknown field
-                    data_subtree:add(udp_payload_buffer(25, 1), "Unknown byte 0x0C (12): " .. string.format("0x%02X", protocol_buffer(12, 1):uint()))
-                    
-                    -- Decode byte 0x0D (dec 13)
-                    -- Decode unknown field
-                    data_subtree:add(udp_payload_buffer(26, 1), "Unknown byte 0x0D (13): " .. string.format("0x%02X", protocol_buffer(13, 1):uint()))
-                    
-                    -- Decode byte 0x0E (dec 14)
-                    -- Decode unknown field
-                    data_subtree:add(udp_payload_buffer(27, 1), "Unknown byte 0x0E (14): " .. string.format("0x%02X", protocol_buffer(14, 1):uint()))
-                    
-                    -- Decode byte 0x0F (dec 15)
-                    -- Decode unknown field
-                    data_subtree:add(udp_payload_buffer(28, 1), "Unknown byte 0x0F (15): " .. string.format("0x%02X", protocol_buffer(15, 1):uint()))
-                    
-                    -- Decode byte 0x10 (dec 16)
-                    -- Decode the oper_mode field
-                    local oper_mode = protocol_buffer(16, 1):uint()
-                    data_subtree:add(udp_payload_buffer(29, 1), "0x10 Operating Mode: " .. string.format("0x%02X", oper_mode) .. " (" .. getOperModeString(oper_mode) .. ")")
-                    
-                    -- Decode byte 0x11 (dec 17)
-                    -- Decode the fan field
-                    local fan = protocol_buffer(17, 1):uint()
-
-                    data_subtree:add(udp_payload_buffer(30, 1), "0x11 Fan: " .. string.format("0x%02X", fan) .. " (" .. getFanString(fan) .. ")")
-                    
-                    -- Decode byte 0x12 (dec 18)
-                    -- Decode unknown field
-                    data_subtree:add(udp_payload_buffer(31, 1), "Unknown byte 0x12 (18): " .. string.format("0x%02X", protocol_buffer(18, 1):uint()))
-                    
-                    -- Decode byte 0x13 (dec 19)
-                    -- Decode unknown field
-                    data_subtree:add(udp_payload_buffer(32, 1), "Unknown byte 0x13 (19): " .. string.format("0x%02X", protocol_buffer(19, 1):uint()))
-                    
-                    -- Decode byte 0x14 (dec 20)
-                    -- Decode unknown field
-                    data_subtree:add(udp_payload_buffer(33, 1), "Unknown byte 0x14 (20): " .. string.format("0x%02X", protocol_buffer(20, 1):uint()))
-                    
-                    -- Decode byte 0x15 (dec 21)
-                    -- Decode unknown field
-                    data_subtree:add(udp_payload_buffer(34, 1), "Unknown byte 0x15 (21): " .. string.format("0x%02X", protocol_buffer(21, 1):uint()))
-                    
-                    -- Decode byte 0x16 (dec 22)
-                    -- Decode unknown field
-                    data_subtree:add(udp_payload_buffer(35, 1), "Unknown byte 0x16 (22): " .. string.format("0x%02X", protocol_buffer(22, 1):uint()))
-                    
-                    -- Decode byte 0x17 (dec 23)
-                    -- Decode unknown field
-                    data_subtree:add(udp_payload_buffer(36, 1), "Unknown byte 0x17 (23): " .. string.format("0x%02X", protocol_buffer(23, 1):uint()))
-                    
-                    -- Decode byte 0x18 (dec 24)
-                    -- Decode unknown field
-                    data_subtree:add(udp_payload_buffer(37, 1), "Unknown byte 0x18 (24): " .. string.format("0x%02X", protocol_buffer(24, 1):uint()))
-                    
-                    -- Decode byte 0x19 (dec 25)
-                    -- Decode unknown field
-                    data_subtree:add(udp_payload_buffer(38, 1), "Unknown byte 0x19 (25): " .. string.format("0x%02X", protocol_buffer(25, 1):uint()))
-                    
-                    -- Decode byte 0x1A (dec 26)
-                    -- Decode unknown field
-                    data_subtree:add(udp_payload_buffer(39, 1), "Unknown byte 0x1A (26): " .. string.format("0x%02X", protocol_buffer(26, 1):uint()))
-                    
-                    -- Decode byte 0x1B (dec 27)
-                    -- Decode unknown field
-                    data_subtree:add(udp_payload_buffer(40, 1), "Unknown byte 0x1B (27): " .. string.format("0x%02X", protocol_buffer(27, 1):uint()))
-                    
-                    -- Decode byte 0x1C (dec 28)
-                    -- Decode unknown field
-                    data_subtree:add(udp_payload_buffer(41, 1), "Unknown byte 0x1C (28): " .. string.format("0x%02X", protocol_buffer(28, 1):uint()))
-                    
-                    -- Decode byte 0x1D (dec 29)
-                    -- Decode unknown field
-                    data_subtree:add(udp_payload_buffer(42, 1), "Unknown byte 0x1D (29): " .. string.format("0x%02X", protocol_buffer(29, 1):uint()))
-                    
-                    -- Validate CRC for 32-byte protocol length
-                    local crc_80 = protocol_buffer(30, 1):uint()
-                    local calculated_crc_80 = validate_crc(udp_payload_buffer(13, 32), 32)
-
-                    if calculated_crc_80 == crc_80 then
-                        data_subtree:add(udp_payload_buffer(43, 1), "CRC: " .. string.format("0x%02X", crc_80) .. " (Valid)")
-                    else
-                        data_subtree:add(udp_payload_buffer(43, 1), "CRC: " .. string.format("0x%02X", crc_80) .. " (Invalid, calculated: 0x%02X)", calculated_crc_80)
-                    end
-
-                    -- Add EndOfFrame field
-                    data_subtree:add(udp_payload_buffer(44, 1), "EndOfFrame: " .. string.format("0x%02X", protocol_buffer(31, 1):uint()))
-
-                else
-                    -- Decode byte 0x00 (Preamble)
-                    data_subtree:add(udp_payload_buffer(13, 1), "0x00 Preamble: " .. string.format("0x%02X", protocol_buffer(0, 1):uint()))
-                
-                    -- Decode byte 0x01 (dec 1)
-                    -- Decode the response code field
-                    data_subtree:add(udp_payload_buffer(14, 1), "0x01 Response Code: " .. string.format("0x%02X", protocol_buffer(1, 1):uint()))
-               
-                    -- Decode byte 0x02 (dec 2)
-                    -- Decode unknown field
-                    data_subtree:add(udp_payload_buffer(15, 1), "Unknown byte 0x02 (02): " .. string.format("0x%02X", protocol_buffer(2, 1):uint()))
-                    
-                    -- Decode byte 0x03 (dec 3)
-                    -- Decode unknown field
-                    data_subtree:add(udp_payload_buffer(16, 1), "Unknown byte 0x03 (03): " .. string.format("0x%02X", protocol_buffer(3, 1):uint()))
-                    
-                    -- Decode byte 0x04 (dec 4)
-                    -- Decode unknown field
-                    data_subtree:add(udp_payload_buffer(17, 1), "Unknown byte 0x04 (04): " .. string.format("0x%02X", protocol_buffer(4, 1):uint()))
-                    
-                    -- Decode byte 0x05 (dec 5)
-                    -- Decode unknown field
-                    data_subtree:add(udp_payload_buffer(18, 1), "Unknown byte 0x05 (05): " .. string.format("0x%02X", protocol_buffer(5, 1):uint()))
-                    
-                    -- Decode byte 0x06 (dec 6)
-                    -- Decode unknown field
-                    data_subtree:add(udp_payload_buffer(19, 1), "Unknown byte 0x06 (06): " .. string.format("0x%02X", protocol_buffer(6, 1):uint()))
-                    
-                    -- Decode byte 0x07 (dec 7)
-                    -- Decode unknown field
-                    data_subtree:add(udp_payload_buffer(20, 1), "Unknown byte 0x07 (07): " .. string.format("0x%02X", protocol_buffer(7, 1):uint()))
-                    
-                    -- Decode byte 0x08 (dec 8)
-                    -- Decode unknown field
-                    data_subtree:add(udp_payload_buffer(21, 1), "Unknown byte 0x08 (08): " .. string.format("0x%02X", protocol_buffer(8, 1):uint()))
-                    
-                    -- Decode byte 0x09 (dec 9)
-                    -- Decode unknown field
-                    data_subtree:add(udp_payload_buffer(22, 1), "Unknown byte 0x09 (09): " .. string.format("0x%02X", protocol_buffer(9, 1):uint()))
-                    
-                    -- Decode byte 0x0A (dec 10)
-                    -- Decode unknown field
-                    data_subtree:add(udp_payload_buffer(23, 1), "Unknown byte 0x0A (10): " .. string.format("0x%02X", protocol_buffer(10, 1):uint()))
-                    
-                    -- Decode byte 0x0B (dec 11)
-                    -- Decode unknown field
-                    data_subtree:add(udp_payload_buffer(24, 1), "Unknown byte 0x0B (11): " .. string.format("0x%02X", protocol_buffer(11, 1):uint()))
-                    
-                    -- Decode byte 0x0C (dec 12)
-                    -- Decode unknown field
-                    data_subtree:add(udp_payload_buffer(25, 1), "Unknown byte 0x0C (12): " .. string.format("0x%02X", protocol_buffer(12, 1):uint()))
-                    
-                    -- Decode byte 0x0D (dec 13)
-                    -- Decode unknown field
-                    data_subtree:add(udp_payload_buffer(26, 1), "Unknown byte 0x0D (13): " .. string.format("0x%02X", protocol_buffer(13, 1):uint()))
-                    
-                    -- Decode byte 0x0E (dec 14)
-                    -- Decode unknown field
-                    data_subtree:add(udp_payload_buffer(27, 1), "Unknown byte 0x0E (14): " .. string.format("0x%02X", protocol_buffer(14, 1):uint()))
-                    
-                    -- Decode byte 0x0F (dec 15)
-                    -- Decode unknown field
-                    data_subtree:add(udp_payload_buffer(28, 1), "Unknown byte 0x0F (15): " .. string.format("0x%02X", protocol_buffer(15, 1):uint()))
-                    
-                    -- Decode byte 0x10 (dec 16)
-                    -- Decode unknown field
-                    data_subtree:add(udp_payload_buffer(29, 1), "Unknown byte 0x10 (16): " .. string.format("0x%02X", protocol_buffer(16, 1):uint()))
-                    
-                    -- Decode byte 0x11 (dec 17)
-                    -- Decode unknown field
-                    data_subtree:add(udp_payload_buffer(30, 1), "Unknown byte 0x11 (17): " .. string.format("0x%02X", protocol_buffer(17, 1):uint()))
-                    
-                    -- Decode byte 0x12 (dec 18)
-                    -- Decode unknown field
-                    data_subtree:add(udp_payload_buffer(31, 1), "Unknown byte 0x12 (18): " .. string.format("0x%02X", protocol_buffer(18, 1):uint()))
-                    
-                    -- Decode byte 0x13 (dec 19)
-                    -- Decode unknown field
-                    data_subtree:add(udp_payload_buffer(32, 1), "Unknown byte 0x13 (19): " .. string.format("0x%02X", protocol_buffer(19, 1):uint()))
-                    
-                    -- Decode byte 0x14 (dec 20)
-                    -- Decode unknown field
-                    data_subtree:add(udp_payload_buffer(33, 1), "Unknown byte 0x14 (20): " .. string.format("0x%02X", protocol_buffer(20, 1):uint()))
-                    
-                    -- Decode byte 0x15 (dec 21)
-                    -- Decode unknown field
-                    data_subtree:add(udp_payload_buffer(34, 1), "Unknown byte 0x15 (21): " .. string.format("0x%02X", protocol_buffer(21, 1):uint()))
-                    
-                    -- Decode byte 0x16 (dec 22)
-                    -- Decode unknown field
-                    data_subtree:add(udp_payload_buffer(35, 1), "Unknown byte 0x16 (22): " .. string.format("0x%02X", protocol_buffer(22, 1):uint()))
-                    
-                    -- Decode byte 0x17 (dec 23)
-                    -- Decode unknown field
-                    data_subtree:add(udp_payload_buffer(36, 1), "Unknown byte 0x17 (23): " .. string.format("0x%02X", protocol_buffer(23, 1):uint()))
-                    
-                    -- Decode byte 0x18 (dec 24)
-                    -- Decode unknown field
-                    data_subtree:add(udp_payload_buffer(37, 1), "Unknown byte 0x18 (24): " .. string.format("0x%02X", protocol_buffer(24, 1):uint()))
-                    
-                    -- Decode byte 0x19 (dec 25)
-                    -- Decode unknown field
-                    data_subtree:add(udp_payload_buffer(38, 1), "Unknown byte 0x19 (25): " .. string.format("0x%02X", protocol_buffer(25, 1):uint()))
-                    
-                    -- Decode byte 0x1A (dec 26)
-                    -- Decode unknown field
-                    data_subtree:add(udp_payload_buffer(39, 1), "Unknown byte 0x1A (26): " .. string.format("0x%02X", protocol_buffer(26, 1):uint()))
-                    
-                    -- Decode byte 0x1B (dec 27)
-                    -- Decode unknown field
-                    data_subtree:add(udp_payload_buffer(40, 1), "Unknown byte 0x1B (27): " .. string.format("0x%02X", protocol_buffer(27, 1):uint()))
-                    
-                    -- Decode byte 0x1C (dec 28)
-                    -- Decode unknown field
-                    data_subtree:add(udp_payload_buffer(41, 1), "Unknown byte 0x1C (28): " .. string.format("0x%02X", protocol_buffer(28, 1):uint()))
-                    
-                    -- Decode byte 0x1D (dec 29)
-                    -- Decode unknown field
-                    data_subtree:add(udp_payload_buffer(42, 1), "Unknown byte 0x1D (29): " .. string.format("0x%02X", protocol_buffer(29, 1):uint()))
-                    
-                    -- Validate CRC for 32-byte protocol length
-                    local crc_80 = protocol_buffer(30, 1):uint()
-                    local calculated_crc_80 = validate_crc(udp_payload_buffer(13, 32), 32)
-
-                    if calculated_crc_80 == crc_80 then
-                        data_subtree:add(udp_payload_buffer(43, 1), "CRC: " .. string.format("0x%02X", crc_80) .. " (Valid)")
-                    else
-                        data_subtree:add(udp_payload_buffer(43, 1), "CRC: " .. string.format("0x%02X", crc_80) .. " (Invalid, calculated: 0x%02X)", calculated_crc_80)
-                    end
-
-                    -- Add EndOfFrame field
-                    data_subtree:add(udp_payload_buffer(44, 1), "EndOfFrame: " .. string.format("0x%02X", protocol_buffer(31, 1):uint()))
-                
-                end -- end of if command_code
-
-
-            else
-                 -- Print the data for longer buffers
-                data_subtree:add(udp_payload_buffer(13, protocol_buffer:len()), "Data: " .. tostring(protocol_buffer:bytes()))
             end
+
+            -- CRC + checksum display
+            subtree:add(udp_payload_buffer(crc_offset, 1), string.format(
+                "CRC-8: 0x%02X %s", crc_val,
+                crc_ok and "(Valid)" or string.format("(INVALID, calculated 0x%02X)", crc_calc)))
+            subtree:add(udp_payload_buffer(cksum_offset, 1), string.format(
+                "Checksum: 0x%02X %s", cksum_val,
+                cksum_ok and "(Valid)" or string.format("(INVALID, calculated 0x%02X)", cksum_calc)))
+        else
+            subtree:add(pbuf(0, proto_len), "Frame data (incomplete): " ..
+                tostring(protocol_buffer:bytes()))
         end
+
+        -- Raw frame hex dump (always shown for research)
+        subtree:add(pbuf(0, proto_len), "Raw Frame: " .. tostring(protocol_buffer:bytes()))
+
+    elseif is_xye then
+        -- ══════════════════════════════════════════════════════════════════
+        -- ── XYE RS-485 PROTOCOL (existing decoder) ──────────────────────
+        -- ══════════════════════════════════════════════════════════════════
+        subtree:add(f.protocol_type, "XYE (RS-485)")
+        pinfo.cols.info:prepend("XYE ")
+
+        subtree:add(f.command_code, pbuf(1, 1))
+
+        local protocol_length = protocol_buffer:len()
+        subtree:add(f.command_length, protocol_length)
+        local protocol_buffer_anotation_string = string.format("(Length: %d bytes - ", protocol_length)
+
+        if protocol_length >= 3 then
+            local protocol_crc = protocol_buffer(protocol_length - 2, 1):uint()
+            local calculated_protocol_crc = validate_crc(protocol_buffer, protocol_length)
+            protocol_buffer_anotation_string = protocol_buffer_anotation_string .. string.format("CRC: 0x%02X %s",
+                protocol_crc,
+                calculated_protocol_crc == protocol_crc and " valid" or
+                string.format(" invalid, calculated: 0x%02X", calculated_protocol_crc))
+        end
+
+        local data_subtree = subtree:add(f.data, udp_payload_buffer(data_offset, proto_len)):append_text(
+            " " .. protocol_buffer_anotation_string .. ")")
+
+        if protocol_length == 16 then
+            data_subtree:add(pbuf(0, 1), "0x00 Preamble: " .. string.format("0x%02X", protocol_buffer(0, 1):uint()))
+            local command_code = protocol_buffer(1, 1):uint()
+            local command_name = XYE_COMMANDS[command_code] or "Unknown"
+            data_subtree:add(pbuf(1, 1), "0x01 Command: " .. string.format("0x%02X", command_code) .. " (" .. command_name .. ")")
+            data_subtree:add(pbuf(2, 1), "0x02 Destination: " .. string.format("0x%02X", protocol_buffer(2, 1):uint()))
+            data_subtree:add(pbuf(3, 1), "0x03 Source / Own ID: " .. string.format("0x%02X", protocol_buffer(3, 1):uint()))
+            data_subtree:add(pbuf(4, 1), "0x04 From Master: " .. string.format("0x%02X", protocol_buffer(4, 1):uint()))
+            data_subtree:add(pbuf(5, 1), "0x05 Source / Own ID: " .. string.format("0x%02X", protocol_buffer(5, 1):uint()))
+
+            if command_code == 0xC3 then
+                local oper_mode = protocol_buffer(6, 1):uint()
+                data_subtree:add(pbuf(6, 1), "0x06 Operating Mode: " .. string.format("0x%02X", oper_mode) .. " (" .. getOperModeString(oper_mode) .. ")")
+                local fan = protocol_buffer(7, 1):uint()
+                data_subtree:add(pbuf(7, 1), "0x07 Fan: " .. string.format("0x%02X", fan) .. " (" .. getFanString(fan) .. ")")
+                data_subtree:add(pbuf(8, 1), "0x08 Set Temp: " .. string.format("0x%02X", protocol_buffer(8, 1):uint()) .. " C")
+                local mode_flags = protocol_buffer(9, 1):uint()
+                local mode_flags_str = "Unknown"
+                if mode_flags == 0x02 then mode_flags_str = "Aux Heat (Turbo)"
+                elseif mode_flags == 0x00 then mode_flags_str = "Normal"
+                elseif mode_flags == 0x01 then mode_flags_str = "ECO Mode (Sleep)"
+                elseif mode_flags == 0x04 then mode_flags_str = "Swing"
+                elseif mode_flags == 0x88 then mode_flags_str = "Ventilate" end
+                data_subtree:add(pbuf(9, 1), "0x09 Mode Flags: " .. string.format("0x%02X", mode_flags) .. " (" .. mode_flags_str .. ")")
+                data_subtree:add(pbuf(10, 1), "0x0A Timer Start: " .. string.format("0x%02X", protocol_buffer(10, 1):uint()))
+                data_subtree:add(pbuf(11, 1), "0x0B Timer Stop: " .. string.format("0x%02X", protocol_buffer(11, 1):uint()))
+                data_subtree:add(pbuf(12, 1), "0x0C Unknown: " .. string.format("0x%02X", protocol_buffer(12, 1):uint()))
+            else
+                data_subtree:add(pbuf(6, 7), "Payload: " .. tostring(protocol_buffer(6, 7):bytes()))
+            end
+
+            data_subtree:add(pbuf(13, 1), "0x0D Command Check: " .. string.format("0x%02X", protocol_buffer(13, 1):uint()))
+            local calculated_crc = validate_crc(udp_payload_buffer(data_offset, 16), 16)
+            local crc_value = protocol_buffer(14, 1):uint()
+            if calculated_crc == crc_value then
+                data_subtree:add(pbuf(14, 1), "0x0E CRC: " .. string.format("0x%02X", crc_value) .. " (Valid)")
+            else
+                data_subtree:add(pbuf(14, 1), "0x0E CRC: " .. string.format("0x%02X", crc_value) .. " (Invalid, calculated: 0x%02X)", calculated_crc)
+            end
+            data_subtree:add(pbuf(15, 1), "0x0F EndOfFrame: " .. string.format("0x%02X", protocol_buffer(15, 1):uint()))
+
+        elseif protocol_length == 32 then
+            local command_code = protocol_buffer(1, 1):uint()
+            local command_name = XYE_COMMANDS[command_code] or "Unknown"
+            data_subtree:add(pbuf(0, 1), "0x00 Preamble: " .. string.format("0x%02X", protocol_buffer(0, 1):uint()))
+            data_subtree:add(pbuf(1, 1), "0x01 Response Code: " .. string.format("0x%02X", command_code) .. " (" .. command_name .. ")")
+
+            if command_code == 0xC0 or command_code == 0xC3 then
+                data_subtree:add(pbuf(2, 1), "0x02 To Master: " .. string.format("0x%02X", protocol_buffer(2, 1):uint()))
+                data_subtree:add(pbuf(3, 1), "0x03 Destination: " .. string.format("0x%02X", protocol_buffer(3, 1):uint()))
+                data_subtree:add(pbuf(4, 1), "0x04 Source/Own ID: " .. string.format("0x%02X", protocol_buffer(4, 1):uint()))
+                data_subtree:add(pbuf(5, 1), "0x05 Destination (masterID): " .. string.format("0x%02X", protocol_buffer(5, 1):uint()))
+
+                local oper_mode = protocol_buffer(8, 1):uint()
+                data_subtree:add(pbuf(8, 1), "0x08 Operating Mode: " .. string.format("0x%02X", oper_mode) .. " (" .. getOperModeString(oper_mode) .. ")")
+                local fan = protocol_buffer(9, 1):uint()
+                data_subtree:add(pbuf(9, 1), "0x09 Fan: " .. string.format("0x%02X", fan) .. " (" .. getFanString(fan) .. ")")
+                data_subtree:add(pbuf(10, 1), "0x0A Set Temp: " .. string.format("0x%02X", protocol_buffer(10, 1):uint()))
+
+                local t1 = protocol_buffer(11, 1):uint()
+                data_subtree:add(pbuf(11, 1), string.format("0x0B T1 Temp: 0x%02X (%.1f C)", t1, (t1 - 0x30) * 0.5))
+                local t2a = protocol_buffer(12, 1):uint()
+                data_subtree:add(pbuf(12, 1), string.format("0x0C T2A Temp: 0x%02X (%.1f C)", t2a, (t2a - 0x30) * 0.5))
+                local t2b = protocol_buffer(13, 1):uint()
+                data_subtree:add(pbuf(13, 1), string.format("0x0D T2B Temp: 0x%02X (%.1f C)", t2b, (t2b - 0x30) * 0.5))
+                local t3 = protocol_buffer(14, 1):uint()
+                data_subtree:add(pbuf(14, 1), string.format("0x0E T3 Temp: 0x%02X (%.1f C)", t3, (t3 - 0x30) * 0.5))
+                data_subtree:add(pbuf(15, 1), "0x0F Current: " .. string.format("0x%02X", protocol_buffer(15, 1):uint()))
+
+                local timer_start = protocol_buffer(17, 1):uint()
+                local hours_start = math.floor((timer_start % 128) * 15 / 60)
+                local minutes_start = (timer_start % 128) * 15 % 60
+                data_subtree:add(pbuf(17, 1), "0x11 Timer Start: " .. string.format("0x%02X (%dh%02dm)", timer_start, hours_start, minutes_start))
+                local timer_stop = protocol_buffer(18, 1):uint()
+                local hours_stop = math.floor((timer_stop % 128) * 15 / 60)
+                local minutes_stop = (timer_stop % 128) * 15 % 60
+                data_subtree:add(pbuf(18, 1), "0x12 Timer Stop: " .. string.format("0x%02X (%dh%02dm)", timer_stop, hours_stop, minutes_stop))
+
+                data_subtree:add(pbuf(19, 1), "0x13 Run: " .. string.format("0x%02X", protocol_buffer(19, 1):uint()))
+                data_subtree:add(pbuf(20, 1), "0x14 Mode Flags: " .. string.format("0x%02X", protocol_buffer(20, 1):uint()))
+                data_subtree:add(pbuf(21, 1), "0x15 Operating Flags: " .. string.format("0x%02X", protocol_buffer(21, 1):uint()))
+                data_subtree:add(pbuf(22, 1), "0x16 Error E (0..7): " .. string.format("0x%02X", protocol_buffer(22, 1):uint()))
+                data_subtree:add(pbuf(23, 1), "0x17 Error E (7..f): " .. string.format("0x%02X", protocol_buffer(23, 1):uint()))
+                data_subtree:add(pbuf(24, 1), "0x18 Protect P (0..7): " .. string.format("0x%02X", protocol_buffer(24, 1):uint()))
+                data_subtree:add(pbuf(25, 1), "0x19 Protect P (7..f): " .. string.format("0x%02X", protocol_buffer(25, 1):uint()))
+                data_subtree:add(pbuf(26, 1), "0x1A CCM Comm Error: " .. string.format("0x%02X", protocol_buffer(26, 1):uint()))
+
+                for i = 27, 29 do
+                    data_subtree:add(pbuf(i, 1), string.format("0x%02X Unknown: 0x%02X", i, protocol_buffer(i, 1):uint()))
+                end
+            else
+                -- C4/C6 or other: dump all bytes with offset labels
+                for i = 2, 29 do
+                    data_subtree:add(pbuf(i, 1), string.format("0x%02X: 0x%02X", i, protocol_buffer(i, 1):uint()))
+                end
+            end
+
+            -- CRC + EndOfFrame for 32-byte XYE
+            local crc_32 = protocol_buffer(30, 1):uint()
+            local calc_crc_32 = validate_crc(udp_payload_buffer(data_offset, 32), 32)
+            if calc_crc_32 == crc_32 then
+                data_subtree:add(pbuf(30, 1), "0x1E CRC: " .. string.format("0x%02X", crc_32) .. " (Valid)")
+            else
+                data_subtree:add(pbuf(30, 1), "0x1E CRC: " .. string.format("0x%02X", crc_32) .. " (Invalid, calculated: 0x%02X)", calc_crc_32)
+            end
+            data_subtree:add(pbuf(31, 1), "0x1F EndOfFrame: " .. string.format("0x%02X", protocol_buffer(31, 1):uint()))
+
+        else
+            data_subtree:add(udp_payload_buffer(data_offset, proto_len),
+                "Data: " .. tostring(protocol_buffer:bytes()))
+        end
+
+        -- Raw frame hex dump (always shown for research)
+        subtree:add(pbuf(0, proto_len), "Raw Frame: " .. tostring(protocol_buffer:bytes()))
+
+    else
+        -- Unknown protocol — neither XYE command range nor UART length range
+        subtree:add(f.protocol_type, string.format("Unknown (byte1=0x%02X)", byte1))
+        subtree:add(udp_payload_buffer(data_offset, proto_len),
+            "Raw Frame: " .. tostring(protocol_buffer:bytes()))
     end
 end
 
