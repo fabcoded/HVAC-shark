@@ -27,6 +27,12 @@ f.uart_appliance  = ProtoField.uint8 ("hvac_shark.uart.appliance",  "Appliance T
 f.uart_sync       = ProtoField.uint8 ("hvac_shark.uart.sync",       "Sync Byte", base.HEX)
 f.uart_protocol   = ProtoField.uint8 ("hvac_shark.uart.protocol",   "Protocol Version")
 f.uart_msg_type   = ProtoField.uint8 ("hvac_shark.uart.msg_type",   "Message Type", base.HEX)
+-- IR-specific fields
+f.ir_device_id    = ProtoField.uint8 ("hvac_shark.ir.device_id",    "Device ID", base.HEX)
+f.ir_command      = ProtoField.uint8 ("hvac_shark.ir.command",      "Command Byte", base.HEX)
+f.ir_extended     = ProtoField.uint8 ("hvac_shark.ir.extended",     "Extended Byte", base.HEX)
+f.ir_complement   = ProtoField.string("hvac_shark.ir.complement",   "Complement Check")
+f.ir_frame_type   = ProtoField.string("hvac_shark.ir.frame_type",   "Frame Type")
 
 
 -- ── XYE lookup tables ────────────────────────────────────────────────────────
@@ -440,6 +446,7 @@ function hvac_shark_proto.dissector(udp_payload_buffer, pinfo, tree)
         [0x01] = "UART",
         [0x02] = "disp-mainboard_1",
         [0x03] = "r-t_1",
+        [0x04] = "IR",
     }
     local bus_name = BUS_TYPE_NAMES[bus_type] or string.format("Unknown (0x%02X)", bus_type)
     subtree:add(f.bus_type, udp_payload_buffer(11, 1)):append_text(" (Bus = " .. bus_name .. ")")
@@ -496,7 +503,7 @@ function hvac_shark_proto.dissector(udp_payload_buffer, pinfo, tree)
     --   XYE commands {0xC0..0xCD} vs UART length {0x0D..0x40}
 
     local byte1 = protocol_buffer(1, 1):uint()
-    local is_xye, is_uart, is_disp_mb, is_rt
+    local is_xye, is_uart, is_disp_mb, is_rt, is_ir
 
     if bus_type == 0x01 then
         is_uart = true
@@ -504,6 +511,8 @@ function hvac_shark_proto.dissector(udp_payload_buffer, pinfo, tree)
         is_disp_mb = true
     elseif bus_type == 0x03 then
         is_rt = true
+    elseif bus_type == 0x04 then
+        is_ir = true
     elseif bus_type == 0x00 then
         -- Legacy auto-detection for XYE-tagged packets
         is_xye = XYE_COMMANDS[byte1] ~= nil
@@ -930,6 +939,139 @@ function hvac_shark_proto.dissector(udp_payload_buffer, pinfo, tree)
 
         -- Raw frame hex dump
         subtree:add(pbuf(0, proto_len), "Raw Frame: " .. tostring(protocol_buffer:bytes()))
+
+    elseif is_ir then
+        -- ══════════════════════════════════════════════════════════════════
+        -- ── MIDEA IR REMOTE CONTROL PROTOCOL ─────────────────────────────
+        -- ══════════════════════════════════════════════════════════════════
+        -- 6 bytes per frame: 3 complement pairs (byte[n] XOR byte[n+1] = 0xFF)
+        -- Device IDs: 0xB2 = AC control, 0xB9 = Setup/Programming, 0xD5 = Follow-up
+
+        local IR_DEVICE_NAMES = {
+            [0xB2] = "Midea AC",
+            [0xB9] = "Setup/Programming",
+            [0xD5] = "Follow-up",
+        }
+
+        local IR_AC_MODES = {
+            [0] = "Auto", [1] = "Cool", [2] = "Dry", [3] = "Heat", [4] = "Fan",
+        }
+
+        local IR_AC_FAN = {
+            [0] = "Auto", [1] = "High", [2] = "Medium", [4] = "Low",
+        }
+
+        if proto_len < 6 then
+            subtree:add(f.protocol_type, "Midea IR (truncated)")
+            subtree:add(pbuf(0, proto_len), "Raw Frame: " .. tostring(protocol_buffer:bytes()))
+        else
+            local device_id  = protocol_buffer(0, 1):uint()
+            local device_cpl = protocol_buffer(1, 1):uint()
+            local cmd_byte   = protocol_buffer(2, 1):uint()
+            local cmd_cpl    = protocol_buffer(3, 1):uint()
+            local ext_byte   = protocol_buffer(4, 1):uint()
+            local ext_cpl    = protocol_buffer(5, 1):uint()
+
+            local dev_name = IR_DEVICE_NAMES[device_id] or string.format("Unknown (0x%02X)", device_id)
+
+            -- Complement validation
+            local cpl1_ok = bit.bxor(device_id, device_cpl) == 0xFF
+            local cpl2_ok = bit.bxor(cmd_byte, cmd_cpl) == 0xFF
+            local cpl3_ok = bit.bxor(ext_byte, ext_cpl) == 0xFF
+            local all_cpl_ok = cpl1_ok and cpl2_ok and cpl3_ok
+
+            -- Frame type for info column
+            local frame_label
+            if device_id == 0xB2 then
+                frame_label = "IR AC"
+            elseif device_id == 0xB9 then
+                frame_label = "IR Setup"
+            elseif device_id == 0xD5 then
+                frame_label = "IR Follow-up"
+            else
+                frame_label = "IR"
+            end
+
+            subtree:add(f.protocol_type, "Midea IR (" .. dev_name .. ")")
+            pinfo.cols.info:prepend("[" .. frame_label .. "] ")
+
+            -- Device ID
+            subtree:add(f.ir_device_id, protocol_buffer(0, 1)):append_text(
+                " (" .. dev_name .. ")")
+            subtree:add(f.ir_frame_type, frame_label)
+
+            -- Complement check summary
+            local cpl_str = string.format("Pair1=%s  Pair2=%s  Pair3=%s",
+                cpl1_ok and "OK" or "MISMATCH",
+                cpl2_ok and "OK" or "MISMATCH",
+                cpl3_ok and "OK" or "MISMATCH")
+            local cpl_node = subtree:add(f.ir_complement, cpl_str)
+            if not all_cpl_ok then
+                cpl_node:add_expert_info(PI_CHECKSUM, PI_WARN, "Complement mismatch")
+            end
+
+            -- ── Device-specific decoding ─────────────────────────────────
+            if device_id == 0xB2 then
+                -- AC Control Command — field mapping from Session 2 cross-referencing
+                -- Byte 2 (cmd_byte): mode/power flags — constant 0xBF in all captured
+                --   sessions; exact bit assignments TBD (need captures with mode changes)
+                -- Byte 4 (ext_byte) encoding — confirmed from 5 distinct frames:
+                --   bits[7:5] = temperature - 20  (3 data points: 22C/26C/24C confirmed)
+                --   bit  [4]  = swing (0=off, 1=on)   (confirmed from swing toggle)
+                --   bits [3:0]= always 0xC in all captures (fixed protocol marker, TBD)
+                local ir_tree = subtree:add(pbuf(2, 4), "AC Control")
+
+                -- Command byte: mode/power flags (encoding TBD)
+                ir_tree:add(f.ir_command, protocol_buffer(2, 1)):append_text(
+                    string.format(" (mode/power flags=0x%02X [TBD])", cmd_byte))
+
+                -- Extended byte: temperature + swing (confirmed), lower nibble fixed
+                local temp_bits = bit.rshift(bit.band(ext_byte, 0xE0), 5)
+                local temp_c    = temp_bits + 20
+                local swing_on  = bit.band(ext_byte, 0x10) ~= 0
+                local low_nibble = bit.band(ext_byte, 0x0F)
+
+                ir_tree:add(f.ir_extended, protocol_buffer(4, 1)):append_text(
+                    string.format(" (Temp=%d\xC2\xB0C, Swing=%s, fixed=0x%X)",
+                        temp_c, swing_on and "On" or "Off", low_nibble))
+
+            elseif device_id == 0xB9 then
+                -- Setup / Programming Command
+                -- cmd_byte 0xF7 observed; ext_byte = parameter index
+                --   0x00-0xFF: installer/setter mode parameter (0x00-0x08 observed as mode 0-8)
+                --   0xFF:      settermode query (observed at "enter settermode, query")
+                local ir_tree = subtree:add(pbuf(2, 4), "Setup/Programming")
+                ir_tree:add(f.ir_command, protocol_buffer(2, 1)):append_text(
+                    string.format(" (Function=0x%02X)", cmd_byte))
+                if ext_byte == 0xFF then
+                    ir_tree:add(f.ir_extended, protocol_buffer(4, 1)):append_text(
+                        " (Settermode Query)")
+                else
+                    ir_tree:add(f.ir_extended, protocol_buffer(4, 1)):append_text(
+                        string.format(" (Param=%d)", ext_byte))
+                end
+
+            elseif device_id == 0xD5 then
+                -- Follow-up / Termination Frame
+                local ir_tree = subtree:add(pbuf(2, 4), "Follow-up Frame")
+                ir_tree:add(f.ir_command, protocol_buffer(2, 1)):append_text(
+                    string.format(" (0x%02X)", cmd_byte))
+                ir_tree:add(f.ir_extended, protocol_buffer(4, 1)):append_text(
+                    string.format(" (0x%02X)", ext_byte))
+                if not cpl1_ok then
+                    ir_tree:add_expert_info(PI_PROTOCOL, PI_NOTE,
+                        "Non-standard complement (0xD5^0x66≠0xFF)")
+                end
+
+            else
+                -- Unknown IR device
+                subtree:add(f.ir_command, protocol_buffer(2, 1))
+                subtree:add(f.ir_extended, protocol_buffer(4, 1))
+            end
+
+            -- Raw frame hex dump
+            subtree:add(pbuf(0, proto_len), "Raw Frame: " .. tostring(protocol_buffer:bytes()))
+        end
 
     else
         -- Unknown protocol

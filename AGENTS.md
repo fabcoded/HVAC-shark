@@ -1,0 +1,91 @@
+# AGENTS.md — HVAC-shark
+
+> This file is read automatically by AI coding agents (Claude Code, Cursor, Copilot,
+> Windsurf, and others that honour `AGENTS.md` or `CLAUDE.md`). It sets the ground
+> rules for working in this repository.
+
+## Project overview
+
+HVAC-shark is an open-source protocol analysis toolkit for Midea HVAC systems.
+It captures, decodes, and dissects the internal communication buses of Midea
+air conditioning units for reverse-engineering and research purposes.
+
+Components:
+- Wireshark Lua dissector (`wireshark_dissectors/HVAC-shark_mid-xye.lua`)
+- ESP32 / Python live-capture dongle (`dongle/mid-xye/`)
+- Offline pcap converter for Saleae logic-analyser exports (in the dumps repo)
+
+## Target audience
+
+This project is used by professionals with strong backgrounds in both software
+engineering and microelectronics/embedded systems. Do not over-explain basic
+concepts (serial protocols, bit manipulation, pcap format, Lua, C++, etc.).
+
+## Working style
+
+**Ask before assuming.** This codebase involves undocumented proprietary
+protocols where a wrong assumption leads to incorrect dissectors or corrupt
+captures. When the intent of a change is not completely clear:
+
+1. Ask for clarification before writing any code.
+2. If the first answer is still ambiguous, ask again with a more specific
+   follow-up question. Do not proceed on a guess.
+3. Only implement what was explicitly requested. Do not add features,
+   refactor surrounding code, or "improve" things that were not mentioned.
+
+**Minimal changes.** Protocol decoders are built incrementally as more
+captures become available. A partial decoder with clearly marked unknowns
+(`TBD`,`FIXME`, `?`) is better than a complete-looking decoder built on guesses.
+
+**Document uncertainty explicitly.** When a field encoding is inferred from
+only one or two data points, label it as such in both code comments and any
+markdown documentation. Use the session `SessionNotes.md` files as ground
+truth for validating decoded values against known actions.
+
+**Best-effort analysis — note all controversies.** Protocol documentation in
+this project is built from captures, open-source references, and community
+notes — never from an official Midea specification. When sources disagree,
+**always state the conflict explicitly** rather than silently picking one.
+Use the following labels consistently:
+
+| Label           | Meaning                                                             |
+|-----------------|---------------------------------------------------------------------|
+| **Confirmed**   | Multiple independent data points, or hardware verified              |
+| **Consistent**  | Own captures + at least one source agree                            |
+| **Hypothesis**  | Own data only, no source conflict, but not independently verified   |
+| **Disputed**    | Sources disagree with each other or with own captures               |
+| **Unknown**     | Insufficient data to form a hypothesis                              |
+
+When updating documentation: do not silently upgrade a label. If a field
+moves from Hypothesis to Confirmed, record what new evidence confirmed it.
+
+## Repository layout
+
+```
+wireshark_dissectors/   Lua dissector loaded into Wireshark
+dongle/mid-xye/         ESP32 firmware + Python serial-to-UDP bridge
+  mid_xye/              Arduino project (PlatformIO)
+  py-mid-xye/           Python equivalent bridge
+protocol-analysis/      Protocol reference documents and comparison notes
+```
+
+The capture dumps and session data live in the separate `HVAC-shark-dumps`
+repository, not here.
+
+## Protocol constants
+
+HVAC_shark UDP framing (port 22222):
+
+| Offset | Size | Field          | Values                                      |
+|--------|------|----------------|---------------------------------------------|
+| 0      | 10   | Magic          | `HVAC_shark` (ASCII)                        |
+| 10     | 1    | Manufacturer   | `0x01` = Midea                              |
+| 11     | 1    | Bus type       | `0x00`=XYE, `0x01`=UART, `0x02`=disp-mb, `0x03`=r-t, `0x04`=IR |
+| 12     | 1    | Header version | `0x00`=legacy, `0x01`=extended              |
+| 13+    | var  | Metadata       | len-prefixed: channel name, board, comment  |
+| ...    | var  | Protocol data  | bus-specific payload                        |
+
+Bus type `0x04` (IR) payload: 6 decoded bytes per frame (NEC-like encoding,
+active-low TSOP receiver). See `SessionNotes.md` in session folders for
+known field mappings.
+

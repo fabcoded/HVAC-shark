@@ -1,0 +1,1133 @@
+# Midea HVAC UART Serial Protocol - Byte-Level Reference
+
+> **Source Status — Community, Open-Source, and Own Hardware Observations**
+> This document is based on publicly available information (open-source repositories, community
+> forum discussions, independently published technical observations) **and own hardware captures**
+> from the `HVAC-shark-dumps` repository. No official Midea protocol specification is publicly
+> available. Uncertainties are present throughout. Where sources contradict each other, the
+> conflict is explicitly flagged. A flagged discrepancy is only considered resolved after
+> independent hardware verification with corresponding additional documentation.
+
+Compiled from analysis of:
+- `dudanov/MideaUART` (C++/Arduino)
+- `NeoAcheron/midea-ac-py` (Python)
+- `reneklootwijk/midea-uart` (C++/ESP8266)
+- `chemelli74/midea-local` (Python, Home Assistant)
+- `reneklootwijk/node-mideahvac` (JavaScript)
+- `yitsushi/midea-air-condition` (Ruby)
+- **Own hardware captures** — `HVAC-shark-dumps` repository (Midea extremeSaveBlue display board, logic-analyser sessions)
+
+---
+
+## 1. Frame Structure
+
+Every UART frame follows this layout:
+
+```
+Offset  Size  Field           Value/Description
+------  ----  -----           -----------------
+  0      1    START_BYTE      0xAA (always)
+  1      1    LENGTH          Total frame length (including this byte, excluding byte 0)
+  2      1    APPLIANCE_TYPE  0xAC for air conditioner
+  3      1    SYNC            LENGTH ^ APPLIANCE_TYPE
+  4-7    4    (reserved)      0x00, 0x00, 0x00, 0x00
+  8      1    PROTOCOL        Protocol version (0x00 or 0x03)
+  9      1    MSG_TYPE        Message type (see below)
+ 10..N-3      BODY            Command/response payload (FrameData)
+  N-2    1    CRC8            CRC-8 over body bytes (offset 10..N-3)
+  N-1    1    CHECKSUM        Additive checksum over bytes 1..N-2
+```
+
+### Message Types (byte 9)
+- `0x02` - Command to appliance (set)
+- `0x03` - Response from appliance / notification
+- `0x04` - Network-related
+- `0x05` - Handshake/ACK
+- `0x07` - Device identification (appliance type in byte 2)
+- `0x63` - Network status request
+
+### Frame construction (dudanov):
+```python
+frame = bytearray([0xAA, 0x00, appliance_type, 0x00, 0x00, 0x00, 0x00, 0x00, protocol, msg_type])
+frame.extend(body_data)
+frame[1] = len(frame)           # length field
+frame[3] = frame[1] ^ frame[2]  # sync byte
+frame.append(crc8(frame[10:]))  # CRC over body
+frame.append(checksum(frame))   # checksum over bytes 1..end-1
+```
+
+---
+
+## 2. Checksum Algorithm
+
+**Frame Checksum** (last byte): Additive inverse of sum of bytes from offset 1 to N-2:
+```python
+def checksum(frame):
+    """Calculate frame checksum. Sum bytes[1..N-2], return negation (mod 256)."""
+    return (256 - sum(frame[1:])) & 0xFF
+```
+
+Alternative (from reneklootwijk): `256 - (sum of bytes[1..N-2]) & 0xFF`
+
+---
+
+## 3. CRC-8 Lookup Table and Algorithm
+
+All implementations use the same CRC-8/854 table (polynomial-based, 256 entries):
+
+```python
+CRC8_TABLE = [
+    0x00, 0x5E, 0xBC, 0xE2, 0x61, 0x3F, 0xDD, 0x83,
+    0xC2, 0x9C, 0x7E, 0x20, 0xA3, 0xFD, 0x1F, 0x41,
+    0x9D, 0xC3, 0x21, 0x7F, 0xFC, 0xA2, 0x40, 0x1E,
+    0x5F, 0x01, 0xE3, 0xBD, 0x3E, 0x60, 0x82, 0xDC,
+    0x23, 0x7D, 0x9F, 0xC1, 0x42, 0x1C, 0xFE, 0xA0,
+    0xE1, 0xBF, 0x5D, 0x03, 0x80, 0xDE, 0x3C, 0x62,
+    0xBE, 0xE0, 0x02, 0x5C, 0xDF, 0x81, 0x63, 0x3D,
+    0x7C, 0x22, 0xC0, 0x9E, 0x1D, 0x43, 0xA1, 0xFF,
+    0x46, 0x18, 0xFA, 0xA4, 0x27, 0x79, 0x9B, 0xC5,
+    0x84, 0xDA, 0x38, 0x66, 0xE5, 0xBB, 0x59, 0x07,
+    0xDB, 0x85, 0x67, 0x39, 0xBA, 0xE4, 0x06, 0x58,
+    0x19, 0x47, 0xA5, 0xFB, 0x78, 0x26, 0xC4, 0x9A,
+    0x65, 0x3B, 0xD9, 0x87, 0x04, 0x5A, 0xB8, 0xE6,
+    0xA7, 0xF9, 0x1B, 0x45, 0xC6, 0x98, 0x7A, 0x24,
+    0xF8, 0xA6, 0x44, 0x1A, 0x99, 0xC7, 0x25, 0x7B,
+    0x3A, 0x64, 0x86, 0xD8, 0x5B, 0x05, 0xE7, 0xB9,
+    0x8C, 0xD2, 0x30, 0x6E, 0xED, 0xB3, 0x51, 0x0F,
+    0x4E, 0x10, 0xF2, 0xAC, 0x2F, 0x71, 0x93, 0xCD,
+    0x11, 0x4F, 0xAD, 0xF3, 0x70, 0x2E, 0xCC, 0x92,
+    0xD3, 0x8D, 0x6F, 0x31, 0xB2, 0xEC, 0x0E, 0x50,
+    0xAF, 0xF1, 0x13, 0x4D, 0xCE, 0x90, 0x72, 0x2C,
+    0x6D, 0x33, 0xD1, 0x8F, 0x0C, 0x52, 0xB0, 0xEE,
+    0x32, 0x6C, 0x8E, 0xD0, 0x53, 0x0D, 0xEF, 0xB1,
+    0xF0, 0xAE, 0x4C, 0x12, 0x91, 0xCF, 0x2D, 0x73,
+    0xCA, 0x94, 0x76, 0x28, 0xAB, 0xF5, 0x17, 0x49,
+    0x08, 0x56, 0xB4, 0xEA, 0x69, 0x37, 0xD5, 0x8B,
+    0x57, 0x09, 0xEB, 0xB5, 0x36, 0x68, 0x8A, 0xD4,
+    0x95, 0xCB, 0x29, 0x77, 0xF4, 0xAA, 0x48, 0x16,
+    0xE9, 0xB7, 0x55, 0x0B, 0x88, 0xD6, 0x34, 0x6A,
+    0x2B, 0x75, 0x97, 0xC9, 0x4A, 0x14, 0xF6, 0xA8,
+    0x74, 0x2A, 0xC8, 0x96, 0x15, 0x4B, 0xA9, 0xF7,
+    0xB6, 0xE8, 0x0A, 0x54, 0xD7, 0x89, 0x6B, 0x35,
+]
+
+def crc8(data: bytes) -> int:
+    """CRC-8 over the body/payload bytes only (frame[10:-2])."""
+    crc = 0
+    for byte in data:
+        crc = CRC8_TABLE[crc ^ byte]
+    return crc
+```
+
+**Where CRC is applied:**
+- In `reneklootwijk`: CRC is computed over `data[10..N-3]` (body bytes excluding CRC and checksum)
+- In `NeoAcheron`: CRC is computed over `data[16:]` of the command (offset within the 30-byte inner command, i.e., body bytes after some header)
+- In `dudanov`: CRC is appended to the FrameData body before wrapping in a Frame
+
+---
+
+## 4. Command 0x41 - Query Status
+
+### Request Body (FrameData payload, at frame offset 10+):
+```python
+# dudanov QueryStateData:
+query_body = [
+    0x41,  # byte 0: command ID
+    0x81,  # byte 1: sub-command
+    0x00,  # byte 2
+    0xFF,  # byte 3
+    0x03,  # byte 4
+    0xFF,  # byte 5
+    0x00,  # byte 6
+    0x02,  # byte 7
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  # bytes 8-15
+    0x00, 0x00, 0x00, 0x00,                            # bytes 16-19
+    0x03,  # byte 20
+    MSG_ID,  # byte 21: incrementing message counter
+    # CRC8 appended automatically
+]
+```
+
+### Full frame (NeoAcheron-style, 0-indexed from frame start):
+```python
+query_frame = bytearray([
+    0xAA,  # [0]  start
+    0x23,  # [1]  length (will be recalculated)
+    0xAC,  # [2]  appliance type
+    0x00,  # [3]  sync (recalculated)
+    0x00, 0x00, 0x00, 0x00,  # [4-7] reserved
+    0x03,  # [8]  protocol
+    0x03,  # [9]  message type (query = 0x03 in reneklootwijk)
+    0x41,  # [10] command ID
+    0x81,  # [11]
+    0x00,  # [12]
+    0xFF,  # [13]
+    0x03,  # [14]
+    0xFF,  # [15]
+    0x00,  # [16]
+    0x02,  # [17]
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  # [18-25]
+    0x00, 0x00,  # [26-27]
+    0x00,  # [28] padding
+    0x03,  # [29]
+    0x00,  # [30] msg ID
+    0x00,  # [31] CRC8
+    0x00,  # [32] checksum
+])
+```
+
+### Query Power Usage (cmd 0x41 variant):
+```python
+power_query_body = [
+    0x41,  # byte 0: command ID (still 0x41)
+    0x21,  # byte 1: sub-command for power
+    0x01,  # byte 2
+    0x44,  # byte 3
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  # bytes 4-9
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  # bytes 10-15
+    0x00, 0x00, 0x00, 0x00, 0x00,        # bytes 16-20
+    0x04,  # byte 21
+    MSG_ID,  # byte 22
+    # CRC8 appended
+]
+```
+
+### Display Toggle:
+```python
+display_toggle_body = [
+    0x41, 0x61, 0x00, 0xFF, 0x02, 0x00, 0x02, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, RANDOM_BYTE,
+    # CRC8 appended
+]
+```
+
+---
+
+## 5. Command 0x40 - Set Status
+
+### Body layout (offsets relative to body start = frame offset 10):
+
+The body is 26 bytes (indices 0-25), making the full frame 36 bytes.
+
+```
+Body    Frame
+Offset  Offset  Bits        Field
+------  ------  ----        -----
+  0      10     [7:0]       0x40 (command ID, always)
+
+  1      11     bit 0       Power ON (1=on, 0=off)
+                bit 1       Always 0x02 (must set)
+                bit 2       Resume
+                bit 3       Child sleep
+                bit 4       Timer mode
+                bit 5       Test2
+                bit 6       Beep/buzzer (1=audible feedback)
+                NOTE: NeoAcheron uses 0x42 mask for beep (bits 1+6)
+
+  2      12     bits [3:0]  Target temperature - 16 (range 0-14 = 16-30C)
+                bit 4       Temperature has 0.5C decimal
+                bits [7:5]  Operating mode (see Mode enum below)
+
+  3      13     bits [6:0]  Fan speed (see Fan enum below)
+                bit 7       Timer set flag
+
+  4      14     bit 7       On-timer enabled
+                bits [6:2]  On-timer hours (0-31)
+                bits [1:0]  On-timer minutes high (quarter-hours)
+
+  5      15     bit 7       Off-timer enabled
+                bits [6:2]  Off-timer hours (0-31)
+                bits [1:0]  Off-timer minutes high (quarter-hours)
+
+  6      16     bits [7:4]  On-timer minutes low
+                bits [3:0]  Off-timer minutes low
+
+  7      17     bits [1:0]  Left-right fan (swing horizontal, 0x03 = on)
+                bits [3:2]  Up-down fan (swing vertical, 0x0C = on)
+                bits [5:4]  Always 0x30
+                (NeoAcheron: byte 0x11 & 0x0F = swing_mode)
+
+  8      18     bits [1:0]  Cosy sleep mode (0-3)
+                bit 2       Alarm sleep
+                bit 3       Save
+                bit 4       Low frequency fan
+                bit 5       Turbo mode (duplicate, also in byte 10)
+                bit 6       Power saver
+                bit 7       Feel own
+
+  9      19     bit 0       Wise eye / child sleep (NeoAcheron: childSleep)
+                bit 1       Exchange air
+                bit 2       Dry clean
+                bit 3       PTC heater
+                bit 4       PTC button / eco mode (NeoAcheron: eco_mode)
+                bit 5       Clean up
+                bit 6       Change cosy sleep
+                bit 7       Eco mode
+
+ 10      20     bit 0       Sleep mode
+                bit 1       Turbo mode (another location)
+                bit 2       Temperature unit (0=C, 1=F)
+                bit 3       Catch cold
+                bit 4       Night light
+                bit 5       Peak elec
+                bit 6       Dust full
+                bit 7       Clean fan time
+
+ 11-14   21-24  (reserved, 0x00)
+
+ 15      25     bit 7       Natural fan
+                bits [6:0]  0x00
+
+ 16-17   26-27  (reserved, 0x00)
+
+ 18      28     bits [4:0]  New temperature setpoint - 12 (alternative temp range 12-43C)
+
+ 19      29     bits [6:0]  Humidity setpoint (0-100)
+
+ 20      30     (reserved)
+
+ 21      31     bit 0       Set expand dot (0.5C flag)
+                bits [6:1]  Set expand value
+                bit 6       Double temp
+                bit 7       Frost protection mode
+
+ 22      32     (reserved or padding)
+
+ 23      33     MSG_ID      Incrementing message counter
+
+ 24      34     CRC8        CRC-8 over body bytes
+
+ 25      35     CHECKSUM    Frame checksum
+```
+
+### Operating Modes (bits [7:5] of body byte 2):
+```python
+MODE_AUTO     = 1   # 0b001
+MODE_COOL     = 2   # 0b010
+MODE_DRY      = 3   # 0b011
+MODE_HEAT     = 4   # 0b100
+MODE_FAN_ONLY = 5   # 0b101
+```
+
+### Fan Speed Values (body byte 3):
+```python
+FAN_AUTO   = 102
+FAN_SILENT = 20
+FAN_LOW    = 40
+FAN_MEDIUM = 60
+FAN_HIGH   = 80
+FAN_TURBO  = 100
+```
+
+### Swing Mode (body byte 7, lower nibble):
+```python
+SWING_OFF        = 0b0000  # 0x00
+SWING_VERTICAL   = 0b1100  # 0x0C
+SWING_HORIZONTAL = 0b0011  # 0x03
+SWING_BOTH       = 0b1111  # 0x0F
+```
+
+### Temperature Setting (dudanov's approach):
+```python
+def set_target_temp(body, temp_celsius):
+    """Set target temperature with 0.5C resolution."""
+    tmp = int(temp_celsius * 4) + 1
+    integer = tmp // 4
+    # New temperature field (byte 18 of body)
+    body[18] = (integer - 12) & 0x1F
+    # Legacy temperature field (byte 2 of body)
+    integer_legacy = integer - 16
+    if integer_legacy < 1 or integer_legacy > 14:
+        integer_legacy = 1
+    half_degree = (tmp & 2) << 3  # bit 4 = 0.5C flag
+    body[2] = (body[2] & 0xE0) | half_degree | integer_legacy
+```
+
+---
+
+## 6. Response Parsing - C0 Status Response
+
+The AC responds to 0x40 (set) and 0x41 (query) with a **0xC0** response.
+
+Response data starts at frame offset 10. The response `data[0]` = `0xC0`.
+All byte references below are **relative to body start** (body[0] = `0xC0`).
+
+```
+Body
+Byte  Bits        Field                   Formula
+----  ----        -----                   -------
+ 0    [7:0]       0xC0 (response ID)
+
+ 1    bit 0       Power ON                bool
+      bit 2       Resume                  bool
+      bit 4       Timer mode              uint8
+      bit 5       Test2                   bool
+      bit 7       In error                bool
+
+ 2    bits [3:0]  Temperature setpoint     value + 16 (Celsius)
+      bit 4       Temperature decimal      +0.5C if set
+      bits [7:5]  Operating mode           see Mode enum
+
+ 3    bits [6:0]  Fan speed               0-100, 101=fixed, 102=auto
+
+ 4    bit 7       On-timer enabled
+      bits [6:2]  On-timer hours
+      bits [1:0]  On-timer quarter high
+
+ 5    bit 7       Off-timer enabled
+      bits [6:2]  Off-timer hours
+      bits [1:0]  Off-timer quarter high
+
+ 6    bits [7:4]  On-timer minutes elapsed
+      bits [3:0]  Off-timer minutes elapsed
+
+ 7    bits [1:0]  Left-right fan (horizontal swing)
+      bits [3:2]  Up-down fan (vertical swing)
+      (NeoAcheron: byte & 0x0F = swing_mode)
+
+ 8    bits [1:0]  Cosy sleep (0-3)
+      bit 3       Save
+      bit 4       Low frequency fan
+      bit 5       Turbo mode (location 2)
+      bit 7       Feel own
+
+ 9    bit 0       Child sleep
+      bit 1       Natural fan
+      bit 2       Dry clean
+      bit 3       PTC heater
+      bit 4       Eco mode
+      bit 5       Clean up
+      bit 6       Self cosy sleep
+      bit 7       Self feel own
+
+10    bit 0       Sleep mode
+      bit 1       Turbo mode (primary)
+      bit 2       Temperature unit (0=C)
+      bit 3       Exchange air
+      bit 4       Night light
+      bit 5       Catch cold
+      bit 6       Peak elec
+      bit 7       Cool fan
+
+11    [7:0]       Indoor temperature       (value - 50) / 2.0  (Celsius)
+
+12    [7:0]       Outdoor temperature      (value - 50) / 2.0  (Celsius)
+
+13    bit 5       Dust full
+      bits [4:0]  New temperature           value + 12 (if > 0, overrides byte 2 setpoint)
+
+14    bits [6:4]  Light/display             0x70 = on (all 3 bits set)
+      bits [3:0]  PMV mode (0-12)
+
+15    bits [3:0]  Indoor temp decimal (t1Dot, tenths of degree)
+      bits [7:4]  Outdoor temp decimal (t4Dot, tenths of degree)
+
+16    [7:0]       Error code (0-33)
+
+17    (reserved)
+
+18    (reserved)
+
+19    bits [6:0]  Humidity setpoint (0-100)
+
+20    (reserved)
+
+21    bit 7       Frost protection mode
+      bit 6       Double temp
+
+22    bit 3       Silky cool (if response length >= 23)
+```
+
+### Temperature Parsing with Decimal Precision:
+```python
+def parse_temperature(integer_byte, decimal_nibble, fahrenheits=False):
+    """Parse indoor/outdoor temperature.
+    integer_byte: body[11] or body[12]
+    decimal_nibble: body[15] lower or upper nibble
+    """
+    integer = integer_byte - 50
+    temp = integer / 2.0
+
+    if not fahrenheits and decimal_nibble > 0:
+        # Add decimal precision (tenths)
+        if integer >= 0:
+            temp = (integer // 2) + decimal_nibble * 0.1
+        else:
+            temp = (integer // 2) - decimal_nibble * 0.1
+
+    if decimal_nibble >= 5:
+        if integer >= 0:
+            temp += 0.5
+        else:
+            temp -= 0.5
+
+    return temp
+
+indoor_temp  = parse_temperature(body[11], body[15] & 0x0F)
+outdoor_temp = parse_temperature(body[12], (body[15] >> 4) & 0x0F)
+```
+
+### NeoAcheron Response Parsing (alternative offsets)
+NeoAcheron strips a 0x32-byte (50-byte) network header, so their `data[0x01]` = our `body[1]`:
+```
+NeoAcheron    Our Body    Field
+data[0x01]    body[1]     power, resume, timer, error
+data[0x02]    body[2]     mode + temperature
+data[0x03]    body[3]     fan speed
+data[0x07]    body[7]     swing mode
+data[0x08]    body[8]     cosy sleep, turbo2
+data[0x09]    body[9]     eco, child sleep, etc.
+data[0x0a]    body[10]    sleep, turbo, night light
+data[0x0b]    body[11]    indoor temperature
+data[0x0c]    body[12]    outdoor temperature
+data[0x0d]    body[13]    humidity (& 0x7F)
+```
+
+---
+
+## 7. Power Usage Response (C1)
+
+The power usage data comes in a **C1 response** (body[0] = `0xC1`).
+
+Power usage is BCD-encoded across body bytes 16, 17, 18:
+
+```python
+def parse_power_usage(body):
+    """Parse power usage from C1 response. Returns value in Wh (or 0.1 kWh)."""
+    power = 0
+    multiplier = 1
+    for i in range(3):
+        byte = body[18 - i]
+        low_nibble = byte & 0x0F
+        high_nibble = (byte >> 4) & 0x0F
+        power += low_nibble * multiplier
+        power += high_nibble * multiplier * 10
+        multiplier *= 100
+    return power
+```
+
+dudanov's approach (reading bytes 15-18 in a different way, returning kWh * 0.1):
+```python
+def parse_power_usage_dudanov(body):
+    """BCD decode bytes 15-18, return float kWh."""
+    def bcd2int(b):
+        return 10 * (b >> 4) + (b & 0x0F)
+    power = 0
+    weight = 1
+    for offset in [18, 17, 16, 15]:
+        power += weight * bcd2int(body[offset])
+        weight *= 100
+    return power * 0.1
+```
+
+---
+
+## 8. Command 0xB5 - Capabilities Query
+
+### Request Body:
+```python
+# First capabilities query:
+cap_query_1 = [0xB5, 0x01, 0x11]
+# + CRC8 appended
+
+# Second capabilities query (for additional capabilities):
+cap_query_2 = [0xB5, 0x01, 0x01, 0x00]
+# + CRC8 appended
+```
+
+### Full frame (reneklootwijk-style):
+```python
+cap_frame = bytearray([
+    0xAA, 0x00, 0xAC, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x03,
+    0xB5, 0x01, 0x00,  # byte 12 = 0x00 for first query
+    0x00, 0x00  # CRC + checksum
+])
+```
+
+### B5 Response Parsing:
+
+Response body[0] = `0xB5`. Structure:
+```
+body[1] = number of capability records
+body[2..] = capability records
+```
+
+Each capability record:
+```
+Offset  Field
+  0     Capability ID (low byte)
+  1     Capability type: 0x00 = simple, 0x02 = extended
+  2     Data length (N)
+  3..   Data bytes (N bytes)
+```
+
+Record iteration: `i += 3 + data_length`
+
+### Capability IDs:
+
+**Type 0x00 (simple on/off, check byte 3 != 0):**
+| ID     | Feature              |
+|--------|----------------------|
+| 0x15   | Indoor humidity      |
+| 0x18   | Silky cool           |
+| 0x30   | Smart eye            |
+| 0x32   | Wind on me           |
+| 0x33   | Wind of me           |
+| 0x39   | Active clean         |
+| 0x42   | One-key no wind      |
+| 0x43   | Breeze control       |
+
+**Type 0x02 (extended, value in byte 3+):**
+| ID     | Feature                        | Values                                    |
+|--------|--------------------------------|-------------------------------------------|
+| 0x10   | Fan speed control              | byte3 != 0 = supported                    |
+| 0x12   | Eco mode                       | 1 = eco, 2 = special eco                  |
+| 0x13   | Frost protection               | byte3 != 0 = supported                    |
+| 0x14   | Operating modes                | 0=cool+heat+dry, 1=cool+dry, 2=heat+dry, 3=cool+heat+dry+auto |
+| 0x15   | Swing/fan direction            | bit-encoded: up/down, left/right          |
+| 0x16   | Power calculation              | byte3=1: powerCal, byte3=2: +powerCalSetting |
+| 0x17   | Nest/filter check              | byte3=1: nestCheck, byte3=2: +nestNeedChange |
+| 0x19   | Aux electric heating           | byte3 != 0 = supported                    |
+| 0x1A   | Turbo mode                     | byte3=1: turboCool, byte3=2: +turboHeat, byte3=3: both |
+| 0x1F   | Humidity control               | 1=manual, 2=manual+auto                   |
+| 0x22   | Unit changeable (C/F)          | byte3 != 0 = supported                    |
+| 0x24   | Light/LED control              | byte3 != 0 = supported                    |
+| 0x25   | Temperature ranges             | 6 bytes: minCool, maxCool, minAuto, maxAuto, minHeat, maxHeat |
+| 0x2C   | Buzzer                         | byte3 != 0 = supported                    |
+
+### dudanov Capability IDs (16-bit, includes type prefix):
+```python
+CAPABILITY_INDOOR_HUMIDITY         = 0x0015
+CAPABILITY_SILKY_COOL              = 0x0018
+CAPABILITY_SMART_EYE               = 0x0030
+CAPABILITY_WIND_ON_ME              = 0x0032
+CAPABILITY_WIND_OF_ME              = 0x0033
+CAPABILITY_ACTIVE_CLEAN            = 0x0039
+CAPABILITY_ONE_KEY_NO_WIND_ON_ME   = 0x0042
+CAPABILITY_BREEZE_CONTROL          = 0x0043
+CAPABILITY_FAN_SPEED_CONTROL       = 0x0210
+CAPABILITY_PRESET_ECO              = 0x0212
+CAPABILITY_PRESET_FREEZE_PROTECTION = 0x0213
+CAPABILITY_MODES                   = 0x0214
+CAPABILITY_SWING_MODES             = 0x0215
+CAPABILITY_POWER                   = 0x0216
+CAPABILITY_NEST                    = 0x0217
+CAPABILITY_AUX_ELECTRIC_HEATING    = 0x0219
+CAPABILITY_PRESET_TURBO            = 0x021A
+CAPABILITY_HUMIDITY                = 0x021F
+CAPABILITY_UNIT_CHANGEABLE         = 0x0222
+CAPABILITY_LIGHT_CONTROL           = 0x0224
+CAPABILITY_TEMPERATURES            = 0x0225
+CAPABILITY_BUZZER                  = 0x022C
+```
+
+---
+
+## 9. NeoAcheron Command Construction (Python reference)
+
+### Base command template (30 bytes):
+```python
+base_cmd = bytearray([
+    0xAA,  # [0x00] start byte
+    0x23,  # [0x01] length (recalculated in finalize)
+    0xAC,  # [0x02] appliance type
+    0x00,  # [0x03]
+    0x00,  # [0x04]
+    0x00,  # [0x05]
+    0x00,  # [0x06]
+    0x00,  # [0x07]
+    0x03,  # [0x08] protocol
+    0x02,  # [0x09] msg type (0x02 = command to appliance)
+    0x40,  # [0x0A] command type (0x40 = set)
+    0x81,  # [0x0B] control byte (see below)
+    0x00,  # [0x0C] mode + temp
+    0xFF,  # [0x0D] fan speed
+    0x03,  # [0x0E]
+    0xFF,  # [0x0F]
+    0x00,  # [0x10]
+    0x30,  # [0x11] swing mode (0x30 = base value)
+    0x00,  # [0x12]
+    0x00,  # [0x13] eco mode (0xFF = on)
+    0x00,  # [0x14] turbo mode (0x02 = on)
+    0x00,  # [0x15]
+    0x00,  # [0x16]
+    0x00,  # [0x17]
+    0x00,  # [0x18]
+    0x00,  # [0x19]
+    0x00,  # [0x1A]
+    0x00,  # [0x1B]
+    0x03,  # [0x1C]
+    0xCC,  # [0x1D] CRC8 (recalculated)
+])
+```
+
+### NeoAcheron set_command properties (frame-absolute offsets):
+```python
+# Power:     frame[0x0B] bit 0
+# Beep:      frame[0x0B] & 0x42 (bits 1 and 6)
+# Mode:      frame[0x0C] bits [7:5]
+# Temp:      frame[0x0C] bits [4:0] (bit4=0.5, bits[3:0]=temp&0xF | (temp<<4)&0x10)
+# Fan:       frame[0x0D] = speed value
+# Swing:     frame[0x11] bits [3:0]
+# Eco:       frame[0x13] = 0xFF (on) or 0x00 (off)
+# Turbo:     frame[0x14] = 0x02 (on) or 0x00 (off)
+```
+
+### Finalize command:
+```python
+def finalize(cmd):
+    cmd[0x1D] = crc8(cmd[16:])   # CRC over bytes 16 onward
+    cmd[0x01] = len(cmd)          # length field
+    return cmd
+```
+
+---
+
+## 10. Complete Frame Examples
+
+### Query status (full 34-byte frame):
+```
+AA 21 AC 8D 00 00 00 00 00 03
+41 81 00 FF 03 FF 00 02 00 00
+00 00 00 00 00 00 00 00 00 00
+03 XX YY ZZ
+```
+Where XX = msg_id, YY = CRC8, ZZ = checksum
+
+### Set power ON, mode=cool, temp=24C, fan=auto (full 36-byte frame):
+```
+AA 23 AC 8F 00 00 00 00 00 02
+40 43 48 66 00 00 00 30 00 00
+00 00 00 00 00 00 00 00 00 00
+00 00 00 XX YY ZZ
+```
+Byte 11: 0x43 = beep(0x40) | always(0x02) | power(0x01)
+Byte 12: 0x48 = cool(2<<5) | (24-16=8)
+Byte 13: 0x66 = fan_auto(102)
+XX = msg_id, YY = CRC8, ZZ = checksum
+
+---
+
+## 11. UART Communication Flow
+
+1. **Baud rate**: 9600 bps (standard Midea UART)
+2. **Byte order**: Little-endian for multi-byte values
+3. **Start detection**: Wait for 0xAA byte, then read `length` byte to know total frame size
+4. **Frame reading**: Read `length + 1` total bytes (0xAA + length bytes)
+5. **Validation**: Verify CRC8 and checksum before processing
+6. **Response**: AC responds to 0x40/0x41 commands with 0xC0 body, to power query with 0xC1 body
+7. **Handshake**: On startup, send electronic ID query; AC responds with msg_type 0x07 containing appliance type
+8. **Network status**: Periodically report network status (every 2 minutes)
+
+### Response dispatch (by frame byte 9 = msg_type, then body[0]):
+```
+msg_type 0x02 + body[0] 0xC0 -> Status response (parse C0)
+msg_type 0x03 + body[0] 0xB1 -> Extended status
+msg_type 0x03 + body[0] 0xB5 -> Capabilities response
+msg_type 0x03 + body[0] 0xC0 -> Status notification
+msg_type 0x03 + body[0] 0xC1 -> Power usage
+msg_type 0x04 + body[0] 0xA1 -> Network-related
+msg_type 0x05 + body[0] 0xA0 -> Handshake ACK
+msg_type 0x07              -> Device identification
+msg_type 0x63              -> Network status request
+```
+
+---
+
+## 12. Cross-Source Analysis — Matches and Conflicts
+
+Sources compared: `dudanov/MideaUART` (C++), `chemelli74/midea-local` (Python), `NeoAcheron/midea-ac-py` (Python), `reneklootwijk/node-mideahvac` (JS).
+
+---
+
+### 12.1 Confirmed Matches (all sources agree)
+
+| Field | Value | Notes |
+|---|---|---|
+| Start byte | `0xAA` | Universal |
+| Appliance type | `0xAC` | Universal |
+| SYNC byte | `LENGTH ^ APPLIANCE_TYPE` | Universal |
+| CRC-8 table | identical 256-entry table | All sources carry the same table verbatim |
+| Checksum formula | `(256 - sum(frame[1:])) & 0xFF` | Universal |
+| Fan speed values | AUTO=102, SILENT=20, LOW=40, MED=60, HIGH=80, TURBO=100 | Universal |
+| Mode encoding | bits[7:5] of body[2]; 1=Auto,2=Cool,3=Dry,4=Heat,5=Fan | Universal |
+| Swing nibble | body[7] lower nibble; OFF=0, V=0x0C, H=0x03, BOTH=0x0F | Universal |
+| ECO in SET (0x40) | body[9] bit 7 (0x80) | dudanov + midea-local agree |
+| Turbo in SET/response | body[8] bit 5 AND body[10] bit 1 (both locations active) | dudanov + midea-local agree |
+| Frost protection | body[21] bit 7 (0x80) | All agree |
+| Indoor temp | body[11]: `(val - 50) / 2.0` | All agree |
+| Outdoor temp | body[12]: `(val - 50) / 2.0` | All agree |
+| New temp field | body[13] bits[4:0]: `val + 12` if > 0, overrides byte 2 | dudanov + our doc agree |
+| Capabilities frame | record structure: ID(1B) + type(1B) + len(1B) + data | All agree |
+| Capability IDs 0x0212–0x022C | values match across all sources | |
+
+---
+
+### 12.2 Conflicts and Deviations
+
+#### ⚠️ ECO mode — C0 response body[9]: BIT MISMATCH
+
+| Source | Bit mask | Notes |
+|---|---|---|
+| This document (section 6) | `0x10` (bit 4) | Correctly documented |
+| **`response.py` in this project** | `0x80` (bit 7) | **WRONG — confirmed bug** |
+| `dudanov/MideaUART` | `0x10` (bit 4) | `m_getValue(9, 16)` where 16=0x10 |
+| `midea-local` | `0x10` (bit 4) | `body[9] & 0x10` |
+
+**The response parser reads bit 7 but the correct bit is bit 4. This causes ECO mode to never be detected from a real AC response. Requires hardware verification before fixing.**
+
+Note: SET command (0x40) correctly uses bit 7 (0x80) for ECO — the protocol uses different bit positions for set vs. response.
+
+---
+
+#### ⚠️ CAPABILITY_MODES (0x0214) — encoding table conflict
+
+| Value | This document | dudanov | midea-local |
+|---|---|---|---|
+| 0 | cool+heat+dry | cool+dry+auto (no heat) | cool+dry+auto |
+| 1 | cool+dry | all four modes | heat+cool+dry+auto |
+| 2 | heat+dry | heat+auto only | heat+auto only |
+| 3 | cool+heat+dry+auto | cool only | cool only |
+| 4–9 | not documented | not documented | heat variants |
+
+All three sources disagree on values 0 and 1. midea-local additionally handles values 4–9.
+**This document's table appears incorrect for values 0–3. Requires hardware verification.**
+
+---
+
+#### ⚠️ CAPABILITY_TURBO (0x021A) — encoding conflict
+
+| Value | This document | dudanov |
+|---|---|---|
+| 0 | (not documented) | turboCool=true, turboHeat=false |
+| 1 | turboCool | turboCool=true, turboHeat=true |
+| 2 | turboCool + turboHeat | turboCool=false, turboHeat=false |
+| 3 | both | turboCool=false, turboHeat=true |
+
+This document and dudanov are completely incompatible. **This document's mapping is unverified.**
+
+---
+
+#### ⚠️ CAPABILITY_FAN_SPEED_CONTROL (0x0210) — inverted logic
+
+| Source | Interpretation |
+|---|---|
+| This document | `val != 0` → supported |
+| dudanov | `val != 1` → supported |
+
+For `val=1`: this document says supported, dudanov says NOT supported. Conflict for all values ≥ 1.
+
+---
+
+#### ⚠️ CAPABILITY_UNIT_CHANGEABLE (0x0222) — inverted logic
+
+| Source | Interpretation |
+|---|---|
+| This document | `val != 0` → changeable |
+| dudanov | `!val` → changeable (val=0 means changeable) |
+
+Logic is fully inverted between sources.
+
+---
+
+#### ⚠️ CAPABILITY_TEMPERATURES (0x0225) — scaling conflict
+
+| Source | Encoding |
+|---|---|
+| This document | raw bytes = direct °C |
+| dudanov | raw bytes × 0.5 = °C |
+
+If dudanov is correct, a raw value of 32 means 16°C, not 32°C. Significant impact on temperature range validation. **Requires hardware verification.**
+
+---
+
+#### ⚠️ Display state — C0 response body[14]: inverted interpretation
+
+| Source | ON condition |
+|---|---|
+| This document | `body[14] & 0x70 == 0x70` (bits[6:4] all set) |
+| midea-local | `(body[14] >> 4 & 0x7) != 0x07` (bits[6:4] NOT all set) AND power is on |
+
+These are directly contradictory. midea-local also gates display state on power status.
+
+---
+
+#### ℹ️ Fan speed — hardware variants
+
+`dudanov/MideaUART` contains the following comment in `StatusData.cpp`:
+
+> *"some ACs return 30 for LOW and 50 for MEDIUM. Note though, in appMode, this device still uses 40/60"*
+
+Not all units consistently return the documented fan speed values. Parsers should handle 30→40 and 50→60 substitution defensively.
+
+---
+
+#### ℹ️ Query command body[4:5] — minor variant
+
+| Source | body[4] | body[5] |
+|---|---|---|
+| dudanov / NeoAcheron | `0x03` | `0xFF` |
+| midea-local | `0x00` | `0x00` |
+
+Functional impact unknown — the AC likely ignores these bytes in a query. Both variants appear to work in practice.
+
+---
+
+#### ℹ️ Power query body length — significant variant
+
+| Source | Body length | Notes |
+|---|---|---|
+| dudanov | 23 bytes | Full padding to 0x00 |
+| midea-local | 6 bytes | `[0x41, 0x21, 0x01, 0x44, 0x00, 0x01]` — truncated |
+
+Functional impact unknown. Both variants are in active use.
+
+---
+
+#### ℹ️ C1 power response — subbody type discrimination
+
+midea-local distinguishes body[3] as a subbody type discriminator:
+- `0x44`: total energy consumption at body[4:8], current consumption at body[12:16], realtime power at body[16:19]
+- `0x40`: not yet documented
+
+This document only covers the `0x44` format (bytes 16–18 BCD). Additionally, midea-local implements three parsing methods (BCD, binary, raw integer) and treats the format as device-dependent. The single-format BCD approach in section 7 may not work on all units.
+
+---
+
+#### ℹ️ Display toggle command — body[1] variant
+
+| Source | body[1] | body[1] meaning |
+|---|---|---|
+| dudanov | `0x61` | fixed sub-command |
+| midea-local | `0x02` or `0x42` | base + optional prompt_tone bit |
+
+Different sub-command bytes. Both are in active use across different device generations.
+
+---
+
+### 12.3 Additional response types not yet documented
+
+midea-local reveals response types not covered in this document:
+
+| Body type | Name | Notes |
+|---|---|---|
+| `0xA0` | XA0 | msg_type notify2 — alternative status format, different field layout |
+| `0xA1` | XA1 | msg_type notify1 — temperature-only notification with humidity |
+| `0xBB` | XBB sub-protocol | Used by newer "SN8" units; completely different encoding |
+| `0xB0/0xB1` | New protocol | Tag-value pairs for indirect wind, breeze, fresh air, screen display |
+
+The `0xBB` sub-protocol in particular indicates a parallel protocol stack used by a newer device generation, with temperature precision at 1/100°C rather than 0.5°C steps.
+
+---
+
+## 13. AI Analysis Summary
+
+> **Note on analysis method:** The comparisons, conflict detections, and stability estimates below
+> were produced primarily through automated AI-assisted analysis of the referenced open-source
+> repositories. They represent a best-effort interpretation and may contain errors or misreadings.
+> The authors of the referenced projects are not affiliated with this analysis — their work is
+> referenced here purely as a documentation basis and is greatly appreciated.
+> All findings marked `CONFLICT` or `BUG` require independent hardware verification before
+> acting on them.
+
+---
+
+### 13.1 Source Stability Estimates
+
+Ratings reflect breadth of protocol coverage, implementation quality, cross-source agreement,
+and apparent maintenance activity. Scale: `0` (limited) → `+++` (comprehensive).
+The goal is to identify which sources are most suitable as a protocol reference.
+
+```yaml
+sources:
+
+  dudanov/MideaUART:
+    language: C++
+    stability: +++
+    protocol_ref_value: high
+    notes: >
+      Strongly typed, well-structured, widely deployed in ESPHome ecosystem.
+      Good for low-level frame and capability detail. Actively maintained.
+
+  chemelli74/midea-local:
+    language: Python
+    stability: +++
+    protocol_ref_value: high
+    notes: >
+      Most complete coverage of all sources. Handles multiple device generations,
+      sub-protocols (XBB, B0/B1), and edge cases. Best single reference for
+      newer devices and full feature set.
+
+  reneklootwijk/node-mideahvac:
+    language: JavaScript
+    stability: ++
+    protocol_ref_value: medium
+    notes: >
+      Good documentation and reasonable coverage. Useful cross-check for
+      command construction. Moderate maintenance activity.
+
+  NeoAcheron/midea-ac-py:
+    language: Python
+    stability: +
+    protocol_ref_value: low-medium
+    notes: >
+      Functional but older. Field offsets appear shifted due to a network-layer
+      header being included in its frame model — care needed when cross-referencing.
+
+  reneklootwijk/midea-uart:
+    language: C++
+    stability: +
+    protocol_ref_value: low-medium
+    notes: >
+      ESP8266 focused. Useful for low-level framing detail but limited in scope.
+      Overlaps significantly with dudanov.
+
+  yitsushi/midea-air-condition:
+    language: Ruby
+    stability: 0
+    protocol_ref_value: low
+    notes: >
+      Niche language. Limited cross-validation possible. Likely unmaintained.
+      Only useful as a basic consistency check.
+```
+
+---
+
+### 13.2 Findings Summary
+
+Status key:
+- `BUG` — confirmed implementation error in this project
+- `CONFLICT` — sources disagree; hardware verification required
+- `VARIANT` — known hardware or firmware variation; handle defensively
+- `INCOMPLETE` — partially documented; known gaps
+- `NOT_COVERED` — feature confirmed to exist but not documented here
+
+```yaml
+findings:
+
+  - id: 1
+    topic: ECO bit in C0 response
+    doc_ref: "Section 6, body[9]"
+    code_ref: "response.py:131"
+    status: BUG
+    sources_agree: [dudanov, midea-local]
+    detail: >
+      response.py uses 0x80 (bit 7); correct value is 0x10 (bit 4).
+      ECO mode is never detected from real AC responses as a result.
+      The SET command (0x40) correctly uses bit 7 — the protocol intentionally
+      uses different bit positions for set vs. response. Verify on hardware before fixing.
+
+  - id: 2
+    topic: CAPABILITY_MODES (0x0214) encoding
+    doc_ref: "Section 8"
+    status: CONFLICT
+    sources_disagree: [this_doc, dudanov, midea-local]
+    detail: >
+      All three sources produce different mode sets for values 0–3.
+      midea-local additionally handles values 4–9 (not documented here at all).
+      The table in this document appears incorrect.
+
+  - id: 3
+    topic: CAPABILITY_TURBO (0x021A) value mapping
+    doc_ref: "Section 8"
+    status: CONFLICT
+    sources_disagree: [this_doc, dudanov]
+    detail: >
+      Completely different value-to-feature mappings for values 0–3.
+      No overlap found. This document's mapping is unverified.
+
+  - id: 4
+    topic: CAPABILITY_FAN_SPEED_CONTROL (0x0210) logic
+    doc_ref: "Section 8"
+    status: CONFLICT
+    sources_disagree: [this_doc, dudanov]
+    detail: >
+      this_doc: val != 0 → supported.
+      dudanov:  val != 1 → supported.
+      Diverges for val >= 1 (dudanov treats val=1 as "not supported").
+
+  - id: 5
+    topic: CAPABILITY_UNIT_CHANGEABLE (0x0222) logic
+    doc_ref: "Section 8"
+    status: CONFLICT
+    sources_disagree: [this_doc, dudanov]
+    detail: >
+      Fully inverted. this_doc: val != 0 = changeable.
+      dudanov: !val (val == 0 = changeable).
+
+  - id: 6
+    topic: CAPABILITY_TEMPERATURES (0x0225) scaling
+    doc_ref: "Section 8"
+    status: CONFLICT
+    sources_disagree: [this_doc, dudanov]
+    detail: >
+      this_doc: raw bytes are direct °C.
+      dudanov:  raw bytes × 0.5 = °C.
+      If dudanov is correct all documented temperature limits are doubled.
+
+  - id: 7
+    topic: Display state — C0 body[14] bits[6:4]
+    doc_ref: "Section 6"
+    status: CONFLICT
+    sources_disagree: [this_doc, midea-local]
+    detail: >
+      this_doc:    bits[6:4] == 0x7 → display ON.
+      midea-local: bits[6:4] != 0x7 → display ON (inverted), also gated on power ON.
+
+  - id: 8
+    topic: Fan speed hardware variants (30/50 instead of 40/60)
+    doc_ref: "Section 4, Section 6"
+    status: VARIANT
+    source: dudanov
+    detail: >
+      Some units return 30 for LOW and 50 for MEDIUM in responses.
+      Commands should still use 40/60. Defensive remapping recommended in parser.
+
+  - id: 9
+    topic: Query command body[4:5]
+    doc_ref: "Section 4"
+    status: VARIANT
+    sources: [dudanov/NeoAcheron → 0x03/0xFF, midea-local → 0x00/0x00]
+    detail: >
+      Functional impact unknown. AC likely ignores these bytes in a query frame.
+
+  - id: 10
+    topic: Power query body length
+    doc_ref: "Section 4"
+    status: VARIANT
+    sources: [dudanov → 23 bytes, midea-local → 6 bytes]
+    detail: Both are in active use. Shorter form may be safer for compatibility.
+
+  - id: 11
+    topic: C1 power response — subbody type discrimination
+    doc_ref: "Section 7"
+    status: INCOMPLETE
+    detail: >
+      Only subbody type 0x44 is documented here. Type 0x40 exists but is undocumented.
+      midea-local implements three separate parsing methods (BCD, binary, raw integer)
+      depending on device type. Single-format BCD will not work on all units.
+
+  - id: 12
+    topic: Display toggle command body[1]
+    doc_ref: "Section 4"
+    status: VARIANT
+    sources: [dudanov → 0x61, midea-local → 0x02/0x42]
+    detail: Corresponds to different device generations. Both observed in the field.
+
+  - id: 13
+    topic: XBB sub-protocol (SN8 / newer units)
+    doc_ref: "Section 12.3"
+    status: NOT_COVERED
+    detail: >
+      Entirely different body encoding for newer devices. Temperature at 1/100°C precision.
+      Requires dedicated analysis; midea-local is the primary reference.
+
+  - id: 14
+    topic: B0/B1 new-protocol (tag-value pairs)
+    doc_ref: "Section 12.3"
+    status: NOT_COVERED
+    detail: >
+      Used for indirect wind, breeze, fresh air, screen display on newer units.
+      Requires dedicated analysis; midea-local is the primary reference.
+```
