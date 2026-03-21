@@ -435,13 +435,14 @@ function hvac_shark_proto.dissector(udp_payload_buffer, pinfo, tree)
         subtree:add(f.manufacturer, udp_payload_buffer(10, 1))
     end
 
-    if bus_type == 0 then
-        subtree:add(f.bus_type, udp_payload_buffer(11, 1)):append_text(" (Bus = XYE)")
-    elseif bus_type == 1 then
-        subtree:add(f.bus_type, udp_payload_buffer(11, 1)):append_text(" (Bus = UART)")
-    else
-        subtree:add(f.bus_type, udp_payload_buffer(11, 1))
-    end
+    local BUS_TYPE_NAMES = {
+        [0x00] = "XYE",
+        [0x01] = "UART",
+        [0x02] = "disp-mainboard_1",
+        [0x03] = "r-t_1",
+    }
+    local bus_name = BUS_TYPE_NAMES[bus_type] or string.format("Unknown (0x%02X)", bus_type)
+    subtree:add(f.bus_type, udp_payload_buffer(11, 1)):append_text(" (Bus = " .. bus_name .. ")")
 
     -- ── Header version & extended metadata ──────────────────────────────
     local data_offset = 13
@@ -488,16 +489,30 @@ function hvac_shark_proto.dissector(udp_payload_buffer, pinfo, tree)
 
     local protocol_buffer = udp_payload_buffer(data_offset, proto_len)
 
-    -- ── Protocol auto-detection ─────────────────────────────────────────
-    -- Byte 0 is always 0xAA for both protocols.
-    -- Byte 1 disambiguates:
-    --   XYE:  command byte in {0xC0, 0xC3, 0xC4, 0xC6, 0xCC, 0xCD}
-    --   UART: length field in range 0x0D–0x40 (13–64)
-    -- These ranges never overlap.
+    -- ── Protocol selection ─────────────────────────────────────────────
+    -- bus_type from HVAC_shark header determines the parser:
+    --   0x00 = XYE,  0x01 = UART,  0x02 = disp-mainboard_1,  0x03 = r-t_1
+    -- For legacy packets (bus_type=0x00), auto-detect via byte 1:
+    --   XYE commands {0xC0..0xCD} vs UART length {0x0D..0x40}
 
     local byte1 = protocol_buffer(1, 1):uint()
-    local is_xye = XYE_COMMANDS[byte1] ~= nil
-    local is_uart = (byte1 >= 0x0D and byte1 <= 0x40)
+    local is_xye, is_uart, is_disp_mb, is_rt
+
+    if bus_type == 0x01 then
+        is_uart = true
+    elseif bus_type == 0x02 then
+        is_disp_mb = true
+    elseif bus_type == 0x03 then
+        is_rt = true
+    elseif bus_type == 0x00 then
+        -- Legacy auto-detection for XYE-tagged packets
+        is_xye = XYE_COMMANDS[byte1] ~= nil
+        is_uart = (not is_xye) and (byte1 >= 0x0D and byte1 <= 0x40)
+    else
+        -- Unknown bus type — try auto-detection
+        is_xye = XYE_COMMANDS[byte1] ~= nil
+        is_uart = (not is_xye) and (byte1 >= 0x0D and byte1 <= 0x40)
+    end
 
     if is_uart then
         -- ══════════════════════════════════════════════════════════════════
@@ -516,12 +531,19 @@ function hvac_shark_proto.dissector(udp_payload_buffer, pinfo, tree)
         hdr_tree:add(f.uart_appliance, pbuf(2, 1)):append_text(
             protocol_buffer(2, 1):uint() == 0xAC and " (Air Conditioner)" or "")
 
-        -- Sync validation
+        -- Sync validation — spec says LENGTH XOR APPLIANCE_TYPE,
+        -- but many devices leave this as 0x00 (unimplemented)
         local sync_val = protocol_buffer(3, 1):uint()
         local sync_expected = bit.bxor(byte1, protocol_buffer(2, 1):uint())
-        local sync_ok = sync_val == sync_expected
-        hdr_tree:add(f.uart_sync, pbuf(3, 1)):append_text(
-            sync_ok and " (Valid)" or string.format(" (INVALID, expected 0x%02X)", sync_expected))
+        local sync_text
+        if sync_val == sync_expected then
+            sync_text = " (Valid)"
+        elseif sync_val == 0x00 then
+            sync_text = " (Zero — not implemented by device)"
+        else
+            sync_text = string.format(" (INVALID, expected 0x%02X)", sync_expected)
+        end
+        hdr_tree:add(f.uart_sync, pbuf(3, 1)):append_text(sync_text)
 
         hdr_tree:add(pbuf(4, 4), "Reserved: " .. tostring(protocol_buffer(4, 4):bytes()))
 
@@ -735,9 +757,183 @@ function hvac_shark_proto.dissector(udp_payload_buffer, pinfo, tree)
         -- Raw frame hex dump (always shown for research)
         subtree:add(pbuf(0, proto_len), "Raw Frame: " .. tostring(protocol_buffer:bytes()))
 
+    elseif is_disp_mb then
+        -- ══════════════════════════════════════════════════════════════════
+        -- ── DISPLAY ↔ MAINBOARD INTERNAL BUS ─────────────────────────────
+        -- ══════════════════════════════════════════════════════════════════
+        subtree:add(f.protocol_type, "Display-Mainboard Internal Bus")
+        pinfo.cols.info:prepend("DISP-MB ")
+
+        local frame_tree = subtree:add(pbuf(0, proto_len), "Internal Bus Frame")
+
+        frame_tree:add(pbuf(0, 1), string.format("Start: 0x%02X", protocol_buffer(0, 1):uint()))
+        frame_tree:add(pbuf(1, 1), string.format("Device Type: 0x%02X", byte1))
+
+        if proto_len >= 3 then
+            local pkt_len = protocol_buffer(2, 1):uint()
+            local len_match = (pkt_len == proto_len)
+            frame_tree:add(pbuf(2, 1), string.format("Packet Length: %d %s",
+                pkt_len, len_match and "(matches frame)" or
+                string.format("(frame is %d bytes)", proto_len)))
+
+            -- Dump remaining bytes with offset labels
+            for i = 3, proto_len - 1 do
+                frame_tree:add(pbuf(i, 1), string.format("0x%02X: 0x%02X", i, protocol_buffer(i, 1):uint()))
+            end
+        end
+
+        subtree:add(pbuf(0, proto_len), "Raw Frame: " .. tostring(protocol_buffer:bytes()))
+
+    elseif is_rt then
+        -- ══════════════════════════════════════════════════════════════════
+        -- ── BIDIRECTIONAL EXTENSION BOARD (R/T / HA/HB) BUS ──────────────
+        -- ══════════════════════════════════════════════════════════════════
+        subtree:add(f.protocol_type, "Extension Board R/T (HA/HB)")
+
+        local start_byte = protocol_buffer(0, 1):uint()
+        local is_request = (start_byte == 0xAA)
+        pinfo.cols.info:prepend(is_request and "R/T-REQ " or "R/T-RSP ")
+
+        local rt_len = proto_len >= 3 and (protocol_buffer(2, 1):uint() + 4) or proto_len
+
+        -- Frame header
+        local hdr_tree = subtree:add(pbuf(0, math.min(11, proto_len)), "R/T Frame Header")
+        hdr_tree:add(pbuf(0, 1), string.format("Start: 0x%02X (%s)",
+            start_byte, is_request and "Request" or "Response"))
+        if proto_len >= 2 then
+            hdr_tree:add(pbuf(1, 1), string.format("Device Type: 0x%02X", protocol_buffer(1, 1):uint()))
+        end
+        if proto_len >= 3 then
+            local len_val = protocol_buffer(2, 1):uint()
+            local len_match = (len_val + 4 == proto_len)
+            hdr_tree:add(pbuf(2, 1), string.format("Length: 0x%02X (%d) %s",
+                len_val, len_val, len_match and "(valid, total=" .. proto_len .. ")" or
+                string.format("(MISMATCH, frame=%d)", proto_len)))
+        end
+        if proto_len >= 4 then
+            hdr_tree:add(pbuf(3, 1), string.format("Appliance: 0x%02X%s",
+                protocol_buffer(3, 1):uint(),
+                protocol_buffer(3, 1):uint() == 0xAC and " (Air Conditioner)" or ""))
+        end
+        if proto_len >= 9 then
+            hdr_tree:add(pbuf(4, 5), "Reserved: " .. tostring(protocol_buffer(4, 5):bytes()))
+        end
+        if proto_len >= 10 then
+            hdr_tree:add(pbuf(9, 1), string.format("Protocol Version: %d", protocol_buffer(9, 1):uint()))
+        end
+        if proto_len >= 11 then
+            local msg_type = protocol_buffer(10, 1):uint()
+            local msg_type_str = UART_MSG_TYPES[msg_type] or "Unknown"
+            hdr_tree:add(pbuf(10, 1), string.format("Message Type: 0x%02X (%s)", msg_type, msg_type_str))
+        end
+
+        -- Body + integrity (UART-compatible body starts at byte 11)
+        -- 0xAA requests: header(11) + body + CRC-8(1) + checksum(1) + 0x00(1) + frame_ck(1) → tail=4
+        -- 0x55 responses: header(11) + body + checksum(1) + 0x00(1) + EF(1) → tail=3 (no CRC-8)
+        local tail_len = is_request and 4 or 3
+        if proto_len >= 11 + 1 + tail_len then  -- need at least header + 1 body + tail
+            local body_off = data_offset + 11
+            local body_len = proto_len - 11 - tail_len
+
+            -- Body tree
+            local integrity_str
+            local crc_ok = true
+            if is_request then
+                -- CRC-8 over body (confirmed for 0xAA requests, not present on 0x55)
+                local crc_offset = data_offset + proto_len - 4
+                local crc_val = udp_payload_buffer(crc_offset, 1):uint()
+                local crc_calc = uart_crc8(udp_payload_buffer, body_off, body_len)
+                crc_ok = crc_val == crc_calc
+                integrity_str = string.format("CRC8: 0x%02X %s",
+                    crc_val, crc_ok and "(Valid)" or string.format("(calc 0x%02X)", crc_calc))
+            else
+                integrity_str = "no CRC-8"
+            end
+            local body_tree = subtree:add(udp_payload_buffer(body_off, body_len),
+                string.format("Body (%d bytes) — %s", body_len, integrity_str))
+
+            if body_len > 0 then
+                local cmd_id = udp_payload_buffer(body_off, 1):uint()
+                local cmd_str = UART_COMMAND_IDS[cmd_id] or string.format("Unknown (0x%02X)", cmd_id)
+                pinfo.cols.info:append(" " .. cmd_str)
+
+                -- Reuse UART body decoders
+                if cmd_id == 0xC0 then
+                    decode_uart_c0_status(body_tree, udp_payload_buffer, body_off, body_len)
+                elseif cmd_id == 0xC1 then
+                    decode_uart_c1_power(body_tree, udp_payload_buffer, body_off, body_len)
+                elseif cmd_id == 0x40 then
+                    decode_uart_40_set(body_tree, udp_payload_buffer, body_off, body_len)
+                elseif cmd_id == 0x41 then
+                    decode_uart_41_query(body_tree, udp_payload_buffer, body_off, body_len)
+                else
+                    body_tree:add(udp_payload_buffer(body_off, 1),
+                        string.format("Command ID: 0x%02X (%s)", cmd_id, cmd_str))
+                    if body_len > 1 then
+                        body_tree:add(udp_payload_buffer(body_off + 1, body_len - 1),
+                            "Payload: " .. tostring(udp_payload_buffer(body_off + 1, body_len - 1):bytes()))
+                    end
+                end
+            end
+
+            -- Tail bytes
+            local tail_off = data_offset + proto_len - tail_len
+
+            if is_request then
+                -- 0xAA: CRC-8 + Checksum + 0x00 + Frame Checksum
+                local crc_val = udp_payload_buffer(tail_off, 1):uint()
+                local crc_calc = uart_crc8(udp_payload_buffer, body_off, body_len)
+                subtree:add(udp_payload_buffer(tail_off, 1), string.format(
+                    "CRC-8: 0x%02X %s", crc_val,
+                    crc_ok and "(Valid)" or string.format("(calc 0x%02X)", crc_calc)))
+                tail_off = tail_off + 1
+            end
+
+            -- Additive checksum (XYE-style two's complement of sum)
+            -- Checksum sits at byte[N-3] in both directions.
+            -- Range covers header + body only (excludes CRC-8, checksum, padding, tail):
+            --   0xAA: bytes [1..N-5]  (devtype through last body byte, excludes CRC-8 at N-4)
+            --   0x55: bytes [2..N-4]  (length through last body byte, no CRC-8 present)
+            local cksum_val = udp_payload_buffer(tail_off, 1):uint()
+            local cksum_sum = 0
+            if is_request then
+                for i = 1, proto_len - 5 do
+                    cksum_sum = cksum_sum + protocol_buffer(i, 1):uint()
+                end
+            else
+                for i = 2, proto_len - 4 do
+                    cksum_sum = cksum_sum + protocol_buffer(i, 1):uint()
+                end
+            end
+            local cksum_calc = bit.band(bit.bnot(bit.band(cksum_sum, 0xFF)) + 1, 0xFF)
+            local cksum_ok = cksum_val == cksum_calc
+            subtree:add(udp_payload_buffer(tail_off, 1), string.format(
+                "Checksum: 0x%02X %s", cksum_val,
+                cksum_ok and "(Valid)" or string.format("(INVALID, calc 0x%02X)", cksum_calc)))
+
+            subtree:add(udp_payload_buffer(tail_off + 1, 1), string.format(
+                "Padding: 0x%02X", udp_payload_buffer(tail_off + 1, 1):uint()))
+
+            local last_byte = udp_payload_buffer(tail_off + 2, 1):uint()
+            if is_request then
+                subtree:add(udp_payload_buffer(tail_off + 2, 1), string.format(
+                    "Frame Checksum: 0x%02X (sum=0)", last_byte))
+            else
+                subtree:add(udp_payload_buffer(tail_off + 2, 1), string.format(
+                    "End Marker: 0x%02X%s", last_byte,
+                    last_byte == 0xEF and " (EF)" or " (unexpected)"))
+            end
+        else
+            subtree:add(pbuf(0, proto_len), "Frame data (too short): " ..
+                tostring(protocol_buffer:bytes()))
+        end
+
+        -- Raw frame hex dump
+        subtree:add(pbuf(0, proto_len), "Raw Frame: " .. tostring(protocol_buffer:bytes()))
+
     else
-        -- Unknown protocol — neither XYE command range nor UART length range
-        subtree:add(f.protocol_type, string.format("Unknown (byte1=0x%02X)", byte1))
+        -- Unknown protocol
+        subtree:add(f.protocol_type, string.format("Unknown (bus=0x%02X, byte1=0x%02X)", bus_type, byte1))
         subtree:add(udp_payload_buffer(data_offset, proto_len),
             "Raw Frame: " .. tostring(protocol_buffer:bytes()))
     end
