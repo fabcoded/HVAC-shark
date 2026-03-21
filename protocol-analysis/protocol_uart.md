@@ -268,9 +268,11 @@ the discharge pipe temperature — the slow increment is consistent with thermal
 
 ---
 
-#### 4b-ii — Group Page 0x42 Response — Temperature Snapshot (R/T bus)
+#### 4b-ii — Group Page 0x42 Response — Group 2: Indoor Device Params (R/T bus)
 
 Source: own Session 1 captures, 15 frames, 6 unique bodies.
+Field labels from mill1000/midea-msmart (see `midea-msmart-mill1000.md`, Finding 11).
+All labels **Hypothesis** — single source, not verified at field level against own captures.
 
 ```
 Example frames (body[0..25]):
@@ -282,8 +284,25 @@ count=1  C1 21 01 42  6B 62 00 00 00 00 00 00 40 01 00 00 00 00 00 00 00 00 00 0
 count=1  C1 21 01 42  6B 6B 00 00 00 00 00 00 40 01 00 00 00 00 00 00 00 00 00 00  (28.5/28.5°C)
 ```
 
-| Offset | Bytes | Observed values | Label | Confidence |
-|--------|-------|-----------------|-------|------------|
+**Finding 11 field map (Group 2)** vs own captures — **mismatch**:
+
+Group 2 expects: body[4]=indoor set fan speed (×8 RPM), body[5]=indoor actual fan speed (×8 RPM),
+body[6..8]=indoor fault bytes, body[9..11]=freq-limit bytes, body[12..13]=load state bytes,
+body[14]=E2 param version, body[15..19]=child/smart-eye detection.
+
+Own captures show: body[4..5] = values 0x4C–0x6B consistent with `(val−50)/2` temperature
+encoding (13–28.5 °C), body[12] = 0x40 flag. These values **do not match** Group 2 RPM
+fields (×8 would give 608–856 RPM — plausible but the temperature interpretation also
+fits). The sentinel pattern (body[4]=body[5]=0x00 in 7/15 frames) is unusual for fan speed.
+
+**Status**: Finding 11 Group 2 labels applied provisionally. The R/T bus may use a
+different field layout than the Wi-Fi path for page 0x42. **Disputed** — own captures
+are ambiguous; needs dedicated testing with known fan speed changes.
+
+Previous own-capture analysis (retained for reference):
+
+| Offset | Bytes | Observed values | Own capture label | Confidence |
+|--------|-------|-----------------|-------------------|------------|
 | body[4] | 1 | 0x00 (sentinel) or 0x4C–0x6B | Temperature A: `(val−50)/2` °C; 0x00 = sensor unavailable | Hypothesis |
 | body[5] | 1 | 0x00 (sentinel) or 0x4C–0x6B | Temperature B: `(val−50)/2` °C; 0x00 = sensor unavailable | Hypothesis |
 | body[6..11] | 6 | 0x00 constant | Reserved / unused | Consistent |
@@ -291,21 +310,16 @@ count=1  C1 21 01 42  6B 6B 00 00 00 00 00 00 40 01 00 00 00 00 00 00 00 00 00 0
 | body[13] | 1 | 0x00 (sentinel) or 0x01 | Correlated with body[12]; meaning unknown | Hypothesis |
 | body[14..23] | 10 | 0x00 constant | Reserved / unused | Consistent |
 
-Temperature encoding `(val−50)/2` is consistent with 0xC0 indoor/outdoor temperature fields
-(body[11..12] of status response). 7 of 15 frames carry the sentinel state (body[4]=body[5]=0x00,
-body[12]=0x00) — possibly "sensor not yet ready" at session start.
-
-**Cross-reference**: mill1000/midea-msmart (see `midea-msmart-mill1000.md`):
-property ID `0x42/0x00` = `prevent_straight_wind` in the 0xB1 variable-length property
-protocol. This is a **different bus protocol layer** — no direct field mapping to R/T bus
-group pages confirmed. **Disputed** (different protocol).
+**Note**: `0x42/0x00` = `prevent_straight_wind` in the 0xB1 property protocol is a
+**different bus protocol layer** — no direct field mapping to R/T bus group pages. **Disputed**.
 
 ---
 
-#### 4b-iii — Group Page 0x43 Response — body[3] Echo Anomaly (R/T bus)
+#### 4b-iii — Group Page 0x43 Response — Group 3: Outdoor Device Params (R/T bus)
 
 Source: own Session 1 captures, 14 frames, 7 unique bodies. All responses have
 body[3]=`0x03`, not `0x43` — the page ID is not echoed directly.
+Field labels from mill1000/midea-msmart (see `midea-msmart-mill1000.md`, Finding 11).
 
 ```
 Example frames (body[0..25]):
@@ -315,34 +329,41 @@ count=2  C1 21 01 03  00 00 00 00 00 08 4C 3E 72 AC B3 00 39 00 00 00 00 00 00 0
 count=2  C1 21 01 03  00 00 00 00 00 08 61 3C 72 AD B3 00 00 00 00 00 00 00 00 00
 ```
 
-| Offset | Bytes | Observed values | Label | Confidence |
-|--------|-------|-----------------|-------|------------|
-| body[3] | 1 | 0x03 (always) | Echo anomaly — not `0x43`; reason unknown | Unknown |
-| body[4..8] | 5 | 0x00 constant | Reserved / unused | Consistent |
-| body[9] | 1 | 0x08 constant | Format marker or sub-version | Unknown |
-| body[10] | 1 | 0x00 (sentinel) or 0x17–0x61 | Temperature A: `(val−50)/2` °C; 0x00 = sensor unavailable | Hypothesis |
-| body[11] | 1 | 0x1B–0x3E | Temperature B: `(val−50)/2` °C (−11.5 to 6°C range observed) | Hypothesis |
-| body[12] | 1 | 0x72 constant | Unknown constant | Unknown |
-| body[13] | 1 | 0xA9–0xB3 range | Unknown — varies, not a simple temperature | Unknown |
-| body[14] | 1 | 0xB3 constant | Unknown constant | Unknown |
-| body[15] | 1 | 0x00 constant | Reserved | Consistent |
-| body[16] | 1 | 0x00 or 0x39 | Unknown flag or state | Unknown |
-| body[17..23] | 7 | 0x00 constant | Reserved / unused | Consistent |
+**body[3] anomaly explained**: body[3]=`0x03` → `0x03 & 0x0F = 3` = Group 3. The group
+dispatch works correctly despite the non-echoed page ID. Finding 11 confirms the
+dispatch uses `body[3] & 0x0F`, not the full byte.
 
-**body[3] anomaly**: the query sends page ID `0x43`, but the response echoes `0x03`.
-Hypothesis: body[3] in the response carries a page index (0x43 − 0x40 = 0x03). However,
-pages 0x41 and 0x42 echo their full IDs (0x41 and 0x42, not 0x01 and 0x02), so this
-subtraction rule does not hold uniformly. **Unknown.**
+**Finding 11 field map (Group 3)** vs own captures:
 
-**Cross-reference**: mill1000/midea-msmart property ID `0x43/0x00` = `gentle_wind_sense` /
-`prevent_straight_wind_flag` in 0xB1 protocol. Different protocol layer. **Disputed**.
+| Offset | Bytes | Observed | Finding 11 field | Encoding | Fit with captures | Confidence |
+|--------|-------|----------|------------------|----------|-------------------|------------|
+| body[4..8] | 5 | 0x00 constant | Outdoor device state 1-5 | 8-bit packed flags | Consistent (no outdoor faults) | Hypothesis |
+| body[9] | 1 | 0x08 constant | Outdoor device state 6 | 8-bit packed flags | Consistent (bit3=4-way valve?) | Hypothesis |
+| body[10] | 1 | 0x00/0x17/0x4C/0x61 | Outdoor DC fan speed | raw × 8 RPM → 0/184/608/776 RPM | Plausible | Hypothesis |
+| body[11] | 1 | 0x1B–0x3E | EEV position | raw × 8 steps → 216–496 steps | Plausible | Hypothesis |
+| body[12] | 1 | 0x72 constant | Outdoor return air temp | raw AD value (=114) | Plausible | Hypothesis |
+| body[13] | 1 | 0xA9–0xB3 | Outdoor DC bus voltage | raw (169–179) | Plausible for DC bus | Hypothesis |
+| body[14] | 1 | 0xB3 constant | IPM module temp | raw °C (=179?) | High for °C — **Disputed** | Disputed |
+| body[15] | 1 | 0x00 | Outdoor load state | raw | Consistent (idle) | Hypothesis |
+| body[16] | 1 | 0x00/0x39 | Outdoor target compressor freq | raw Hz (0/57) | Plausible | Hypothesis |
+| body[17..23] | 7 | 0x00 | Beyond Group 3 fields | — | Consistent | — |
+
+**Previous interpretation corrected**: body[10..11] were previously labeled as temperatures
+using `(val−50)/2`. Finding 11 shows they are outdoor DC fan speed (×8 RPM) and EEV
+position (×8 steps). body[12] (0x72=114) was "unknown constant" — now identified as outdoor
+return air temperature (raw AD, not `(val-50)/2`). body[14] (0xB3=179) as IPM temperature
+seems too high for °C — may be a raw AD value requiring a lookup table. **Disputed**.
+
+**Note**: `0x43/0x00` = `gentle_wind_sense` / `prevent_straight_wind_flag` in 0xB1
+property protocol is a **different bus protocol layer**. **Disputed**.
 
 ---
 
-#### 4b-iv — Group Page 0x45 Response — Unknown (R/T bus)
+#### 4b-iv — Group Page 0x45 Response — Group 5: Extended Params (R/T bus)
 
 Source: own Session 1 captures, 5 frames, 5 unique bodies. No corresponding
-`41 81 01 45` request found — possible spontaneous/pushed response. **Unknown.**
+`41 81 01 45` request found — possible spontaneous/pushed response.
+Field labels from mill1000/midea-msmart (see `midea-msmart-mill1000.md`, Finding 11).
 
 ```
 Example frames (body[0..22], 23 bytes total):
@@ -353,25 +374,33 @@ count=1  C1 21 01 45  00 50 26 1B 61 3E 00 00 00 00 33 07 00 B7 88 00 4D 7A 97
 count=1  C1 21 01 45  00 50 26 1B 61 3E 00 00 00 00 33 07 00 B7 88 00 9E CF F1
 ```
 
-| Offset | Bytes | Observed values | Label | Confidence |
-|--------|-------|-----------------|-------|------------|
-| body[4] | 1 | 0x00 constant | Unknown | Unknown |
-| body[5] | 1 | 0x4A, 0x50, 0x52 | Possibly temperature: `(val−50)/2` °C → 12/15/16°C | Unknown |
-| body[6] | 1 | 0x26 constant | Unknown constant | Unknown |
-| body[7] | 1 | 0x1B constant | Unknown constant | Unknown |
-| body[8] | 1 | 0x00 or 0x61 | Unknown — two distinct values | Unknown |
-| body[9] | 1 | 0x1B or 0x3E (correlated with body[8]) | Unknown | Unknown |
-| body[10..13] | 4 | 0x00 constant | Unknown | Unknown |
-| body[14] | 1 | 0x33 constant | Unknown constant | Unknown |
-| body[15] | 1 | 0x07 constant | Unknown constant | Unknown |
-| body[16] | 1 | 0x00 constant | Unknown | Unknown |
-| body[17] | 1 | 0xB7 constant | Unknown constant | Unknown |
-| body[18] | 1 | 0x88 constant | Unknown constant | Unknown |
-| body[19] | 1 | 0x00 constant | Unknown | Unknown |
-| body[20..22] | 3 | Varies (all frames different) | Likely frame checksums (not protocol data) | Hypothesis |
+**Finding 11 field map (Group 5)** vs own captures:
 
-All fields **Unknown**. The constant pattern `26 1B ... 33 07 00 B7 88` may be a version
-or board identifier. Insufficient data for any confident hypotheses.
+| Offset | Bytes | Observed | Finding 11 field | Encoding | Fit with captures | Confidence |
+|--------|-------|----------|------------------|----------|-------------------|------------|
+| body[4] | 1 | 0x00 | Humidity | raw % | Consistent (0% = sensor idle?) | Hypothesis |
+| body[5] | 1 | 0x4A/0x50/0x52 | Compensated temp setpoint (Tsc) | raw | 74/80/82 — plausible raw Tsc | Hypothesis |
+| body[6] | 1 | 0x26 | Indoor fan runtime (lo) | 16-bit LE with body[7] | 0x1B26 = 6950 min ≈ 116 h | Hypothesis |
+| body[7] | 1 | 0x1B | Indoor fan runtime (hi) | | — | Hypothesis |
+| body[8] | 1 | 0x00/0x61 | Outdoor fan target speed | raw ×8 → 0/776 RPM | Plausible | Hypothesis |
+| body[9] | 1 | 0x1B/0x3E | EEV target angle | raw ×8 → 216/496 steps | Plausible (correlated with body[8]) | Hypothesis |
+| body[10] | 1 | 0x00 | Defrost step | 0=none | Consistent | Hypothesis |
+| body[11] | 1 | 0x00 | Outdoor state 7 (reserved) | raw | Consistent | Hypothesis |
+| body[12] | 1 | 0x00 | Outdoor state 8 (reserved) | raw | Consistent | Hypothesis |
+| body[13] | 1 | 0x00 | Compressor run time | raw ×64 s | Consistent (idle) | Hypothesis |
+| body[14] | 1 | 0x33 | Compressor cumul. time (lo) | 16-bit LE with body[15] | 0x0733 = 1843 h | Hypothesis |
+| body[15] | 1 | 0x07 | Compressor cumul. time (hi) | | — | Hypothesis |
+| body[16] | 1 | 0x00 | Freq-limit type 2 | raw | Consistent | Hypothesis |
+| body[17] | 1 | 0xB7 | Max bus voltage | raw + 60 → 243 V | Plausible (≈240V mains) | Hypothesis |
+| body[18] | 1 | 0x88 | Min bus voltage | raw + 60 → 196 V | Plausible (sag during startup) | Hypothesis |
+| body[19] | 1 | 0x00 | Beyond Group 5 fields | — | — | — |
+| body[20..22] | 3 | Varies | Frame tail (CRC/checksum area) | not protocol data | Hypothesis |
+
+**Previous unknowns now decoded**: The constant pattern `26 1B ... 33 07 00 B7 88` is
+actually: indoor fan runtime = 6950 min, compressor cumulative runtime = 1843 h,
+max voltage = 243V, min voltage = 196V — all plausible historical counters for a unit
+in service. body[5] (0x4A–0x52) previously guessed as temperature is actually the
+compensated setpoint (Tsc) — a raw internal value, not `(val-50)/2`.
 
 ### 4c — Power usage query (body[1]=0x21, body[2]=0x01, body[3]=0x44)
 
@@ -787,15 +816,18 @@ data[0x0d]    body[13]    humidity (& 0x7F)
 
 ## 7. Command 0xC1 — Extended Response Sub-types (Group Pages, Power, Extended State)
 
-`body[0] = 0xC1` covers three distinct sub-types. **Dispatch by body[3] first, then body[1]:**
+`body[0] = 0xC1` covers multiple sub-types. **Dispatch by body[1]/body[2] first:**
 
 | Priority | Condition | Sub-type | Triggered by |
 |----------|-----------|----------|--------------|
-| 1 | `body[3] == 0x44` | Power usage (BCD kWh) | `0x41/0x21/0x01/0x44` query |
-| 2 | `body[1] == 0x21 and body[2] == 0x01` | Group page response (R/T bus) | `0x41/0x81/0x01/page` query |
-| 3 | `body[1] == 0x01` | Extended state sub-page 0x01 (sensors, faults) | Extended `0x41/0x21` query — mill1000/midea-msmart Finding 8 |
-| 4 | `body[1] == 0x02` | Extended state sub-page 0x02 (flags, power, vanes) | Extended `0x41/0x21` query — mill1000/midea-msmart Finding 8 |
+| 1 | `body[1] == 0x21 and body[2] == 0x01` | Group page response (groups 1-5+, incl. power) | `0x41/0x81/0x01/page` or `0x41/0x21/0x01/page` query |
+| 2 | `body[1] == 0x01` | Extended state sub-page 0x01 (sensors, faults) | Extended `0x41/0x21` query — mill1000/midea-msmart Finding 8 |
+| 3 | `body[1] == 0x02` | Extended state sub-page 0x02 (flags, power, vanes) | Extended `0x41/0x21` query — mill1000/midea-msmart Finding 8 |
 | — | other | Unknown | — |
+
+Group page responses dispatch further by `body[3] & 0x0F` as group number (Finding 11).
+Group 4 (`body[3]=0x44`) is the power usage page — previously handled as a separate
+top-level sub-type, now unified under the group page dispatcher.
 
 > Do not call all 0xC1 frames "Power Response" — this is incorrect for group-page and extended-state variants.
 

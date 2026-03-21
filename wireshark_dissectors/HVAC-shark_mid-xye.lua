@@ -323,7 +323,7 @@ end
 
 
 local function decode_c1_group1(body_tree, buf, body_off, body_len)
-    -- Group Page 0x41 = Group 1 "Base Run Info" (基本运行信息)
+    -- Group Page 0x41 = Group 1 "Base Run Info"
     -- Source: mill1000/midea-msmart (see midea-msmart-mill1000.md, Finding 11)
     -- Cross-checked against own Session 1 captures (R/T bus, 13 unique frames).
     -- All field labels are Hypothesis unless noted.
@@ -442,6 +442,294 @@ local function decode_c1_group1(body_tree, buf, body_off, body_len)
     if n > 14 then
         body_tree:add(buf(d + 14, n - 14),
             "Tail: " .. tostring(buf(d + 14, n - 14):bytes()) .. "  [beyond Group 1 fields]")
+    end
+end
+
+
+local function decode_c1_group2(body_tree, buf, body_off, body_len)
+    -- Group 2 "Indoor Device Params"
+    -- Source: mill1000/midea-msmart (see midea-msmart-mill1000.md, Finding 11)
+    -- All fields: Hypothesis.
+
+    local d = body_off + 4
+    local n = body_len - 4
+
+    -- body[4]: indoor set fan speed (raw × 8 = RPM)
+    if n >= 1 then
+        local raw = buf(d + 0, 1):uint()
+        body_tree:add(buf(d + 0, 1), string.format(
+            "Indoor set fan speed: %d RPM (raw %d ×8)  [Hypothesis]", raw * 8, raw))
+    end
+
+    -- body[5]: indoor actual fan speed (raw × 8 = RPM)
+    if n >= 2 then
+        local raw = buf(d + 1, 1):uint()
+        body_tree:add(buf(d + 1, 1), string.format(
+            "Indoor actual fan speed: %d RPM (raw %d ×8)  [Hypothesis]", raw * 8, raw))
+    end
+
+    -- body[6..8]: indoor fault state bytes 1-3 (8-bit packed each)
+    if n >= 3 then
+        body_tree:add(buf(d + 2, 1), string.format(
+            "Indoor fault state 1: 0x%02X  [Hypothesis: 8 flags]", buf(d + 2, 1):uint()))
+    end
+    if n >= 4 then
+        body_tree:add(buf(d + 3, 1), string.format(
+            "Indoor fault state 2: 0x%02X  [Hypothesis: 8 flags]", buf(d + 3, 1):uint()))
+    end
+    if n >= 5 then
+        body_tree:add(buf(d + 4, 1), string.format(
+            "Indoor fault state 3: 0x%02X  [Hypothesis: 8 flags]", buf(d + 4, 1):uint()))
+    end
+
+    -- body[9..11]: indoor freq-limit state bytes 1-3
+    if n >= 6 then
+        body_tree:add(buf(d + 5, 1), string.format(
+            "Indoor freq-limit state 1: 0x%02X  [Hypothesis: 8 flags]", buf(d + 5, 1):uint()))
+    end
+    if n >= 7 then
+        body_tree:add(buf(d + 6, 1), string.format(
+            "Indoor freq-limit state 2: 0x%02X  [Hypothesis: 8 flags]", buf(d + 6, 1):uint()))
+    end
+    if n >= 8 then
+        body_tree:add(buf(d + 7, 1), string.format(
+            "Indoor freq-limit state 3: 0x%02X  [Hypothesis: 8 flags]", buf(d + 7, 1):uint()))
+    end
+
+    -- body[12..13]: indoor load state bytes 1-2
+    if n >= 9 then
+        body_tree:add(buf(d + 8, 1), string.format(
+            "Indoor load state 1: 0x%02X  [Hypothesis: 8 flags]", buf(d + 8, 1):uint()))
+    end
+    if n >= 10 then
+        body_tree:add(buf(d + 9, 1), string.format(
+            "Indoor load state 2: 0x%02X  [Hypothesis: 8 flags]", buf(d + 9, 1):uint()))
+    end
+
+    -- body[14]: indoor E2 param version
+    if n >= 11 then
+        body_tree:add(buf(d + 10, 1), string.format(
+            "Indoor E2 param version: %d  [Hypothesis]", buf(d + 10, 1):uint()))
+    end
+
+    -- body[15..19]: smart-eye child detection fields
+    if n >= 12 then
+        body_tree:add(buf(d + 11, 1), string.format(
+            "Child state: %d  [Hypothesis: smart-eye occupancy]", buf(d + 11, 1):uint()))
+    end
+    if n >= 13 then
+        body_tree:add(buf(d + 12, 1), string.format(
+            "Child count: %d  [Hypothesis]", buf(d + 12, 1):uint()))
+    end
+    if n >= 16 then
+        body_tree:add(buf(d + 13, 4), string.format(
+            "Child angles/distances: %d / %d / %d / %d  [Hypothesis]",
+            buf(d + 13, 1):uint(), buf(d + 14, 1):uint(),
+            buf(d + 15, 1):uint(), 0))  -- childDistance2 is hardcoded 0x00
+    end
+end
+
+
+local function decode_c1_group3(body_tree, buf, body_off, body_len)
+    -- Group 3 "Outdoor Device Params"
+    -- Source: mill1000/midea-msmart (see midea-msmart-mill1000.md, Finding 11)
+    -- Note: query page 0x43 echoes body[3]=0x03, not 0x43 — dispatch via body[3]&0x0F=3
+    -- All fields: Hypothesis.
+
+    local d = body_off + 4
+    local n = body_len - 4
+
+    -- body[4..9]: outdoor device state bytes 1-6 (8-bit packed each)
+    for i = 0, 5 do
+        if n >= (i + 1) then
+            body_tree:add(buf(d + i, 1), string.format(
+                "Outdoor device state %d: 0x%02X  [Hypothesis: 8 flags]", i + 1, buf(d + i, 1):uint()))
+        end
+    end
+
+    -- body[10]: outdoor DC fan actual speed (raw × 8 = RPM)
+    if n >= 7 then
+        local raw = buf(d + 6, 1):uint()
+        body_tree:add(buf(d + 6, 1), string.format(
+            "Outdoor DC fan speed: %d RPM (raw %d ×8)  [Hypothesis]", raw * 8, raw))
+    end
+
+    -- body[11]: electronic expansion valve position (raw × 8 = steps)
+    if n >= 8 then
+        local raw = buf(d + 7, 1):uint()
+        body_tree:add(buf(d + 7, 1), string.format(
+            "EEV position: %d steps (raw %d ×8)  [Hypothesis]", raw * 8, raw))
+    end
+
+    -- body[12]: outdoor return air (suction) temperature (raw)
+    if n >= 9 then
+        body_tree:add(buf(d + 8, 1), string.format(
+            "Outdoor return air temp: %d (raw)  [Hypothesis]", buf(d + 8, 1):uint()))
+    end
+
+    -- body[13]: outdoor DC bus voltage (raw)
+    if n >= 10 then
+        body_tree:add(buf(d + 9, 1), string.format(
+            "Outdoor DC bus voltage: %d (raw)  [Hypothesis]", buf(d + 9, 1):uint()))
+    end
+
+    -- body[14]: IPM module temperature (raw °C)
+    if n >= 11 then
+        body_tree:add(buf(d + 10, 1), string.format(
+            "IPM module temp: %d °C  [Hypothesis]", buf(d + 10, 1):uint()))
+    end
+
+    -- body[15]: outdoor load state (raw)
+    if n >= 12 then
+        body_tree:add(buf(d + 11, 1), string.format(
+            "Outdoor load state: 0x%02X  [Hypothesis]", buf(d + 11, 1):uint()))
+    end
+
+    -- body[16]: outdoor target compressor frequency (raw)
+    if n >= 13 then
+        body_tree:add(buf(d + 12, 1), string.format(
+            "Outdoor target compressor freq: %d  [Hypothesis]", buf(d + 12, 1):uint()))
+    end
+end
+
+
+local function decode_c1_group4(body_tree, buf, body_off, body_len)
+    -- Group 4 "Power Consumption"
+    -- Source: mill1000/midea-msmart (see midea-msmart-mill1000.md, Finding 11)
+    -- All fields: Hypothesis.
+
+    local d = body_off + 4
+    local n = body_len - 4
+
+    local function bcd(byte)
+        return 10 * bit.rshift(bit.band(byte, 0xF0), 4) + bit.band(byte, 0x0F)
+    end
+
+    -- body[4..7]: total power consumed (BCD kWh)
+    if n >= 4 then
+        local val = bcd(buf(d+0,1):uint()) * 10000 + bcd(buf(d+1,1):uint()) * 100
+                  + bcd(buf(d+2,1):uint()) + bcd(buf(d+3,1):uint()) / 100.0
+        body_tree:add(buf(d + 0, 4), string.format(
+            "Total power consumed: %.2f kWh (BCD)  [Hypothesis]", val))
+    end
+
+    -- body[8..11]: total running power (BCD kWh)
+    if n >= 8 then
+        local val = bcd(buf(d+4,1):uint()) * 10000 + bcd(buf(d+5,1):uint()) * 100
+                  + bcd(buf(d+6,1):uint()) + bcd(buf(d+7,1):uint()) / 100.0
+        body_tree:add(buf(d + 4, 4), string.format(
+            "Total running power: %.2f kWh (BCD)  [Hypothesis]", val))
+    end
+
+    -- body[12..15]: current run power (BCD kWh)
+    if n >= 12 then
+        local val = bcd(buf(d+8,1):uint()) * 10000 + bcd(buf(d+9,1):uint()) * 100
+                  + bcd(buf(d+10,1):uint()) + bcd(buf(d+11,1):uint()) / 100.0
+        body_tree:add(buf(d + 8, 4), string.format(
+            "Current run power: %.2f kWh (BCD)  [Hypothesis]", val))
+    end
+
+    -- body[16..18]: real-time power (BCD kW)
+    if n >= 15 then
+        local val = bcd(buf(d+12,1):uint()) + bcd(buf(d+13,1):uint()) / 100.0
+                  + bcd(buf(d+14,1):uint()) / 10000.0
+        body_tree:add(buf(d + 12, 3), string.format(
+            "Real-time power: %.4f kW (BCD)  [Hypothesis]", val))
+    end
+end
+
+
+local function decode_c1_group5(body_tree, buf, body_off, body_len)
+    -- Group 5 "Extended Params"
+    -- Source: mill1000/midea-msmart (see midea-msmart-mill1000.md, Finding 11)
+    -- All fields: Hypothesis.
+
+    local d = body_off + 4
+    local n = body_len - 4
+
+    -- body[4]: current humidity (%)
+    if n >= 1 then
+        body_tree:add(buf(d + 0, 1), string.format(
+            "Humidity: %d %%  [Hypothesis]", buf(d + 0, 1):uint()))
+    end
+
+    -- body[5]: compensated temp setpoint (Tsc)
+    if n >= 2 then
+        body_tree:add(buf(d + 1, 1), string.format(
+            "Compensated temp setpoint (Tsc): %d  [Hypothesis]", buf(d + 1, 1):uint()))
+    end
+
+    -- body[6..7]: indoor fan runtime (16-bit LE)
+    if n >= 4 then
+        local val = buf(d + 2, 1):uint() + buf(d + 3, 1):uint() * 256
+        body_tree:add(buf(d + 2, 2), string.format(
+            "Indoor fan runtime: %d (16-bit LE)  [Hypothesis]", val))
+    end
+
+    -- body[8]: outdoor fan target speed (raw × 8 = RPM)
+    if n >= 5 then
+        local raw = buf(d + 4, 1):uint()
+        body_tree:add(buf(d + 4, 1), string.format(
+            "Outdoor fan target speed: %d RPM (raw %d ×8)  [Hypothesis]", raw * 8, raw))
+    end
+
+    -- body[9]: EEV target angle (raw × 8 = steps)
+    if n >= 6 then
+        local raw = buf(d + 5, 1):uint()
+        body_tree:add(buf(d + 5, 1), string.format(
+            "EEV target angle: %d steps (raw %d ×8)  [Hypothesis]", raw * 8, raw))
+    end
+
+    -- body[10]: defrost step
+    if n >= 7 then
+        local step = buf(d + 6, 1):uint()
+        local step_str = ({"none","start","in-progress","ending"})[step + 1] or "unknown"
+        body_tree:add(buf(d + 6, 1), string.format(
+            "Defrost step: %d (%s)  [Hypothesis]", step, step_str))
+    end
+
+    -- body[11..12]: outdoor state 7-8 (reserved)
+    if n >= 8 then
+        body_tree:add(buf(d + 7, 1), string.format(
+            "Outdoor state 7 (reserved): 0x%02X  [Hypothesis]", buf(d + 7, 1):uint()))
+    end
+    if n >= 9 then
+        body_tree:add(buf(d + 8, 1), string.format(
+            "Outdoor state 8 (reserved): 0x%02X  [Hypothesis]", buf(d + 8, 1):uint()))
+    end
+
+    -- body[13]: compressor current run time (raw × 64 seconds)
+    if n >= 10 then
+        local raw = buf(d + 9, 1):uint()
+        body_tree:add(buf(d + 9, 1), string.format(
+            "Compressor run time: %d s (raw %d ×64)  [Hypothesis]", raw * 64, raw))
+    end
+
+    -- body[14..15]: compressor cumulative run time (16-bit LE, hours)
+    if n >= 12 then
+        local val = buf(d + 10, 1):uint() + buf(d + 11, 1):uint() * 256
+        body_tree:add(buf(d + 10, 2), string.format(
+            "Compressor cumulative run time: %d h (16-bit LE)  [Hypothesis]", val))
+    end
+
+    -- body[16]: freq-limit type 2
+    if n >= 13 then
+        body_tree:add(buf(d + 12, 1), string.format(
+            "Freq-limit type 2: %d  [Hypothesis]", buf(d + 12, 1):uint()))
+    end
+
+    -- body[17]: max bus voltage (raw + 60 V)
+    if n >= 14 then
+        body_tree:add(buf(d + 13, 1), string.format(
+            "Max bus voltage: %d V (raw %d +60)  [Hypothesis]",
+            buf(d + 13, 1):uint() + 60, buf(d + 13, 1):uint()))
+    end
+
+    -- body[18]: min bus voltage (raw + 60 V)
+    if n >= 15 then
+        body_tree:add(buf(d + 14, 1), string.format(
+            "Min bus voltage: %d V (raw %d +60)  [Hypothesis]",
+            buf(d + 14, 1):uint() + 60, buf(d + 14, 1):uint()))
     end
 end
 
@@ -606,9 +894,8 @@ end
 
 
 local function decode_uart_c1(body_tree, buf, body_off, body_len)
-    -- 0xC1 — four distinct sub-types, checked in priority order:
-    --   body[3]=0x44                             → power usage response (BCD kWh)  [checked first]
-    --   body[1]=0x21, body[2]=0x01              → group dev-param page response (R/T bus)
+    -- 0xC1 — dispatch by body[1]/body[2]/body[3]:
+    --   body[1]=0x21, body[2]=0x01              → group dev-param page (incl. 0x44 power)
     --   body[1]=0x01                             → extended state sub-page 0x01
     --   body[1]=0x02                             → extended state sub-page 0x02
     --   other                                    → unknown, show raw
@@ -617,37 +904,23 @@ local function decode_uart_c1(body_tree, buf, body_off, body_len)
     local b2 = body_len >= 3 and buf(body_off + 2, 1):uint() or 0
     local b3 = body_len >= 4 and buf(body_off + 3, 1):uint() or 0
 
-    if b3 == 0x44 then
-        -- Power usage response takes priority — body[3]=0x44 is the power-page marker.
-        -- (Shares b1=0x21, b2=0x01 with group-page responses, so check this first.)
-
-        -- Power usage response — BCD-encoded kWh
-        -- *** CONTROVERSY: subbody format ***
-        -- Only 0x44 format documented. midea-local has 3 parsing methods (BCD/binary/raw).
-        body_tree:add(buf(body_off + 0, 1), "Command ID: 0xC1 (Power Response, sub=0x44)")
-        if body_len >= 19 then
-            local power = 0
-            local multiplier = 1
-            for i = 18, 16, -1 do
-                local byte = buf(body_off + i, 1):uint()
-                local lo = bit.band(byte, 0x0F)
-                local hi = bit.band(bit.rshift(byte, 4), 0x0F)
-                power = power + lo * multiplier + hi * multiplier * 10
-                multiplier = multiplier * 100
-            end
-            body_tree:add(buf(body_off + 16, 3), string.format(
-                "Power Usage: %d (BCD)   [NOTE: only 0x44 subbody format decoded, see protocol_uart.md §7]",
-                power))
-        end
-
-    elseif b1 == 0x21 and b2 == 0x01 then
-        -- Capability/config page response (seen on R/T bus from KJR wall controller)
-        -- body[3] = page ID echoed from the request (0x41, 0x42, 0x43 observed; 0x03 for page 0x43)
+    if b1 == 0x21 and b2 == 0x01 then
+        -- Group dev-param page response (R/T bus, KJR wall controller)
+        -- body[3] = page ID echoed from request; group = body[3] & 0x0F
+        -- Source: mill1000/midea-msmart (see midea-msmart-mill1000.md, Finding 11)
+        local group = bit.band(b3, 0x0F)
         body_tree:add(buf(body_off + 0, 4), string.format(
-            "Command ID: 0xC1 (Group Page Response, page=0x%02X)", b3))
-        if b3 == 0x41 then
-            -- Field-wise dissection for page 0x41 (13 unique frames observed in Session 1)
+            "Command ID: 0xC1 (Group Page Response, page=0x%02X, group=%d)", b3, group))
+        if group == 1 then
             decode_c1_group1(body_tree, buf, body_off, body_len)
+        elseif group == 2 then
+            decode_c1_group2(body_tree, buf, body_off, body_len)
+        elseif group == 3 then
+            decode_c1_group3(body_tree, buf, body_off, body_len)
+        elseif group == 4 then
+            decode_c1_group4(body_tree, buf, body_off, body_len)
+        elseif group == 5 then
+            decode_c1_group5(body_tree, buf, body_off, body_len)
         elseif body_len > 4 then
             body_tree:add(buf(body_off + 4, body_len - 4),
                 "Page Data: " .. tostring(buf(body_off + 4, body_len - 4):bytes()))
@@ -756,37 +1029,82 @@ local function decode_uart_41_query(body_tree, buf, body_off, body_len)
     local b2   = buf(body_off + 2, 1):uint()
     local b3   = buf(body_off + 3, 1):uint()
 
+    -- Group page name table
+    local group_page_names = {
+        [0x40] = "Group 0 (Timing Info)",
+        [0x41] = "Group 1 (Base Run Info)",
+        [0x42] = "Group 2 (Indoor Device Params)",
+        [0x43] = "Group 3 (Outdoor Device Params)",
+        [0x44] = "Group 4 (Power Consumption)",
+        [0x45] = "Group 5 (Extended Params)",
+        [0x46] = "Group 6 (Diagnostics)",
+        [0x4B] = "Group 11 (Wind Blade Control)",
+    }
+
+    -- body[0]: command ID
+    body_tree:add(buf(body_off, 1), "body[0] = 0x41 (Query command)")
+
     if sub == 0x81 then
+        body_tree:add(buf(body_off + 1, 1), "body[1] = 0x81 (Standard query sub-command)")
         if b2 == 0x00 then
-            body_tree:add(buf(body_off, 4),
-                "Command: 0x41/0x81/0x00 (Query Status → 0xC0)")
+            body_tree:add(buf(body_off + 2, 1), "body[2] = 0x00 (Status query)")
+            body_tree:add(buf(body_off + 3, 1), string.format(
+                "body[3] = 0x%02X (query param — expects 0xC0 response)", b3))
         elseif b2 == 0x01 then
-            body_tree:add(buf(body_off, 4), string.format(
-                "Command: 0x41/0x81/0x01 (Query Group Page 0x%02X → 0xC1 group)", b3))
+            local group = bit.band(b3, 0x0F)
+            local page_name = group_page_names[b3] or string.format("Group %d", group)
+            body_tree:add(buf(body_off + 2, 1), "body[2] = 0x01 (Group page query)")
+            body_tree:add(buf(body_off + 3, 1), string.format(
+                "body[3] = 0x%02X → group = body[3] & 0x0F = %d → %s",
+                b3, group, page_name))
         else
-            body_tree:add(buf(body_off, 4), string.format(
-                "Command: 0x41/0x81/0x%02X (unknown variant, b3=0x%02X)", b2, b3))
+            body_tree:add(buf(body_off + 2, 1), string.format(
+                "body[2] = 0x%02X (unknown query type)", b2))
+            body_tree:add(buf(body_off + 3, 1), string.format(
+                "body[3] = 0x%02X", b3))
         end
     elseif sub == 0x21 then
-        if b2 == 0x01 and b3 == 0x44 then
-            body_tree:add(buf(body_off, 4),
-                "Command: 0x41/0x21/0x01/0x44 (Query Power Usage → 0xC1 BCD)")
+        body_tree:add(buf(body_off + 1, 1), "body[1] = 0x21 (Dev-param query sub-command)")
+        if b2 == 0x01 then
+            local group = bit.band(b3, 0x0F)
+            local page_name = group_page_names[b3] or string.format("Group %d", group)
+            body_tree:add(buf(body_off + 2, 1), "body[2] = 0x01 (Group page query)")
+            body_tree:add(buf(body_off + 3, 1), string.format(
+                "body[3] = 0x%02X → group = body[3] & 0x0F = %d → %s",
+                b3, group, page_name))
         else
             local opt = body_len >= 5 and buf(body_off + 4, 1):uint() or 0
-            body_tree:add(buf(body_off, 4), string.format(
-                "Command: 0x41/0x21 (Extended, optCommand=0x%02X)", opt))
+            body_tree:add(buf(body_off + 2, 1), string.format(
+                "body[2] = 0x%02X (extended query)", b2))
+            body_tree:add(buf(body_off + 3, 1), string.format(
+                "body[3] = 0x%02X", b3))
+            if body_len >= 5 then
+                body_tree:add(buf(body_off + 4, 1), string.format(
+                    "body[4] = 0x%02X (optCommand)", opt))
+            end
         end
     elseif sub == 0x61 then
-        body_tree:add(buf(body_off, 2), "Command: 0x41/0x61 (Display Toggle)")
+        body_tree:add(buf(body_off + 1, 1), "body[1] = 0x61 (Display toggle)")
     else
-        body_tree:add(buf(body_off, 2), string.format(
-            "Command: 0x41/0x%02X (unknown sub-command)", sub))
+        body_tree:add(buf(body_off + 1, 1), string.format(
+            "body[1] = 0x%02X (unknown sub-command)", sub))
+    end
+
+    -- body[4..19]: padding (all zero in observed queries)
+    -- body[20]: random byte, body[21]: CRC-8
+    if body_len >= 21 then
+        body_tree:add(buf(body_off + 20, 1), string.format(
+            "body[20] = 0x%02X (random)", buf(body_off + 20, 1):uint()))
+    end
+    if body_len >= 22 then
+        body_tree:add(buf(body_off + 21, 1), string.format(
+            "body[21] = 0x%02X (CRC-8)", buf(body_off + 21, 1):uint()))
     end
 
     -- R/T bus adds an extra MSG_ID byte at body[22] (body_len=23 vs UART body_len=22)
     if body_len >= 23 then
         body_tree:add(buf(body_off + 22, 1), string.format(
-            "Msg ID (R/T): 0x%02X", buf(body_off + 22, 1):uint()))
+            "body[22] = 0x%02X (Msg ID, R/T bus only)", buf(body_off + 22, 1):uint()))
     end
 end
 
