@@ -33,6 +33,8 @@ captures. When the intent of a change is not completely clear:
 3. Only implement what was explicitly requested. Do not add features,
    refactor surrounding code, or "improve" things that were not mentioned.
 
+**Follow the terms of use and license terms of each source.** Check terms and licenses for each source and after each use of a source to ensure that you have complied with the terms of use and licenses.
+
 **Minimal changes.** Protocol decoders are built incrementally as more
 captures become available. A partial decoder with clearly marked unknowns
 (`TBD`,`FIXME`, `?`) is better than a complete-looking decoder built on guesses.
@@ -89,3 +91,24 @@ Bus type `0x04` (IR) payload: 6 decoded bytes per frame (NEC-like encoding,
 active-low TSOP receiver). See `SessionNotes.md` in session folders for
 known field mappings.
 
+## Local toolchain
+
+### tshark / Wireshark
+
+`tshark` is available at `C:\Program Files\Wireshark\tshark.exe` (Wireshark 4.4.2,
+verified 2026-03-21). The HVAC-shark Lua dissector is symlinked into
+`%APPDATA%\Wireshark\plugins\` and is loaded automatically by both Wireshark
+and tshark — no `-X lua_script:` flag needed.
+
+**Before using tshark in a session**, verify the path is still valid:
+```
+"C:/Program Files/Wireshark/tshark.exe" --version
+```
+If that fails, ask the user where tshark is installed before proceeding.
+
+Invoke tshark with forward slashes or double-escaped backslashes in bash
+(the shell is bash even on Windows):
+```bash
+TSHARK="C:/Program Files/Wireshark/tshark.exe"
+"$TSHARK" -r session.pcap -V 2>&1 | head -50
+```

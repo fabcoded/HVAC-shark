@@ -72,8 +72,9 @@ local UART_MSG_TYPES = {
 
 local UART_COMMAND_IDS = {
     [0x40] = "Set Status",   [0x41] = "Query",
+    [0x93] = "Ext Status",
     [0xB5] = "Capabilities", [0xC0] = "Status Response",
-    [0xC1] = "Power Response",
+    [0xC1] = "C1 Response",
 }
 
 local function getUartModeString(mode_bits)
@@ -321,26 +322,356 @@ local function decode_uart_c0_status(body_tree, buf, body_off, body_len)
 end
 
 
-local function decode_uart_c1_power(body_tree, buf, body_off, body_len)
-    -- C1 Power Response — BCD-encoded kWh
-    -- *** CONTROVERSY: subbody format ***
-    -- Only 0x44 format documented. midea-local has 3 parsing methods (BCD/binary/raw).
-    body_tree:add(buf(body_off + 0, 1), "Command ID: 0xC1 (Power Response)")
+local function decode_c1_group1(body_tree, buf, body_off, body_len)
+    -- Group Page 0x41 = Group 1 "Base Run Info" (基本运行信息)
+    -- Source: mill1000/midea-msmart (see midea-msmart-mill1000.md, Finding 11)
+    -- Cross-checked against own Session 1 captures (R/T bus, 13 unique frames).
+    -- All field labels are Hypothesis unless noted.
 
-    if body_len >= 19 then
-        -- BCD decode bytes 16-18 (documented format for subbody type 0x44)
-        local power = 0
-        local multiplier = 1
-        for i = 18, 16, -1 do
-            local byte = buf(body_off + i, 1):uint()
-            local lo = bit.band(byte, 0x0F)
-            local hi = bit.band(bit.rshift(byte, 4), 0x0F)
-            power = power + lo * multiplier + hi * multiplier * 10
-            multiplier = multiplier * 100
+    local d = body_off + 4  -- first data byte after the 4-byte command header
+    local n = body_len - 4  -- how many data bytes actually present
+
+    -- body[4]: compressor actual frequency (Hz)
+    if n >= 1 then
+        body_tree:add(buf(d + 0, 1), string.format(
+            "Compressor freq: %d Hz  [Hypothesis]",
+            buf(d + 0, 1):uint()))
+    end
+
+    -- body[5]: indoor target frequency
+    if n >= 2 then
+        body_tree:add(buf(d + 1, 1), string.format(
+            "Indoor target freq: %d  [Hypothesis]",
+            buf(d + 1, 1):uint()))
+    end
+
+    -- body[6]: compressor current (unit unclear)
+    if n >= 3 then
+        body_tree:add(buf(d + 2, 1), string.format(
+            "Compressor current: %d (raw, unit unclear)  [Hypothesis]",
+            buf(d + 2, 1):uint()))
+    end
+
+    -- body[7]: outdoor total current (raw × 4)
+    if n >= 4 then
+        local raw7 = buf(d + 3, 1):uint()
+        body_tree:add(buf(d + 3, 1), string.format(
+            "Outdoor total current: %d (raw×4 = %d)  [Hypothesis]",
+            raw7, raw7 * 4))
+    end
+
+    -- body[8]: outdoor supply voltage (raw)
+    if n >= 5 then
+        body_tree:add(buf(d + 4, 1), string.format(
+            "Outdoor supply voltage: %d (raw)  [Hypothesis]",
+            buf(d + 4, 1):uint()))
+    end
+
+    -- body[9]: indoor actual operating mode (raw)
+    if n >= 6 then
+        body_tree:add(buf(d + 5, 1), string.format(
+            "Indoor operating mode: %d (raw)  [Hypothesis]",
+            buf(d + 5, 1):uint()))
+    end
+
+    -- body[10]: T1 temperature (indoor coil) — offset 30
+    if n >= 7 then
+        local raw = buf(d + 6, 1):uint()
+        local t1 = raw >= 30 and (raw - 30) / 2.0 or (30 - raw) / -2.0
+        body_tree:add(buf(d + 6, 1), string.format(
+            "T1 indoor coil: %.1f °C (raw %d, offset 30)  [Hypothesis]",
+            t1, raw))
+    end
+
+    -- body[11]: T2 temperature — offset 30
+    if n >= 8 then
+        local raw = buf(d + 7, 1):uint()
+        local t2 = raw >= 30 and (raw - 30) / 2.0 or (30 - raw) / -2.0
+        body_tree:add(buf(d + 7, 1), string.format(
+            "T2: %.1f °C (raw %d, offset 30)  [Hypothesis]",
+            t2, raw))
+    end
+
+    -- body[12]: T3 temperature (outdoor coil) — offset 50
+    if n >= 9 then
+        local raw = buf(d + 8, 1):uint()
+        local t3 = raw >= 50 and (raw - 50) / 2.0 or (50 - raw) / -2.0
+        body_tree:add(buf(d + 8, 1), string.format(
+            "T3 outdoor coil: %.1f °C (raw %d, offset 50)  [Hypothesis]",
+            t3, raw))
+    end
+
+    -- body[13]: T4 temperature (outdoor ambient) — offset 50
+    if n >= 10 then
+        local raw = buf(d + 9, 1):uint()
+        local t4 = raw >= 50 and (raw - 50) / 2.0 or (50 - raw) / -2.0
+        body_tree:add(buf(d + 9, 1), string.format(
+            "T4 outdoor ambient: %.1f °C (raw %d, offset 50)  [Hypothesis]",
+            t4, raw))
+    end
+
+    -- body[14]: discharge pipe temperature (Tp) — lookup table, show raw
+    if n >= 11 then
+        body_tree:add(buf(d + 10, 1), string.format(
+            "Tp discharge temp: %d (raw, needs lookup table)  [Hypothesis]",
+            buf(d + 10, 1):uint()))
+    end
+
+    -- body[15]: outdoor DC fan stator flux
+    if n >= 12 then
+        body_tree:add(buf(d + 11, 1), string.format(
+            "Outdoor fan stator flux: %d (raw)  [Hypothesis]",
+            buf(d + 11, 1):uint()))
+    end
+
+    -- body[16]: outdoor supply voltage (duplicate?)
+    if n >= 13 then
+        body_tree:add(buf(d + 12, 1), string.format(
+            "Outdoor voltage (2): %d (raw)  [Hypothesis]",
+            buf(d + 12, 1):uint()))
+    end
+
+    -- body[17]: indoor fan stator flux
+    if n >= 14 then
+        body_tree:add(buf(d + 13, 1), string.format(
+            "Indoor fan stator flux: %d (raw)  [Hypothesis]",
+            buf(d + 13, 1):uint()))
+    end
+
+    -- body[18..23]: remaining bytes (not covered by Group 1 parser, typically zero)
+    if n > 14 then
+        body_tree:add(buf(d + 14, n - 14),
+            "Tail: " .. tostring(buf(d + 14, n - 14):bytes()) .. "  [beyond Group 1 fields]")
+    end
+end
+
+
+local function decode_c1_extstate_01(body_tree, buf, body_off, body_len)
+    -- 0xC1 extended state sub-page 0x01 — sensor temperatures, fault flags, actuator positions
+    -- Source: mill1000/midea-msmart (see midea-msmart-mill1000.md, Finding 8)
+    -- NOT verified against own captures. All fields: Hypothesis.
+
+    -- Helper: 16-bit LE × 0.01 °C, MSB ≥ 0x80 → negative
+    local function t16(off)
+        if body_len <= off + 1 then return nil end
+        local raw = buf(body_off + off, 2):le_uint()
+        local neg = buf(body_off + off + 1, 1):uint() >= 0x80
+        return (neg and -(0x10000 - raw) or raw) * 0.01
+    end
+
+    body_tree:add(buf(body_off, 2), "Extended State Sub-page: 0x01 (Hypothesis — not in own captures)")
+
+    if body_len > 10 then
+        local v = t16(9)
+        if v then body_tree:add(buf(body_off + 9,  2), string.format("T1 indoor coil (evap): %.2f °C  [Hypothesis: 16-bit LE ×0.01]", v)) end
+    end
+    if body_len > 12 then
+        local v = t16(11)
+        if v then body_tree:add(buf(body_off + 11, 2), string.format("T2: %.2f °C  [Hypothesis: 16-bit LE ×0.01]", v)) end
+    end
+    if body_len > 14 then
+        local v = t16(13)
+        if v then body_tree:add(buf(body_off + 13, 2), string.format("T3 outdoor coil (cond): %.2f °C  [Hypothesis: 16-bit LE ×0.01]", v)) end
+    end
+    if body_len > 16 then
+        local v = t16(15)
+        if v then body_tree:add(buf(body_off + 15, 2), string.format("T4 outdoor ambient: %.2f °C  [Hypothesis: 16-bit LE ×0.01]", v)) end
+    end
+    if body_len > 20 then
+        body_tree:add(buf(body_off + 20, 1), string.format(
+            "Compressor current: %.2f A  [Hypothesis: raw×0.25]",
+            buf(body_off + 20, 1):uint() * 0.25))
+    end
+    if body_len > 21 then
+        body_tree:add(buf(body_off + 21, 1), string.format(
+            "Outdoor total current: %.2f A  [Hypothesis: raw×0.25]",
+            buf(body_off + 21, 1):uint() * 0.25))
+    end
+    if body_len > 22 then
+        body_tree:add(buf(body_off + 22, 1), string.format(
+            "Outdoor supply voltage (raw AD): 0x%02X  [Hypothesis]",
+            buf(body_off + 22, 1):uint()))
+    end
+    if body_len > 26 then
+        body_tree:add(buf(body_off + 26, 1), string.format(
+            "Indoor fault byte 1: 0x%02X  b0=env-sensor b1=pipe-sensor b2=E2 b3=DC-fan-stall b4=indoor-outdoor-comm b5=smart-eye b6=display-E2 b7=RF-module  [Hypothesis]",
+            buf(body_off + 26, 1):uint()))
+    end
+    if body_len > 32 then
+        body_tree:add(buf(body_off + 32, 1), string.format(
+            "Load state: 0x%02X  b0=defrost b1=aux-heat b6=indoor-fan-run b7=purifier  [Hypothesis]",
+            buf(body_off + 32, 1):uint()))
+    end
+    if body_len > 41 then
+        body_tree:add(buf(body_off + 41, 1), string.format(
+            "Outdoor DC fan speed: %d RPM  [Hypothesis: raw×8]",
+            buf(body_off + 41, 1):uint() * 8))
+    end
+    if body_len > 42 then
+        body_tree:add(buf(body_off + 42, 1), string.format(
+            "EEV position: %d steps  [Hypothesis: raw×8]",
+            buf(body_off + 42, 1):uint() * 8))
+    end
+    if body_len > 77 then
+        body_tree:add(buf(body_off + 77, 1), string.format(
+            "Error code: %d  [Hypothesis]", buf(body_off + 77, 1):uint()))
+    end
+    if body_len > 1 then
+        body_tree:add(buf(body_off + 1, body_len - 1),
+            "Full payload: " .. tostring(buf(body_off + 1, body_len - 1):bytes()))
+    end
+end
+
+
+local function decode_c1_extstate_02(body_tree, buf, body_off, body_len)
+    -- 0xC1 extended state sub-page 0x02 — status flags, timers, power, vane angles, compressor
+    -- Source: mill1000/midea-msmart (see midea-msmart-mill1000.md, Finding 8)
+    -- NOT verified against own captures. All fields: Hypothesis.
+
+    body_tree:add(buf(body_off, 2), "Extended State Sub-page: 0x02 (Hypothesis — not in own captures)")
+
+    if body_len > 3 then
+        body_tree:add(buf(body_off + 2, 2), string.format(
+            "On-timer: %d min  [Hypothesis: 16-bit LE]",
+            buf(body_off + 2, 2):le_uint()))
+    end
+    if body_len > 5 then
+        body_tree:add(buf(body_off + 4, 2), string.format(
+            "Off-timer: %d min  [Hypothesis: 16-bit LE]",
+            buf(body_off + 4, 2):le_uint()))
+    end
+    if body_len > 6 then
+        body_tree:add(buf(body_off + 6, 1), string.format(
+            "Status flags A: 0x%02X  b7=body-sense b6=energy-save b5=strong b0=ECO  [Hypothesis]",
+            buf(body_off + 6, 1):uint()))
+    end
+    if body_len > 7 then
+        body_tree:add(buf(body_off + 7, 1), string.format(
+            "Status flags B: 0x%02X  b7=dust b6=aux-heat-actual b3=smart-eye b0=night-light  [Hypothesis]",
+            buf(body_off + 7, 1):uint()))
+    end
+    if body_len > 8 then
+        body_tree:add(buf(body_off + 8, 1), string.format(
+            "Status flags C: 0x%02X  b3=display-on/off b2=self-clean b1=no-direct-wind  [Hypothesis]",
+            buf(body_off + 8, 1):uint()))
+    end
+    if body_len > 11 then
+        body_tree:add(buf(body_off + 11, 1), string.format(
+            "Current humidity: %d %%  [Hypothesis]", buf(body_off + 11, 1):uint()))
+    end
+    if body_len > 12 then
+        body_tree:add(buf(body_off + 12, 1), string.format(
+            "Temp setpoint (compensated): %.1f °C  [Hypothesis: (raw-30)×0.5]",
+            (buf(body_off + 12, 1):uint() - 30) * 0.5))
+    end
+    if body_len > 17 then
+        local step = buf(body_off + 17, 1):uint()
+        local step_str = ({"none","start","in-progress","ending"})[step + 1] or "unknown"
+        body_tree:add(buf(body_off + 17, 1), string.format(
+            "Defrost step: %d (%s)  [Hypothesis]", step, step_str))
+    end
+    if body_len > 20 then
+        body_tree:add(buf(body_off + 20, 1), string.format(
+            "Compressor current run time: %d s  [Hypothesis]",
+            buf(body_off + 20, 1):uint()))
+    end
+    if body_len > 22 then
+        body_tree:add(buf(body_off + 21, 2), string.format(
+            "Compressor cumulative run time: %d h  [Hypothesis: 16-bit LE]",
+            buf(body_off + 21, 2):le_uint()))
+    end
+    if body_len > 48 then
+        body_tree:add(buf(body_off + 47, 2), string.format(
+            "Outdoor unit power: %d W  [Hypothesis: 16-bit LE]",
+            buf(body_off + 47, 2):le_uint()))
+    end
+    if body_len > 53 then
+        body_tree:add(buf(body_off + 53, 1), string.format(
+            "UD vane current angle: %d %%  [Hypothesis]", buf(body_off + 53, 1):uint()))
+    end
+    if body_len > 56 then
+        body_tree:add(buf(body_off + 56, 1), string.format(
+            "LR vane current angle: %d %%  [Hypothesis]", buf(body_off + 56, 1):uint()))
+    end
+    if body_len > 57 then
+        body_tree:add(buf(body_off + 57, 1), string.format(
+            "Outdoor target compressor frequency: %d  [Hypothesis]",
+            buf(body_off + 57, 1):uint()))
+    end
+    if body_len > 1 then
+        body_tree:add(buf(body_off + 1, body_len - 1),
+            "Full payload: " .. tostring(buf(body_off + 1, body_len - 1):bytes()))
+    end
+end
+
+
+local function decode_uart_c1(body_tree, buf, body_off, body_len)
+    -- 0xC1 — four distinct sub-types, checked in priority order:
+    --   body[3]=0x44                             → power usage response (BCD kWh)  [checked first]
+    --   body[1]=0x21, body[2]=0x01              → group dev-param page response (R/T bus)
+    --   body[1]=0x01                             → extended state sub-page 0x01
+    --   body[1]=0x02                             → extended state sub-page 0x02
+    --   other                                    → unknown, show raw
+
+    local b1 = body_len >= 2 and buf(body_off + 1, 1):uint() or 0
+    local b2 = body_len >= 3 and buf(body_off + 2, 1):uint() or 0
+    local b3 = body_len >= 4 and buf(body_off + 3, 1):uint() or 0
+
+    if b3 == 0x44 then
+        -- Power usage response takes priority — body[3]=0x44 is the power-page marker.
+        -- (Shares b1=0x21, b2=0x01 with group-page responses, so check this first.)
+
+        -- Power usage response — BCD-encoded kWh
+        -- *** CONTROVERSY: subbody format ***
+        -- Only 0x44 format documented. midea-local has 3 parsing methods (BCD/binary/raw).
+        body_tree:add(buf(body_off + 0, 1), "Command ID: 0xC1 (Power Response, sub=0x44)")
+        if body_len >= 19 then
+            local power = 0
+            local multiplier = 1
+            for i = 18, 16, -1 do
+                local byte = buf(body_off + i, 1):uint()
+                local lo = bit.band(byte, 0x0F)
+                local hi = bit.band(bit.rshift(byte, 4), 0x0F)
+                power = power + lo * multiplier + hi * multiplier * 10
+                multiplier = multiplier * 100
+            end
+            body_tree:add(buf(body_off + 16, 3), string.format(
+                "Power Usage: %d (BCD)   [NOTE: only 0x44 subbody format decoded, see protocol_uart.md §7]",
+                power))
         end
-        body_tree:add(buf(body_off + 16, 3), string.format(
-            "Power Usage: %d (BCD)   [NOTE: only 0x44 subbody format decoded, see protocol_uart.md 12.2]",
-            power))
+
+    elseif b1 == 0x21 and b2 == 0x01 then
+        -- Capability/config page response (seen on R/T bus from KJR wall controller)
+        -- body[3] = page ID echoed from the request (0x41, 0x42, 0x43 observed; 0x03 for page 0x43)
+        body_tree:add(buf(body_off + 0, 4), string.format(
+            "Command ID: 0xC1 (Group Page Response, page=0x%02X)", b3))
+        if b3 == 0x41 then
+            -- Field-wise dissection for page 0x41 (13 unique frames observed in Session 1)
+            decode_c1_group1(body_tree, buf, body_off, body_len)
+        elseif body_len > 4 then
+            body_tree:add(buf(body_off + 4, body_len - 4),
+                "Page Data: " .. tostring(buf(body_off + 4, body_len - 4):bytes()))
+        end
+
+    elseif b1 == 0x01 then
+        -- Extended state sub-page 0x01 — sensor temps, fault flags, actuator positions
+        -- Source: mill1000/midea-msmart Finding 8; NOT verified in own captures (Hypothesis)
+        body_tree:add(buf(body_off, 2), "Command ID: 0xC1 (Extended State, sub-page 0x01)")
+        decode_c1_extstate_01(body_tree, buf, body_off, body_len)
+
+    elseif b1 == 0x02 then
+        -- Extended state sub-page 0x02 — timers, power, vanes, compressor
+        -- Source: mill1000/midea-msmart Finding 8; NOT verified in own captures (Hypothesis)
+        body_tree:add(buf(body_off, 2), "Command ID: 0xC1 (Extended State, sub-page 0x02)")
+        decode_c1_extstate_02(body_tree, buf, body_off, body_len)
+
+    else
+        body_tree:add(buf(body_off + 0, 1), string.format(
+            "Command ID: 0xC1 (unknown sub-type b1=0x%02X b3=0x%02X)", b1, b3))
+        if body_len > 1 then
+            body_tree:add(buf(body_off + 1, body_len - 1),
+                "Payload: " .. tostring(buf(body_off + 1, body_len - 1):bytes()))
+        end
     end
 end
 
@@ -402,17 +733,88 @@ end
 
 
 local function decode_uart_41_query(body_tree, buf, body_off, body_len)
-    -- 0x41 Query (status or power, distinguished by body[1])
-    local sub = buf(body_off + 1, 1):uint()
+    -- 0x41 Query — sub-type determined by body[1] then body[2]:
+    --
+    --   body[1]=0x81 (standard query sub-command):
+    --     body[2]=0x00, body[3]=0xFF  → Status query        → expects 0xC0 response
+    --     body[2]=0x01, body[3]=page  → Group page query     → expects 0xC1 group page response
+    --                                   pages: 0x41/0x42/0x43 observed on R/T bus
+    --   body[1]=0x21:
+    --     body[2]=0x01, body[3]=0x44  → Power usage query   → expects 0xC1 BCD response
+    --     other body[2]               → Extended query (optCommand in body[4], see mill1000/midea-msmart)
+    --   body[1]=0x61                  → Display toggle
+    --
+    -- body[22] (when body_len >= 23): R/T bus MSG_ID / sequence counter (extra byte vs UART path)
+
+    if body_len < 4 then
+        body_tree:add(buf(body_off, body_len), string.format(
+            "Command: 0x41 (too short, %d bytes)", body_len))
+        return
+    end
+
+    local sub  = buf(body_off + 1, 1):uint()
+    local b2   = buf(body_off + 2, 1):uint()
+    local b3   = buf(body_off + 3, 1):uint()
+
     if sub == 0x81 then
-        body_tree:add(buf(body_off + 0, 2), "Command: 0x41/0x81 (Query Status)")
+        if b2 == 0x00 then
+            body_tree:add(buf(body_off, 4),
+                "Command: 0x41/0x81/0x00 (Query Status → 0xC0)")
+        elseif b2 == 0x01 then
+            body_tree:add(buf(body_off, 4), string.format(
+                "Command: 0x41/0x81/0x01 (Query Group Page 0x%02X → 0xC1 group)", b3))
+        else
+            body_tree:add(buf(body_off, 4), string.format(
+                "Command: 0x41/0x81/0x%02X (unknown variant, b3=0x%02X)", b2, b3))
+        end
     elseif sub == 0x21 then
-        body_tree:add(buf(body_off + 0, 2), "Command: 0x41/0x21 (Query Power)")
+        if b2 == 0x01 and b3 == 0x44 then
+            body_tree:add(buf(body_off, 4),
+                "Command: 0x41/0x21/0x01/0x44 (Query Power Usage → 0xC1 BCD)")
+        else
+            local opt = body_len >= 5 and buf(body_off + 4, 1):uint() or 0
+            body_tree:add(buf(body_off, 4), string.format(
+                "Command: 0x41/0x21 (Extended, optCommand=0x%02X)", opt))
+        end
     elseif sub == 0x61 then
-        body_tree:add(buf(body_off + 0, 2), "Command: 0x41/0x61 (Display Toggle)")
+        body_tree:add(buf(body_off, 2), "Command: 0x41/0x61 (Display Toggle)")
     else
-        body_tree:add(buf(body_off + 0, 2), string.format(
-            "Command: 0x41/0x%02X (Unknown sub-command)", sub))
+        body_tree:add(buf(body_off, 2), string.format(
+            "Command: 0x41/0x%02X (unknown sub-command)", sub))
+    end
+
+    -- R/T bus adds an extra MSG_ID byte at body[22] (body_len=23 vs UART body_len=22)
+    if body_len >= 23 then
+        body_tree:add(buf(body_off + 22, 1), string.format(
+            "Msg ID (R/T): 0x%02X", buf(body_off + 22, 1):uint()))
+    end
+end
+
+
+local function decode_uart_93(body_tree, buf, body_off, body_len)
+    -- 0x93 — Extension-board / KJR wall-controller status command.
+    -- Observed on R/T bus (HA/HB, bidirectionalExtensionBoard) in Session 1.
+    -- The same command ID appears in both request (0xAA, msg_type=0x03 or 0x02)
+    -- and response (0x55, msg_type=0x03 or 0x02) direction.
+    --
+    -- Request body[1..3] variants observed:
+    --   0x00 0x80 0x84  (msg_type=0x03 — periodic poll)
+    --   0x80 0x80 0x84  (msg_type=0x02 — set/ack)
+    --   0x80 0x80 0x04  (msg_type=0x02)
+    --   0x00 0x80 0x90  (msg_type=0x03)
+    --   0x00 0x80 0x04  (msg_type=0x03)
+    -- Response body contains ~26 bytes of status data; field meanings unknown.
+    -- [Hypothesis — single session, no cross-reference for 0x93 field layout]
+
+    local b1 = body_len >= 2 and buf(body_off + 1, 1):uint() or 0
+    local b2 = body_len >= 3 and buf(body_off + 2, 1):uint() or 0
+    local b3 = body_len >= 4 and buf(body_off + 3, 1):uint() or 0
+    body_tree:add(buf(body_off, 1), "Command ID: 0x93 (Ext Status — KJR/R/T bus)")
+    body_tree:add(buf(body_off + 1, math.min(3, body_len - 1)), string.format(
+        "Params: 0x%02X 0x%02X 0x%02X [meaning unknown]", b1, b2, b3))
+    if body_len > 4 then
+        body_tree:add(buf(body_off + 4, body_len - 4),
+            "Payload: " .. tostring(buf(body_off + 4, body_len - 4):bytes()))
     end
 end
 
@@ -596,11 +998,13 @@ function hvac_shark_proto.dissector(udp_payload_buffer, pinfo, tree)
                 if cmd_id == 0xC0 then
                     decode_uart_c0_status(body_tree, udp_payload_buffer, body_off, body_len)
                 elseif cmd_id == 0xC1 then
-                    decode_uart_c1_power(body_tree, udp_payload_buffer, body_off, body_len)
+                    decode_uart_c1(body_tree, udp_payload_buffer, body_off, body_len)
                 elseif cmd_id == 0x40 then
                     decode_uart_40_set(body_tree, udp_payload_buffer, body_off, body_len)
                 elseif cmd_id == 0x41 then
                     decode_uart_41_query(body_tree, udp_payload_buffer, body_off, body_len)
+                elseif cmd_id == 0x93 then
+                    decode_uart_93(body_tree, udp_payload_buffer, body_off, body_len)
                 elseif cmd_id == 0xB5 then
                     body_tree:add(udp_payload_buffer(body_off, 1), "Command ID: 0xB5 (Capabilities Query/Response)")
                     body_tree:add(udp_payload_buffer(body_off + 1, body_len - 1),
@@ -870,11 +1274,13 @@ function hvac_shark_proto.dissector(udp_payload_buffer, pinfo, tree)
                 if cmd_id == 0xC0 then
                     decode_uart_c0_status(body_tree, udp_payload_buffer, body_off, body_len)
                 elseif cmd_id == 0xC1 then
-                    decode_uart_c1_power(body_tree, udp_payload_buffer, body_off, body_len)
+                    decode_uart_c1(body_tree, udp_payload_buffer, body_off, body_len)
                 elseif cmd_id == 0x40 then
                     decode_uart_40_set(body_tree, udp_payload_buffer, body_off, body_len)
                 elseif cmd_id == 0x41 then
                     decode_uart_41_query(body_tree, udp_payload_buffer, body_off, body_len)
+                elseif cmd_id == 0x93 then
+                    decode_uart_93(body_tree, udp_payload_buffer, body_off, body_len)
                 else
                     body_tree:add(udp_payload_buffer(body_off, 1),
                         string.format("Command ID: 0x%02X (%s)", cmd_id, cmd_str))
