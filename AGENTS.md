@@ -61,18 +61,10 @@ Use the following labels consistently:
 When updating documentation: do not silently upgrade a label. If a field
 moves from Hypothesis to Confirmed, record what new evidence confirmed it.
 
-## Repository layout
+## Conventions
 
-```
-wireshark_dissectors/   Lua dissector loaded into Wireshark
-dongle/mid-xye/         ESP32 firmware + Python serial-to-UDP bridge
-  mid_xye/              Arduino project (PlatformIO)
-  py-mid-xye/           Python equivalent bridge
-protocol-analysis/      Protocol reference documents and comparison notes
-```
-
-The capture dumps and session data live in the separate `HVAC-shark-dumps`
-repository, not here.
+- **Temperature**: all values are in **°C (Celsius)** unless a field description explicitly states otherwise.
+- **Confidence labels**: see the table in the Working style section above — use them in both code comments and markdown docs.
 
 ## Protocol constants
 

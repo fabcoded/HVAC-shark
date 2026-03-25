@@ -1,10 +1,10 @@
 # HVAC-shark
 
-This repository contains tools to analyze HVAC bus systems with Wireshark.
+Open-source protocol analysis toolkit for Midea HVAC systems. Captures, decodes,
+and dissects the internal communication buses of Midea air conditioning units for
+reverse-engineering and research purposes.
 
-## Preamble
-
-### Disclaimer and Intended Use
+## Disclaimer and intended use
 
 This code is provided for research and educational purposes only. There is absolutely
 no warranty that it works as intended. Use of this code should not encourage anyone
@@ -12,34 +12,42 @@ to work on their HVAC systems, as doing so carries risks of personal injury or
 property damage. The author is not responsible for any harm or damage resulting
 from the use of this code.
 
-### Background and Brand Names
-
 This repository aggregates information that is publicly available on the internet
 for research and debugging purposes. If anyone feels offended or has a problem with
 the mention of brand names, please contact me directly. The mentioned brand names
 are not owned by me, nor am I affiliated with them.
 
-## Repository Structure
+## Components
 
-The repository is split into three sections:
-
-- **Protocols**: Documentation and tools related to different HVAC communication protocols.
-- **Dongles**: Hardware interfaces and scripts for reading data from HVAC bus systems.
-- **Wireshark Dissectors**: Lua scripts and plugins for Wireshark to dissect and analyze HVAC bus traffic.
+| Component | Path | Description |
+|-----------|------|-------------|
+| Wireshark Lua dissector | `wireshark_dissectors/` | Dissects HVAC_shark UDP frames in Wireshark |
+| ESP32 / Python dongle | `dongle/mid-xye/` | Live-capture firmware + Python serial-to-UDP bridge |
+| Protocol reference docs | `protocol-analysis/` | Reverse-engineered protocol documentation |
 
 ## Currently supported protocols
 
-* mid-xye: Bus systems that work like the Midea XYE bus
+- **mid-xye** — Midea XYE RS-485 inter-unit bus (4800 baud, 16/32-byte frames)
+
+## Repository layout
+
+```
+wireshark_dissectors/   Lua dissector loaded into Wireshark
+dongle/mid-xye/         ESP32 firmware + Python serial-to-UDP bridge
+  mid_xye/              Arduino project (PlatformIO)
+  py-mid-xye/           Python equivalent bridge
+protocol-analysis/      Protocol reference documents and comparison notes
+```
 
 ## Companion repository: HVAC-shark-dumps
 
 Capture sessions, raw logic-analyser exports, and session documentation live in a
 separate repository to keep binary data out of the main codebase:
 
-**[HVAC-shark-dumps](https://github.com/fabianschwamborn/HVAC-shark-dumps)**
+**[HVAC-shark-dumps](https://github.com/fabcoded/HVAC-shark-dumps)**
 
 Contents:
-- `.pcap` files converted from Saleae logic-analyser exports, ready to open in Wireshark with this dissector
+- `.pcap` files converted from Saleae logic-analyser exports, ready to open in Wireshark
 - Raw Saleae CSV exports and `.sal` session files
 - `SessionNotes.md` (operator logs) and `findings.md` (analysis results) per session
 - `channels.yaml` configuration files used by the offline pcap converter
@@ -47,8 +55,13 @@ Contents:
 Each device has its own subfolder (e.g. `Midea-extremeSaveBlue-display/`) with a
 README describing the hardware, captured buses, and session index.
 
-The offline pcap converter (`logicanalyzer-tools/saleae_midea_recording_to_pcap.py`)
+The offline pcap converter (`logicanalyzer-tools/logic_analyzer_midea_to_pcap.py`)
 lives in the dumps repository next to the data it processes.
+
+## Conventions
+
+- **Temperature**: all temperature values are in **°C (Celsius)** unless explicitly
+  noted otherwise in the relevant file or field description.
 
 ## Contributing
 
