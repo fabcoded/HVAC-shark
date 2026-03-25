@@ -72,7 +72,7 @@ command table — it shows 0x0E/0x0F for a 32-byte frame). The Erlang emulator p
 CRC at byte 30 (0x1E) and adds three unknown fields L1/L2/L3 at bytes 27–29.
 Our dissector currently uses byte 30 for CRC (matching the emulator).
 
-### 0.4 Command 0xC4 and 0xC6 — request-response patterns — **Unknown**
+### 0.4 Command 0xC4 and 0xC6 — request-response patterns
 
 The codeberg README documents only 4 commands: 0xC0 (Query), 0xC3 (Set), 0xCC (Lock),
 0xCD (Unlock). However:
@@ -82,13 +82,62 @@ The codeberg README documents only 4 commands: 0xC0 (Query), 0xC3 (Set), 0xCC (L
 | 0xC0    | all three sources  | 16-byte request → 32-byte response | Well documented |
 | 0xC3    | all three sources  | 16-byte request → 32-byte response | Well documented |
 | 0xC4    | our dissector only | 32-byte frame seen        | Not in codeberg or ESPHome. Our dissector treats it as "Ext.Query" but the payload layout is unknown. May be a **32-byte request** (unlike the standard 16-byte), or a response to an unseen query. |
-| 0xC6    | ESPHome + our dissector | 16-byte request → 32-byte response? | ESPHome uses it for "Follow-Me" (sending room temperature). The codeberg Erlang emulator does not handle it. Response structure unknown — may echo 0xC6 or respond with 0xC0. |
+| 0xC6    | ESPHome + Session 3 captures | 16-byte request → 32-byte response | **Confirmed frame pattern** (Session 3). See §0.4a. |
 | 0xCC    | codeberg           | 16-byte request → 32-byte response | Lock. Emulator responds with `0xC0 | 0x0C = 0xCC` in the response code. |
 | 0xCD    | codeberg           | 16-byte request → 32-byte response | Unlock. Emulator responds with `0xC0 | 0x0D = 0xCD`. |
 
 **Open question**: Are there 32-byte *requests* on XYE (not just responses)? The
 current framing logic assumes byte[2]=0x80 always means slave→master (32-byte
 response). If 0xC4 is a 32-byte master→slave command, this assumption breaks.
+
+### 0.4a Command 0xC6 — Follow-Me — **Hypothesis** (own captures, Session 3)
+
+Follow-Me is Midea's feature for using an external room temperature sensor (remote
+control, phone, wall controller) as the AC setpoint reference.
+
+**Observed pattern:** C6 never appears standalone. It always follows a C3 Set as
+an atomic pair within ~60 ms:
+```
+C3 Set  (M→S 16b) → C3 Response (S→M 32b) → C6 (M→S 16b) → C6 Response (S→M 32b)
+```
+
+**C6 master request (16-byte) — observed:**
+```
+AA C6 00 00 00 00  00 00 00 00  46 17 00 39 A4 55
+                   ↑  ↑  ↑  ↑
+                  b6 b7 b8 b9 = 0x00  — no room temperature in payload
+```
+Bytes [6..9] are all zero in all three observed instances. The temperature is **not**
+embedded in the C6 request. Instead it travels in the C3 byte[8] that immediately
+precedes each C6.
+
+**C6 slave response (32-byte) — observed:**
+```
+AA C6 00 00 00 00 05 00 02 30 0E 00 00 00 00 00  [oper] [fan] [setT]  BC D6 32 98 … [ctr] 55
+                                                   ↑      ↑     ↑                     ↑
+                                                  b16    b17   b18              rolling +1
+```
+- Bytes [16..18] echo the operating state (oper / fan / setT) from the preceding C3
+- Byte [30] is a rolling counter incrementing +1 per frame — sequence number or CRC artifact
+
+**Interpretation:** C6 is a Follow-Me handshake. It flags the preceding C3 as a
+Follow-Me temperature push (room temperature, not a user-set command) and requests a
+full state echo from the unit. This is analogous to the UART `body[8] bit 7 = 0x80`
+enable flag in 0x40 Set — it activates the Follow-Me mode for that update cycle.
+
+**UART parallel (from mill1000/Finding 10, Authoritative):**
+
+| UART Follow-Me | XYE equivalent |
+|----------------|----------------|
+| `0x40` body[8]=0x80 enable flag | `C6` request (zero payload) |
+| `0x41` body[4]=0x01, body[5]=T×2+50 | `C3` byte[8] = T + 0x40 |
+
+The temperature encoding differs: UART uses `T × 2 + 50`; XYE uses `T + 0x40`.
+
+**Open question:** Does the KJR-12x room controller populate C6 bytes [6..9] with
+a measured room temperature when an external sensor is wired? Not observed here — the
+payload was always zero. ESPHome uses C6 for room temperature; the exact byte layout
+of ESPHome's C6 frame is not confirmed against own captures.
 
 ### 0.5 Response code construction — **Hypothesis**
 
