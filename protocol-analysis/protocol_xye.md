@@ -20,42 +20,63 @@ The XYE protocol has no official specification. The three independent sources
 disagree on several points. These conflicts are documented here so that
 captures can be checked against each interpretation.
 
-### 0.1 Temperature sensor encoding — **Disputed**
+### 0.1 Temperature sensor encoding — **Confirmed** (Erlang formula, Sessions 4/5/6)
 
-Three different offsets are claimed for the same sensor bytes (0x0B–0x0E):
+Three different offsets were claimed for the same sensor bytes (0x0B–0x0E). Own captures
+across Sessions 4, 5, and 6 have resolved the dispute in favour of the Erlang formula:
 
-| Source | Formula | Offset | Example: raw 0x50 = |
-|--------|---------|--------|---------------------|
-| codeberg/xye README | `(raw - 0x30) × 0.5` | 48 (0x30) | 16.0 °C |
-| codeberg/xye Erlang emulator (`xye.erl`) | `(raw - 40) / 2` | 40 (0x28) | 20.0 °C |
-| esphome-mideaXYE-rs485 | `raw` (no conversion) | none | 80 °F (raw byte = Fahrenheit) |
+**Confirmed formula: `temp_c = (raw - 40) / 2.0`** (codeberg Erlang emulator, offset 40)
 
-The README and the Erlang code **in the same repository** disagree: offset 48 vs 40.
-The ESPHome implementation treats the raw byte as a Fahrenheit value with no offset
-at all — this may be a simplification that happens to work for the author's US-market
-unit, or it may indicate a different firmware variant.
+| Source | Formula | Offset | Example: raw 0x50 = | Status |
+|--------|---------|--------|---------------------|--------|
+| codeberg/xye Erlang emulator (`xye.erl`) | `(raw - 40) / 2` | 40 | **20.0 °C** | **Confirmed** |
+| codeberg/xye README | `(raw - 0x30) × 0.5` | 48 (0x30) | 16.0 °C | Wrong — off by 4 °C |
+| esphome-mideaXYE-rs485 | `raw` (no conversion) | none | 80 °F | Wrong — °F interpretation |
 
-**Impact**: A 4-unit offset difference (48 vs 40) means **2 °C** error in decoded
-temperatures. Until own captures with known room temperature confirm one formula,
-all three must be considered plausible.
+**Evidence (three independent cross-checks):**
 
-**For comparison**: Midea UART uses offset 50 for status response temperatures and
+1. **Session 4 — R-T UART Indoor Temp vs XYE T1**: R-T UART 0xC0 response (offset-50
+   encoding, well-confirmed) showed Indoor Temp = 13–14 °C. XYE T1 raw=0x42 → Erlang:
+   13 °C ✓. README formula gives 9 °C (mismatch by 4 °C).
+
+2. **Session 4 — R-T UART Outdoor Temp vs XYE T3**: R-T UART showed Outdoor Temp = 5.5 °C.
+   XYE T3 raw=0x33 → Erlang: 5.5 °C ✓. README gives 1.5 °C (mismatch by 4 °C).
+
+3. **Session 6 — Service menu ground truth**: Display PCB service menu read directly off
+   hardware: T1 "indoor air" = 18 °C, T3 "coil outside" = 2 °C.
+   XYE T1 raw=0x4C → Erlang: 18.0 °C ✓ (exact). XYE T3 raw=0x2C → Erlang: 2.0 °C ✓ (exact).
+
+4. **Session 7 — Full SET_TEMP range**: Setpoint swept 16–30 °C in both Heat and Cool modes.
+   All 15 values produced the expected T+0x40 byte (`0x50`–`0x5E`), no anomalies.
+
+**Why ESPHome's °F interpretation persisted**: For winter outdoor temperatures, raw values
+cluster around 0x30–0x35. Treated as °F that reads 8–12 °C, which is plausible for a mild
+climate — the error was small enough not to be noticed. For indoor T1, raw ≈ 0x42 as °F
+gives ~19 °C (believable for a heated room), masking the ~6 °C error.
+
+**Additional finding — T1 = Follow-Me reference, not local sensor**: Sessions 5 and 6
+confirm that T1 (byte 0x0B) tracks the KJR-12x wall-controller sensor, not the indoor
+unit's own thermistor. When the KJR-12x was moved outside (~11 °C) T1 = 10–11 °C; when
+indoors (18 °C) T1 = 18 °C. The display-board service menu labels this field
+"tindoor air (followme)" — confirming it is the Follow-Me room-temperature reference.
+
+**For comparison**: Midea UART uses offset 50 for 0xC0 status-response temperatures and
 offset 30 for Group 1 (T1/T2). See [comparison_uart_vs_xye.md](comparison_uart_vs_xye.md).
 
-### 0.2 Fan speed encoding — **Disputed**
+### 0.2 Fan speed encoding — **Confirmed** (Erlang, Session 7)
 
-| Value | codeberg/xye README | codeberg/xye Erlang emulator | esphome-mideaXYE |
-|-------|---------------------|------------------------------|------------------|
-| 0x80  | Auto                | Auto                         | Auto             |
-| 0x01  | High                | High                         | High             |
-| 0x02  | Medium              | Medium                       | Medium           |
-| 0x03  | Low                 | —                            | Low              |
-| 0x04  | —                   | Low                          | —                |
+| Value | Meaning | Source agreement |
+|-------|---------|-----------------|
+| `0x80` | Auto | All sources agree |
+| `0x01` | High | All sources agree |
+| `0x02` | Medium | All sources agree |
+| `0x04` | Low | **Confirmed** — codeberg Erlang emulator + Session 7 hardware |
 
-The README says Low = 0x03, but the Erlang emulator encodes Low as 0x04. The ESPHome
-implementation agrees with the README (0x03). This could be a bug in the emulator,
-or it may reflect different hardware (the emulator was tested with a Midea CCM/01E
-and a Mundo Clima unit — different firmware could use different values).
+Session 7 fan speed sweep (Auto → Low → Mid → High) confirmed Low = `0x04`.
+The codeberg README and ESPHome claim Low = `0x03` — this is incorrect on the
+tested hardware (Midea extremeSaveBlue). The Erlang emulator value is correct.
+
+One-hot encoding: bit7=Auto, bit2=Low, bit1=Mid, bit0=High.
 
 ### 0.3 Response frame bytes 27–30 — **Disputed**
 
@@ -134,6 +155,13 @@ enable flag in 0x40 Set — it activates the Follow-Me mode for that update cycl
 
 The temperature encoding differs: UART uses `T × 2 + 50`; XYE uses `T + 0x40`.
 
+**Session 7 confirmation:** 81 C6 pairs observed (one per setpoint/mode/fan change).
+C6 response payload is structurally identical to the C4 ExtQuery response (see §7a).
+When Follow-Me was disabled via the KJR-12x menu, C6 pairs stopped immediately
+(last C6 at t=762s, session continued to t=781s with no further C6 frames).
+After Follow-Me disable, T1 (C0 byte[11]) changed from 24.0 °C to 20.5 °C — consistent
+with T1 switching from the KJR-12x sensor to the indoor unit's own thermistor.
+
 **Open question:** Does the KJR-12x room controller populate C6 bytes [6..9] with
 a measured room temperature when an external sensor is wired? Not observed here — the
 payload was always zero. ESPHome uses C6 for room temperature; the exact byte layout
@@ -203,11 +231,11 @@ Offset  Field             Description
   7     CAPABILITIES      0x80=extended temp range, 0x10=swing capable
   8     OPERATING_MODE    Current operating mode (see section 4)
   9     FAN_SPEED         Fan speed (see section 5)
- 10     SET_TEMP          Target temperature in deg C (direct value)
- 11     T1_INDOOR         Offset formula disputed — see §0.1
- 12     T2A_COIL_IN       Offset formula disputed — see §0.1
- 13     T2B_COIL_OUT      Offset formula disputed — see §0.1
- 14     T3_OUTDOOR_COIL   Offset formula disputed — see §0.1
+ 10     SET_TEMP          Target temperature: raw - 0x40 = °C (e.g. 0x56 = 22 °C) — Confirmed
+ 11     T1_INDOOR         Follow-Me reference temperature (room temp from KJR-12x) — formula (raw-40)/2 — Confirmed §0.1
+ 12     T2A_COIL_IN       Indoor coil inlet — formula (raw-40)/2 — Confirmed §0.1
+ 13     T2B_COIL_OUT      Indoor coil outlet — formula (raw-40)/2; 0x00 = not reported on this HW
+ 14     T3_OUTDOOR_COIL   Outdoor coil temperature — formula (raw-40)/2 — Confirmed §0.1
  15     CURRENT           0-99 A (direct value)
  16     FREQUENCY         typically 0xFF
  17     TIMER_START       Bitmask
@@ -247,67 +275,108 @@ CRC = (255 - (sum_of_all_bytes_except_CRC % 256) + 1) & 0xFF
 | `0xC0` | Slave→Master   | Status response| all three       | 32-byte response with full state                 |
 | `0xC3` | Master→Slave   | Set parameters | all three       | 16-byte write of operating parameters            |
 | `0xC3` | Slave→Master   | Set ack        | codeberg Erlang | 32-byte response echoing 0xC3 (see §0.5)        |
-| `0xC4` | ?              | Extended query | dissector only  | 32-byte frame observed — direction and payload layout unknown (see §0.4) |
+| `0xC4` | M→S / S→M      | Extended query | dissector + Sessions 6/7 | 16-byte request → 32-byte response. Response payload partially decoded — see §7a |
 | `0xC6` | Master→Slave   | Follow-Me      | ESPHome         | 16-byte send of remote room temperature. Not in codeberg. Response pattern unknown (see §0.4) |
 | `0xCC` | Master→Slave   | Lock           | codeberg        | 16-byte lock command, response echoes 0xCC       |
 | `0xCD` | Master→Slave   | Unlock         | codeberg        | 16-byte unlock command, response echoes 0xCD     |
 
 ---
 
-## 5. Operating Mode Encoding
+## 5. Operating Mode Encoding — **Confirmed** (Session 7)
 
-Byte 0x08 in the slave response (and the corresponding payload byte in Set commands):
+Byte 0x08 in the slave response (and byte[6] in the 16-byte Set command):
 
-| Value  | Mode      |
-|--------|-----------|
-| `0x00` | Off       |
-| `0x80` | Auto      |
-| `0x88` | Cool      |
-| `0x82` | Dry       |
-| `0x84` | Heat      |
-| `0x81` | Fan only  |
+| Value  | Mode      | Bit pattern      |
+|--------|-----------|-------------------|
+| `0x00` | Off       | `0000 0000`       |
+| `0x81` | Fan only  | `1000 0001`       |
+| `0x82` | Dry       | `1000 0010`       |
+| `0x84` | Heat      | `1000 0100`       |
+| `0x88` | Cool      | `1000 1000`       |
+| `0x90` | Auto      | `1001 0000`       |
 
-Bit 7 is always set when the unit is on. Bits [2:0] select the mode.
+Bit 7 = power on. Bits [4:0] use one-hot encoding for the mode:
+bit0=fan, bit1=dry, bit2=heat, bit3=cool, bit4=auto.
+
+> Note: previous sources listed Auto as `0x80`. Session 7 confirmed Auto = `0x90`
+> (bit4 set). `0x80` alone is power-on with no mode bits — not observed standalone.
 
 ---
 
-## 6. Fan Speed Encoding
+## 6. Fan Speed Encoding — **Confirmed** (Session 7)
 
-Byte 0x09 in the slave response:
+Byte 0x09 in the slave response (and byte[7] in the 16-byte Set command):
 
-| Value  | Speed  |
-|--------|--------|
-| `0x80` | Auto   | All sources agree |
-| `0x01` | High   | All sources agree |
-| `0x02` | Medium | All sources agree |
-| `0x03` | Low    | codeberg README + ESPHome — **Disputed**, see §0.2 |
-| `0x04` | Low    | codeberg Erlang emulator — **Disputed**, see §0.2 |
+| Value  | Speed  | Bit pattern | Status |
+|--------|--------|-------------|--------|
+| `0x80` | Auto   | `1000 0000` | Confirmed |
+| `0x01` | High   | `0000 0001` | Confirmed |
+| `0x02` | Medium | `0000 0010` | Confirmed |
+| `0x04` | Low    | `0000 0100` | **Confirmed** — Erlang correct, README/ESPHome wrong (see §0.2) |
+
+One-hot encoding: bit7=auto, bit2=low, bit1=mid, bit0=high.
 
 ---
 
 ## 7. Temperature Encoding
 
-### Target temperature
-Byte 0x0A: direct integer value in degrees C.
+### Target temperature (byte 0x0A) — **Confirmed** (Sessions 3/4/7, full range)
+`temp_c = raw - 0x40` (e.g. raw 0x56 = 22 °C, 0x59 = 25 °C).
 
-### Measured temperatures (sensor bytes 0x0B-0x0E)
-All sensor bytes use an offset formula, but **the offset is disputed** (see §0.1):
+Session 7 confirmed every value from 16 °C (`0x50`) to 30 °C (`0x5E`) in both Heat
+and Cool modes — no gaps, no exceptions. Setpoint limits on tested HW: 16–30 °C.
+
+| °C | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23 | 24 | 25 | 26 | 27 | 28 | 29 | 30 |
+|----|----|----|----|----|----|----|----|----|----|----|----|----|----|----|-----|
+| hex | 50 | 51 | 52 | 53 | 54 | 55 | 56 | 57 | 58 | 59 | 5A | 5B | 5C | 5D | 5E |
+
+> Note: the codeberg README documents this as a "direct integer value", which would
+> imply 0x56 = 86 °C. That is wrong. The actual hardware uses T + 0x40 encoding.
+
+### Measured temperatures (sensor bytes 0x0B-0x0E) — **Confirmed** (Sessions 4/5/6)
+
+**Confirmed formula: `temp_c = (raw - 40) / 2.0`** (codeberg Erlang emulator, offset 40).
+See §0.1 for full evidence and why the README formula (offset 48) and ESPHome °F
+interpretation are incorrect.
+
+| Byte | Field | Notes |
+|------|-------|-------|
+| 0x0B | T1 — Follow-Me room temperature reference | Tracks KJR-12x sensor, not indoor unit's own thermistor (see §0.1) |
+| 0x0C | T2A — Indoor coil inlet (evaporator/condenser inlet) | |
+| 0x0D | T2B — Indoor coil outlet | 0x00 = not reported on this hardware |
+| 0x0E | T3 — Outdoor coil temperature | |
+
+T4 (outdoor ambient) is not present in the XYE 0xC0 response. It appears in the
+C4 ExtQuery response (byte[21]) and is echoed in the R-T UART 0xC0 Outdoor Temp field.
+
+### 7a. C4 / C6 Extended Response Layout (32 bytes) — **Confirmed** (Sessions 6/7)
+
+C4 (ExtQuery) and C6 (FollowMe) slave responses share the same 32-byte payload
+structure — identical except for byte[1] (command code) and byte[30] (CRC).
 
 ```
-codeberg README:    temp_c = (raw - 0x30) × 0.5    (offset 48)
-codeberg Erlang:    temp_c = (raw - 40) / 2         (offset 40)
-ESPHome:            temp_f = raw                     (no conversion, treated as °F)
+Offset  Field             Description
+------  -----             -----------
+  0     PREAMBLE          0xAA
+  1     RESPONSE_CODE     0xC4 or 0xC6
+  2-5   ADDRESS           00 00 00 00
+  6-15  FLAGS             05 00 02 30 0E 00 00 00 00 00 (constant in all captures)
+ 16     OPERATING_MODE    Same encoding as C0 byte[8] (see §5)
+ 17     FAN_SPEED         Same encoding as C0 byte[9] (see §6)
+ 18     SET_TEMP          Same encoding as C0 byte[10]: raw - 0x40 = °C
+ 19     Tp                Compressor temperature: (raw-40)/2 = °C — Confirmed Session 6 (Tp=74°C, raw=0xBC)
+ 20     UNKNOWN           Constant 0xD6 (87°C if sensor formula) — identity unknown, possibly discharge line
+ 21     T4                Outdoor ambient: (raw-40)/2 = °C — Confirmed Session 6 (T4=4°C, raw=0x31)
+ 22     COIL_TRACK        Variable: tracks indoor coil temp, changes with mode (heat ~56°C, cool ~38°C)
+ 23-29  RESERVED          All zeros in all captures
+ 30     CRC               Two's complement checksum
+ 31     EPILOGUE          0x55
 ```
 
-The difference between offset 48 and 40 is **2 °C**. Until verified against
-own captures with known room temperature, the offset must be considered uncertain.
-
-| Offset | Sensor                      |
-|--------|-----------------------------|
-| 0x0B   | T1 — Indoor air temperature |
-| 0x0C   | T2A — Coil inlet (evaporator inlet)  |
-| 0x0D   | T2B — Coil outlet (evaporator outlet)|
-| 0x0E   | T3 — Outdoor coil temperature        |
+Session 7 confirmed: byte[19] (Tp) and byte[20] remain constant (`0xBC`, `0xD6`)
+across all modes (Heat, Cool, Dry, Fan). Byte[21] (T4) drifts ±1°C with ambient.
+Byte[22] varies significantly with operating mode — likely indoor coil temperature
+from a different measurement point than C0 T2A.
 
 ---
 
@@ -363,44 +432,6 @@ These are available on XYE and have no equivalent on Midea UART:
 - **Static pressure control** — for ventilation/duct applications
 - **Emergency heat** mode
 - **Lock / Unlock** — disable/enable local remote control (`0xCC` / `0xCD`)
-
----
-
-## 11. 0xCC Commercial AC — XYE Payload in UART Framing? **[Hypothesis]**
-
-Midea device type 0xCC ("Commercial AC") uses standard Midea UART framing
-(`0xAA` + length + device type + msg_type + body + checksum) but its body content
-closely mirrors XYE payload encoding.
-
-> Source: discoveries from mill1000/midea-msmart (Finding 11, `midea-msmart-mill1000.md`).
-> All field mappings below are **Hypothesis** — no own 0xCC captures exist.
-
-**Key similarities to XYE:**
-
-- Set command ID **0xC3** is identical in both (`0xCC body[0]` = XYE `byte[1]`)
-- Power+mode, fan speed, and set temperature bytes are **bit-identical** for the same input:
-  `0xCC body[1..3]` = XYE `byte[6..8]` (Cool 24 °C fan Auto → `0x88 0x80 0x18`)
-- Mode bits 3:0 are shared; XYE uses bit 7 for power in the same byte, 0xCC separates it
-- Fan Auto = `0x80` shared; other speeds differ (XYE ordinals, 0xCC one-hot)
-- T2A/T2B evaporator sensors present in both XYE and 0xCC responses — **absent** in UART 0xAC
-
-**Key differences from XYE:**
-
-- XYE places the command in the frame header (byte 1), payload from byte 6;
-  0xCC places the command in body[0], payload from body[1], inside Midea UART framing
-- Query/lock command codes differ; only Set (0xC3) matches
-- 0xCC adds extended fields (swing position, temperature decimals, CRC-8/854)
-
-**Interpretation — open:**
-
-| Hypothesis | Summary |
-|------------|---------|
-| A — XYE is ancestor | 0xCC cloud Lua is a XYE↔JSON translator; UART 0xAC is a later residential redesign |
-| B — common ancestor | All three share a Midea-internal spec; XYE and 0xCC stayed closer, UART 0xAC diverged |
-| C — 0xCC wraps XYE | Wi-Fi module for commercial units wraps XYE payloads in Midea UART framing |
-
-**What would resolve this:** Capture 0xCC UART traffic alongside XYE on the same
-commercial unit and compare body bytes 1:1; check which temperature offset 0xCC uses.
 
 ---
 

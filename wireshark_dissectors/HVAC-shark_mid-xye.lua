@@ -53,11 +53,11 @@ end
 
 function getOperModeString(oper_mode)
     if oper_mode == 0x00 then return "Off"
-    elseif oper_mode == 0x80 then return "Auto"
-    elseif oper_mode == 0x88 then return "Cool"
+    elseif oper_mode == 0x81 then return "Fan"
     elseif oper_mode == 0x82 then return "Dry"
     elseif oper_mode == 0x84 then return "Heat"
-    elseif oper_mode == 0x81 then return "Fan"
+    elseif oper_mode == 0x88 then return "Cool"
+    elseif oper_mode == 0x90 then return "Auto"
     else return string.format("Unknown (0x%02X)", oper_mode) end
 end
 
@@ -1432,16 +1432,21 @@ function hvac_shark_proto.dissector(udp_payload_buffer, pinfo, tree)
                 data_subtree:add(pbuf(8, 1), "0x08 Operating Mode: " .. string.format("0x%02X", oper_mode) .. " (" .. getOperModeString(oper_mode) .. ")")
                 local fan = protocol_buffer(9, 1):uint()
                 data_subtree:add(pbuf(9, 1), "0x09 Fan: " .. string.format("0x%02X", fan) .. " (" .. getFanString(fan) .. ")")
-                data_subtree:add(pbuf(10, 1), "0x0A Set Temp: " .. string.format("0x%02X", protocol_buffer(10, 1):uint()))
+                local set_temp_raw = protocol_buffer(10, 1):uint()
+                data_subtree:add(pbuf(10, 1), string.format("0x0A Set Temp: 0x%02X (%.0f C)", set_temp_raw, set_temp_raw - 0x40))
+                -- Confirmed Sessions 3/4: setT = raw - 0x40 (e.g. 0x56=22°C, 0x59=25°C)
 
+                -- Sensor byte formula: (raw - 40) / 2.0  [codeberg Erlang emulator, offset=40]
+                -- Confirmed Session 4: T1=0x42→13°C matches R-T UART Indoor Temp (T×2+50);
+                -- T3=0x33→5.5°C matches R-T UART Outdoor Temp. README formula (offset=48) was off by 4°C.
                 local t1 = protocol_buffer(11, 1):uint()
-                data_subtree:add(pbuf(11, 1), string.format("0x0B T1 Temp: 0x%02X (%.1f C)", t1, (t1 - 0x30) * 0.5))
+                data_subtree:add(pbuf(11, 1), string.format("0x0B T1 (indoor air): 0x%02X (%.1f C)", t1, (t1 - 40) / 2.0))
                 local t2a = protocol_buffer(12, 1):uint()
-                data_subtree:add(pbuf(12, 1), string.format("0x0C T2A Temp: 0x%02X (%.1f C)", t2a, (t2a - 0x30) * 0.5))
+                data_subtree:add(pbuf(12, 1), string.format("0x0C T2A (indoor coil in): 0x%02X (%.1f C)", t2a, (t2a - 40) / 2.0))
                 local t2b = protocol_buffer(13, 1):uint()
-                data_subtree:add(pbuf(13, 1), string.format("0x0D T2B Temp: 0x%02X (%.1f C)", t2b, (t2b - 0x30) * 0.5))
+                data_subtree:add(pbuf(13, 1), string.format("0x0D T2B (indoor coil out): 0x%02X (%.1f C)", t2b, (t2b - 40) / 2.0))
                 local t3 = protocol_buffer(14, 1):uint()
-                data_subtree:add(pbuf(14, 1), string.format("0x0E T3 Temp: 0x%02X (%.1f C)", t3, (t3 - 0x30) * 0.5))
+                data_subtree:add(pbuf(14, 1), string.format("0x0E T3 (outdoor coil): 0x%02X (%.1f C)", t3, (t3 - 40) / 2.0))
                 data_subtree:add(pbuf(15, 1), "0x0F Current: " .. string.format("0x%02X", protocol_buffer(15, 1):uint()))
 
                 local timer_start = protocol_buffer(17, 1):uint()
@@ -1465,8 +1470,29 @@ function hvac_shark_proto.dissector(udp_payload_buffer, pinfo, tree)
                 for i = 27, 29 do
                     data_subtree:add(pbuf(i, 1), string.format("0x%02X Unknown: 0x%02X", i, protocol_buffer(i, 1):uint()))
                 end
+            elseif command_code == 0xC4 or command_code == 0xC6 then
+                -- C4/C6 extended response: partially decoded (Sessions 6/7)
+                for i = 2, 15 do
+                    data_subtree:add(pbuf(i, 1), string.format("0x%02X: 0x%02X", i, protocol_buffer(i, 1):uint()))
+                end
+                local c4_mode = protocol_buffer(16, 1):uint()
+                data_subtree:add(pbuf(16, 1), string.format("0x10 Operating Mode: 0x%02X (%s)", c4_mode, getOperModeString(c4_mode)))
+                local c4_fan = protocol_buffer(17, 1):uint()
+                data_subtree:add(pbuf(17, 1), string.format("0x11 Fan: 0x%02X (%s)", c4_fan, getFanString(c4_fan)))
+                local c4_sett = protocol_buffer(18, 1):uint()
+                data_subtree:add(pbuf(18, 1), string.format("0x12 Set Temp: 0x%02X (%.0f C)", c4_sett, c4_sett - 0x40))
+                local c4_tp = protocol_buffer(19, 1):uint()
+                data_subtree:add(pbuf(19, 1), string.format("0x13 Tp (compressor): 0x%02X (%.1f C)", c4_tp, (c4_tp - 40) / 2.0))
+                data_subtree:add(pbuf(20, 1), string.format("0x14 Unknown: 0x%02X (%.1f C if sensor)", protocol_buffer(20, 1):uint(), (protocol_buffer(20, 1):uint() - 40) / 2.0))
+                local c4_t4 = protocol_buffer(21, 1):uint()
+                data_subtree:add(pbuf(21, 1), string.format("0x15 T4 (outdoor ambient): 0x%02X (%.1f C)", c4_t4, (c4_t4 - 40) / 2.0))
+                local c4_b22 = protocol_buffer(22, 1):uint()
+                data_subtree:add(pbuf(22, 1), string.format("0x16 Coil track: 0x%02X (%.1f C)", c4_b22, (c4_b22 - 40) / 2.0))
+                for i = 23, 29 do
+                    data_subtree:add(pbuf(i, 1), string.format("0x%02X: 0x%02X", i, protocol_buffer(i, 1):uint()))
+                end
             else
-                -- C4/C6 or other: dump all bytes with offset labels
+                -- Other response codes: dump all bytes with offset labels
                 for i = 2, 29 do
                     data_subtree:add(pbuf(i, 1), string.format("0x%02X: 0x%02X", i, protocol_buffer(i, 1):uint()))
                 end
