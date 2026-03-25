@@ -12,10 +12,16 @@ to work on their HVAC systems, as doing so carries risks of personal injury or
 property damage. The author is not responsible for any harm or damage resulting
 from the use of this code.
 
-This repository aggregates information that is publicly available on the internet
-for research and debugging purposes. If anyone feels offended or has a problem with
-the mention of brand names, please contact me directly. The mentioned brand names
-are not owned by me, nor am I affiliated with them.
+**Brand names and trademarks**: Any manufacturer, product, or model names mentioned
+in this repository (including but not limited to "Midea" and associated product
+lines) are used solely to identify the hardware under test. Their use is purely
+descriptive — to specify which physical device was captured — and does not imply
+affiliation, endorsement, or any commercial relationship with the respective
+trademark holders. All trademarks remain the property of their respective owners.
+
+This repository aggregates publicly available information for research and debugging
+purposes. If you have concerns about brand name usage or attribution, please open an
+issue or contact the author directly.
 
 ## Components
 
