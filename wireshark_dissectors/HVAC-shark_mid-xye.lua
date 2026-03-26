@@ -1205,6 +1205,24 @@ local function decode_uart_07_devid(body_tree, buf, body_off, body_len)
 end
 
 
+local function decode_uart_racserial(body_tree, buf, body_off, body_len)
+    -- 0x65 RAC Serial  (dispatched by msg_type=0x65, not body[0])
+    -- body[0] is a serial sub-command, not a cmd_id.
+    -- Observed at boot: body[0]=0x00, body[1]=0xAC (appliance type echo), rest zeros,
+    -- CRC=0x00 (device sends null CRC on this boot-init frame — Hypothesis).
+    if body_len >= 1 then
+        local b0 = buf(body_off, 1):uint()
+        local note = b0 == 0x00 and "  [boot-init null frame — Hypothesis]" or ""
+        body_tree:add(buf(body_off, 1), string.format(
+            "RAC Serial sub-cmd: 0x%02X%s", b0, note))
+    end
+    if body_len > 1 then
+        body_tree:add(buf(body_off + 1, body_len - 1),
+            "Payload: " .. tostring(buf(body_off + 1, body_len - 1):bytes()))
+    end
+end
+
+
 local function decode_uart_netstatus(body_tree, buf, body_off, body_len, msg_type)
     -- 0x63 Network Status / 0x0D Network Init  (dispatched by msg_type, not body[0])
     -- body[0] = connection status/sub-command; body[4..7] = IP (byte order TBD — Hypothesis)
@@ -1601,7 +1619,15 @@ function hvac_shark_proto.dissector(udp_payload_buffer, pinfo, tree)
             if body_len > 0 then
                 local cmd_id   = udp_payload_buffer(body_off, 1):uint()
                 local msg_type = proto_len >= 10 and protocol_buffer(9, 1):uint() or 0
-                local cmd_str  = UART_COMMAND_IDS[cmd_id] or string.format("0x%02X", cmd_id)
+                -- For msg_type-dispatched frames body[0] is not a cmd_id; use msg_type label instead
+                local msg_type_dispatched = (msg_type == 0x07 or msg_type == 0x63
+                    or msg_type == 0x0D or msg_type == 0x65)
+                local cmd_str
+                if msg_type_dispatched then
+                    cmd_str = UART_MSG_TYPES[msg_type] or string.format("msgtype=0x%02X", msg_type)
+                else
+                    cmd_str = UART_COMMAND_IDS[cmd_id] or string.format("0x%02X", cmd_id)
+                end
                 pinfo.cols.info:append(" " .. cmd_str)
 
                 -- Dispatch: some frame types are keyed on msg_type (body[0] is not a cmd_id)
@@ -1609,6 +1635,8 @@ function hvac_shark_proto.dissector(udp_payload_buffer, pinfo, tree)
                     decode_uart_07_devid(body_tree, udp_payload_buffer, body_off, body_len)
                 elseif msg_type == 0x63 or msg_type == 0x0D then
                     decode_uart_netstatus(body_tree, udp_payload_buffer, body_off, body_len, msg_type)
+                elseif msg_type == 0x65 then
+                    decode_uart_racserial(body_tree, udp_payload_buffer, body_off, body_len)
                 -- Standard body[0]-keyed dispatch
                 elseif cmd_id == 0xC0 then
                     decode_uart_c0_status(body_tree, udp_payload_buffer, body_off, body_len)
@@ -1638,12 +1666,6 @@ function hvac_shark_proto.dissector(udp_payload_buffer, pinfo, tree)
                     end
                 elseif cmd_id == 0x64 then
                     body_tree:add(udp_payload_buffer(body_off, 1), "Command ID: 0x64 (OTA/Key Trigger)")
-                    if body_len > 1 then
-                        body_tree:add(udp_payload_buffer(body_off + 1, body_len - 1),
-                            "Payload: " .. tostring(udp_payload_buffer(body_off + 1, body_len - 1):bytes()))
-                    end
-                elseif cmd_id == 0x65 then
-                    body_tree:add(udp_payload_buffer(body_off, 1), "Command ID: 0x65 (RAC Serial)")
                     if body_len > 1 then
                         body_tree:add(udp_payload_buffer(body_off + 1, body_len - 1),
                             "Payload: " .. tostring(udp_payload_buffer(body_off + 1, body_len - 1):bytes()))
