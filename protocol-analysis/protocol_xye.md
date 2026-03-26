@@ -102,70 +102,181 @@ The codeberg README documents only 4 commands: 0xC0 (Query), 0xC3 (Set), 0xCC (L
 |---------|--------------------|---------------------------|-------|
 | 0xC0    | all three sources  | 16-byte request → 32-byte response | Well documented |
 | 0xC3    | all three sources  | 16-byte request → 32-byte response | Well documented |
-| 0xC4    | our dissector only | 32-byte frame seen        | Not in codeberg or ESPHome. Our dissector treats it as "Ext.Query" but the payload layout is unknown. May be a **32-byte request** (unlike the standard 16-byte), or a response to an unseen query. |
+| 0xC4    | own captures | 16-byte request → 32-byte response | **Device enumeration + extended query.** At cold boot, the master scans addresses 0x00–0x0F with C4 requests (200 ms interval). Only responding slaves are added to the poll list. In steady state, C4 continues polling the known slave(s) plus one non-zero probe address per cycle. See §0.4c. Response layout: see §7a. |
 | 0xC6    | ESPHome + Session 3 captures | 16-byte request → 32-byte response | **Confirmed frame pattern** (Session 3). See §0.4a. |
 | 0xCC    | codeberg           | 16-byte request → 32-byte response | Lock. Emulator responds with `0xC0 | 0x0C = 0xCC` in the response code. |
 | 0xCD    | codeberg           | 16-byte request → 32-byte response | Unlock. Emulator responds with `0xC0 | 0x0D = 0xCD`. |
 
-**Open question**: Are there 32-byte *requests* on XYE (not just responses)? The
-current framing logic assumes byte[2]=0x80 always means slave→master (32-byte
-response). If 0xC4 is a 32-byte master→slave command, this assumption breaks.
+**Resolved (Session 9):** C4 uses standard 16-byte request → 32-byte response
+framing, same as C0/C3. The earlier confusion arose because unanswered C4 probes
+(to non-existent slaves) produced only 16-byte request frames with no 32-byte
+response. The 32-byte C4 responses use the same layout as C6 responses (see §7a).
 
-### 0.4a Command 0xC6 — Follow-Me — **Hypothesis** (own captures, Session 3)
+### 0.4c Command 0xC4 — Device Enumeration — **Confirmed** (own captures, Session 9)
 
-Follow-Me is Midea's feature for using an external room temperature sensor (remote
-control, phone, wall controller) as the AC setpoint reference.
+Session 9 captured a cold boot (power off → standby → on). The XYE bus startup
+reveals C4 as the device enumeration mechanism:
 
-**Observed pattern:** C6 never appears standalone. It always follows a C3 Set as
-an atomic pair within ~60 ms:
+**Phase 1 — Fast scan (t=2.7–5.9s):** Master sends C4 to addresses 0x00 through
+0x0F in sequence (200 ms interval, 16 addresses). No responses — the indoor unit
+hasn't booted its communication stack yet.
+
+**Phase 2 — First response (t=5.92s):** Address 0x00 responds to C4. Master
+immediately sends C0 Query → gets OFF mode (0x00) response. Unit is in standby.
+
+**Phase 3 — Power on (t=9.2s):** After a second full scan, address 0x00 responds
+again. Master sends C3 Set (Fan mode 0x81) + C6 — user pressed power on the
+KJR-12x.
+
+**Phase 4 — Steady-state polling (t=17s+):** The master settles into a repeating
+pattern: poll address 0x00 twice (~600 ms each), then probe one non-zero address
+(cycling 0x01→0x0F). Non-zero probes never get responses (single indoor unit).
+This continuous background scanning would detect additional slaves joining the bus
+(e.g., second indoor unit in a multi-split system).
+
+**Key observations:**
+- Address range: 0x00–0x0F (16 addresses max on this bus)
+- Boot time: ~3.2 s from first C4 probe to first slave response
+- C4 request byte[6..7] = `0xA5 0x5A` — magic marker, constant across all probes
+- No C0 or C3 traffic until at least one C4 response is received
+
+### 0.4a Command 0xC6 — Dual-purpose: Follow-Me + Swing — **Confirmed** (own captures, Sessions 3/7/8)
+
+C6 is a **dual-purpose master→slave command**. It carries both Follow-Me handshake
+and swing (vane) activation state. The two functions coexist in the same 16-byte
+frame — byte[7] selects swing mode while the C3+C6 pairing signals Follow-Me.
+
+#### C6 framing pattern
+
+C6 never appears standalone. It always follows a C3 Set as an atomic pair (~60 ms):
 ```
 C3 Set  (M→S 16b) → C3 Response (S→M 32b) → C6 (M→S 16b) → C6 Response (S→M 32b)
 ```
 
-**C6 master request (16-byte) — observed:**
-```
-AA C6 00 00 00 00  00 00 00 00  46 17 00 39 A4 55
-                   ↑  ↑  ↑  ↑
-                  b6 b7 b8 b9 = 0x00  — no room temperature in payload
-```
-Bytes [6..9] are all zero in all three observed instances. The temperature is **not**
-embedded in the C6 request. Instead it travels in the C3 byte[8] that immediately
-precedes each C6.
+#### C6 master request (16-byte) layout
 
-**C6 slave response (32-byte) — observed:**
 ```
-AA C6 00 00 00 00 05 00 02 30 0E 00 00 00 00 00  [oper] [fan] [setT]  BC D6 32 98 … [ctr] 55
-                                                   ↑      ↑     ↑                     ↑
-                                                  b16    b17   b18              rolling +1
+AA C6 [dest] [src] [master] [ownID]  b6  b7  b8  b9  b10 b11 b12 b13 [CRC] 55
+                                      ↑
+                                     b6 = swing state
+```
+
+**Byte [6] — Swing activation** (Sessions 7/8, validated across all sessions):
+
+| Value | Meaning |
+|-------|---------|
+| 0x00  | Swing off (all vanes stopped) |
+| 0x10  | Vertical swing on (up/down auto oscillation) |
+| 0x20  | Horizontal swing on (left/right auto oscillation) |
+
+Bytes [7..9] were always 0x00 in all observed C6 frames (Sessions 3–9 + unsorted).
+The room temperature is **not** embedded in the C6 request — it travels in the C3
+byte[8] that immediately precedes each C6.
+
+**Validation across all captures:**
+
+| Session | C6 byte[6] values | Notes |
+|---------|-------------------|-------|
+| 1–2 | (no C6 frames) | No wired controller |
+| 3 | 3× 0x00 | No swing changes |
+| 4 | 8× 0x00 | No swing changes |
+| 5 | 4× 0x00 | No swing changes |
+| 6 | 1× 0x00 | No swing changes |
+| 7 | 79× 0x00, 1× 0x10, 1× 0x20 | Phase 6 swing toggle |
+| 8 | 2× 0x00, 1× 0x10, 1× 0x20 | Dedicated swing session |
+| 9 | 6× 0x00 | No swing changes |
+| unsort/FollowMe+program | 11× 0x00, 1× 0x10 | Vertical swing |
+| unsort/FollowMe-off-on | 6× 0x00 | No swing changes |
+
+#### C6 slave response (32-byte)
+
+```
+AA C6 ... [oper] [fan] [setT]  BC D6 32 98 … [ctr] 55
+           ↑      ↑     ↑                     ↑
+          b16    b17   b18              rolling +1
 ```
 - Bytes [16..18] echo the operating state (oper / fan / setT) from the preceding C3
-- Byte [30] is a rolling counter incrementing +1 per frame — sequence number or CRC artifact
+- Response payload is structurally identical to C4 ExtQuery response (see §7a)
+- Byte [30] is a rolling counter incrementing +1 per frame
 
-**Interpretation:** C6 is a Follow-Me handshake. It flags the preceding C3 as a
-Follow-Me temperature push (room temperature, not a user-set command) and requests a
-full state echo from the unit. This is analogous to the UART `body[8] bit 7 = 0x80`
-enable flag in 0x40 Set — it activates the Follow-Me mode for that update cycle.
+#### Follow-Me function
+
+C6 acts as a Follow-Me handshake: it flags the preceding C3 as a Follow-Me
+temperature push (room temperature, not a user-set command) and requests a full
+state echo. This is analogous to the UART `body[8] bit 7 = 0x80` enable flag
+in 0x40 Set.
 
 **UART parallel (from mill1000/Finding 10, Authoritative):**
 
 | UART Follow-Me | XYE equivalent |
 |----------------|----------------|
-| `0x40` body[8]=0x80 enable flag | `C6` request (zero payload) |
+| `0x40` body[8]=0x80 enable flag | `C6` request (byte[6]=swing state) |
 | `0x41` body[4]=0x01, body[5]=T×2+50 | `C3` byte[8] = T + 0x40 |
 
 The temperature encoding differs: UART uses `T × 2 + 50`; XYE uses `T + 0x40`.
 
-**Session 7 confirmation:** 81 C6 pairs observed (one per setpoint/mode/fan change).
-C6 response payload is structurally identical to the C4 ExtQuery response (see §7a).
-When Follow-Me was disabled via the KJR-12x menu, C6 pairs stopped immediately
-(last C6 at t=762s, session continued to t=781s with no further C6 frames).
-After Follow-Me disable, T1 (C0 byte[11]) changed from 24.0 °C to 20.5 °C — consistent
-with T1 switching from the KJR-12x sensor to the indoor unit's own thermistor.
+**Session 7:** 81 C6 pairs observed (one per setpoint/mode/fan change). When
+Follow-Me was disabled via the KJR-12x menu, C6 pairs stopped immediately (last
+C6 at t=762s, session continued to t=781s with no further C6). After disable,
+T1 (C0 byte[11]) changed from 24.0 °C to 20.5 °C — T1 switched from KJR-12x
+sensor to the indoor unit's own thermistor.
 
-**Open question:** Does the KJR-12x room controller populate C6 bytes [6..9] with
-a measured room temperature when an external sensor is wired? Not observed here — the
-payload was always zero. ESPHome uses C6 for room temperature; the exact byte layout
-of ESPHome's C6 frame is not confirmed against own captures.
+#### Swing activation function (Session 8)
+
+When the user sets swing on/off (via wired controller or app), the C6 master
+request byte[6] changes to reflect the new swing state. Confirmed in Session 7
+Phase 6, Session 8 Phases 1–2, and the unsorted FollowMe+program capture:
+- Horizontal swing on: byte[6] = 0x20
+- Vertical swing on: byte[6] = 0x10
+- Both off: byte[6] = 0x00
+
+Note: C3 response byte[20] bit 2 carries vertical swing flag but does **not**
+report horizontal swing. Horizontal swing state is only visible in the D0
+broadcast (see §0.4b) and in C6 byte[6].
+
+**Open question:** Does the KJR-12x populate C6 bytes [6..9] with a measured
+room temperature when an external sensor is wired? Not observed — payload bytes
+other than [7] were always zero. ESPHome uses C6 for room temperature; the exact
+byte layout is not confirmed against own captures.
+
+### 0.4b Command 0xD0 — Broadcast — **Confirmed** (own captures, Sessions 3–9)
+
+D0 is a 32-byte broadcast frame on the HAHB XYE bus — a periodic status report
+from the display board containing the full operating state. It appears every
+polling cycle alongside C0/C3/C4 traffic.
+
+**D0 layout (32 bytes):**
+
+| Byte | Field | Encoding | Validated |
+|------|-------|----------|-----------|
+| [0] | Preamble | 0xAA | All sessions |
+| [1] | Command | 0xD0 | All sessions |
+| [2] | Unknown | 0x20 (constant) | Sessions 3–9 |
+| [3] | Unknown | 0x01 (constant) | Sessions 3–9 |
+| [4] | Unknown | 0x00 (constant) | Sessions 3–9 |
+| [5] | Operating Mode | User-set mode only (§5.1), no Auto sub-modes | Session 7: all 5 modes tracked |
+| [6] | Fan Speed | Same as C0/C3 (§6) | Session 7: Auto/Low/High tracked |
+| [7] | Set Temperature | T + 0x40 (§7) | Session 7: full 16–30°C sweep |
+| [8–10] | Unknown | 0x00 | Sessions 3–9 |
+| [11] | **Swing** | See below | Sessions 7/8 |
+| [12–29] | Unknown/CRC/EOF | Various | |
+
+**Byte [11] — Swing state** (Sessions 7/8):
+
+| Value | Meaning |
+|-------|---------|
+| 0x00  | Swing off |
+| 0x10  | Vertical swing on (up/down) |
+| 0x20  | Horizontal swing on (left/right) |
+
+Same encoding as C6 byte[6]. D0 byte[11] is the only place where horizontal
+swing is reported in a broadcast/response frame — C0/C3 response byte[20] bit 2
+only covers vertical swing.
+
+**Validation across all captures:** D0 byte[11] is 0x00 in all sessions without
+swing changes (3–6, 9). Non-zero values appear only in Session 7 (9× 0x10,
+4× 0x20 during Phase 6 swing toggle) and Session 8 (34× 0x10, 35× 0x20 during
+dedicated swing testing).
 
 ### 0.5 Response code construction — **Hypothesis**
 
@@ -229,19 +340,19 @@ Offset  Field             Description
   5     SRC_ID_repeat     Same as byte 4
   6     MARKER            0x30 (fixed)
   7     CAPABILITIES      0x80=extended temp range, 0x10=swing capable
-  8     OPERATING_MODE    Current operating mode (see section 4)
-  9     FAN_SPEED         Fan speed (see section 5)
+  8     OPERATING_MODE    Current operating mode (see §5). In Auto mode, response byte includes active sub-mode (§5.2): 0x91=fan, 0x94=heat, 0x98=cool
+  9     FAN_SPEED         Fan speed (see §6)
  10     SET_TEMP          Target temperature: raw - 0x40 = °C (e.g. 0x56 = 22 °C) — Confirmed
  11     T1_INDOOR         Follow-Me reference temperature (room temp from KJR-12x) — formula (raw-40)/2 — Confirmed §0.1
  12     T2A_COIL_IN       Indoor coil inlet — formula (raw-40)/2 — Confirmed §0.1
  13     T2B_COIL_OUT      Indoor coil outlet — formula (raw-40)/2; 0x00 = not reported on this HW
  14     T3_OUTDOOR_COIL   Outdoor coil temperature — formula (raw-40)/2 — Confirmed §0.1
- 15     CURRENT           0-99 A (direct value)
+ 15     CURRENT           0-99 A (direct value) — **always 0x00 on this HW** (Sessions 6–9). Current draw is only available via UART C1 Group 1 (R-T bus: body[7] outdoor current) or UART C1 Group 4 (WiFi: body[16..18] real-time power — T_0000 Lua publishes dual decode: BCD as `real_time_power_10` and binary uint24BE as `real_time_power`; body[4..7] total energy as uint32BE/100 kWh)
  16     FREQUENCY         typically 0xFF
  17     TIMER_START       Bitmask
  18     TIMER_STOP        Bitmask
  19     RUN_STATUS        0x01 = compressor/unit running
- 20     MODE_FLAGS        0x02=turbo, 0x01=ECO/sleep, 0x04=swing, 0x88=fan-only
+ 20     MODE_FLAGS        0x02=turbo, 0x01=ECO/sleep, 0x04=vertical swing only (horizontal NOT here — see §0.4a/§0.4b), 0x88=fan-only
  21     OP_FLAGS          0x04=pump running, 0x80=locked
  22     ERROR_1           Error/protection bitmask
  23     ERROR_2           Error/protection bitmask
@@ -282,9 +393,13 @@ CRC = (255 - (sum_of_all_bytes_except_CRC % 256) + 1) & 0xFF
 
 ---
 
-## 5. Operating Mode Encoding — **Confirmed** (Session 7)
+## 5. Operating Mode Encoding — **Confirmed** (Sessions 7/8/9)
 
 Byte 0x08 in the slave response (and byte[6] in the 16-byte Set command):
+
+### 5.1 Set command / D0 broadcast mode byte
+
+These frames carry the **user-set mode** only:
 
 | Value  | Mode      | Bit pattern      |
 |--------|-----------|-------------------|
@@ -301,6 +416,27 @@ bit0=fan, bit1=dry, bit2=heat, bit3=cool, bit4=auto.
 > Note: previous sources listed Auto as `0x80`. Session 7 confirmed Auto = `0x90`
 > (bit4 set). `0x80` alone is power-on with no mode bits — not observed standalone.
 
+### 5.2 C0/C3 response mode byte — Auto sub-mode (Sessions 8/9)
+
+In Auto mode, the **slave response** (C0/C3 32-byte) combines the Auto flag
+with the actual operating sub-mode. The D0 broadcast and C3 Set request always
+use the plain 0x90.
+
+| Response | Meaning | Bit pattern | Evidence |
+|----------|---------|-------------|----------|
+| `0x91`   | Auto + Fan (idle) | `1001 0001` | Session 9: after cold boot, unit deciding |
+| `0x94`   | Auto + Heat | `1001 0100` | Session 8: room < setpoint 30 °C |
+| `0x98`   | Auto + Cool | `1001 1000` | Session 8: setpoint jumped to 16 °C, room > setpoint |
+
+The sub-mode can change dynamically: Session 8 at t=237s, dropping setpoint from
+28 °C to 16 °C caused 0x94→0x98 within 600 ms. Session 7 at t=583s, switching to
+Auto mode showed 0x91 (fan idle) for ~5 s, then transitioned to 0x94 (heating).
+
+**Interpretation:** response_mode = 0x90 | sub_mode_bits, where sub_mode_bits
+use the same one-hot encoding as the base modes (0x01=fan, 0x04=heat, 0x08=cool).
+This tells the controller what the unit is actually doing, not just what was
+requested.
+
 ---
 
 ## 6. Fan Speed Encoding — **Confirmed** (Session 7)
@@ -315,6 +451,22 @@ Byte 0x09 in the slave response (and byte[7] in the 16-byte Set command):
 | `0x04` | Low    | `0000 0100` | **Confirmed** — Erlang correct, README/ESPHome wrong (see §0.2) |
 
 One-hot encoding: bit7=auto, bit2=low, bit1=mid, bit0=high.
+
+**Cross-bus correlation (Session 7, XYE ↔ R-T UART):**
+
+| XYE byte[9] | R-T UART body[3] | Fan speed |
+|-------------|------------------|-----------|
+| `0x80`      | 102              | Auto |
+| `0x04`      | (missed, ~2.5s poll) | Low |
+| `0x02`      | (missed)         | Medium |
+| `0x01`      | 80               | High |
+
+R-T UART uses integer encoding (20=Silent, 40=Low, 60=Medium, 80=High, 102=Auto).
+The R-T bus polls every ~2.5 s, so brief fan speed changes (Low→Medium→High within
+seconds) may be missed in R-T data while XYE captures every transition.
+
+R-T also reports `fan=101` during Auto and Dry modes — this may be a variant of
+Auto specific to those modes (102=user-set Auto, 101=system-forced Auto).
 
 ---
 
@@ -364,19 +516,25 @@ Offset  Field             Description
  16     OPERATING_MODE    Same encoding as C0 byte[8] (see §5)
  17     FAN_SPEED         Same encoding as C0 byte[9] (see §6)
  18     SET_TEMP          Same encoding as C0 byte[10]: raw - 0x40 = °C
- 19     Tp                Compressor temperature: (raw-40)/2 = °C — Confirmed Session 6 (Tp=74°C, raw=0xBC)
- 20     UNKNOWN           Constant 0xD6 (87°C if sensor formula) — identity unknown, possibly discharge line
- 21     T4                Outdoor ambient: (raw-40)/2 = °C — Confirmed Session 6 (T4=4°C, raw=0x31)
- 22     COIL_TRACK        Variable: tracks indoor coil temp, changes with mode (heat ~56°C, cool ~38°C)
+ 19     DEVICE_TYPE       Fixed 0xBC = outdoor unit device type. NOT Tp. Previously misidentified
+                         as Tp because in Session 6 byte[22] (true Tp) also happened to be 0xBC
+                         (Tp=74°C → raw=0xBC) — a coincidence. Constant across all sessions.
+ 20     UNKNOWN           Constant 0xD6 (87°C if sensor formula) — identity unknown
+ 21     T4                Outdoor ambient: (raw-40)/2 = °C — Confirmed Session 6 (T4=4°C, raw≈0x30)
+ 22     Tp                Compressor discharge temperature: (raw-40)/2 = °C
+                         Confirmed by cross-session comparison with UART R/T C1-G1 body[14]:
+                         329 matched pairs, mean diff = −0.02°C, max |diff| = 3°C (timing).
+                         Session 6: byte[22]=0xBC→74°C = service menu Tp=74°C ✓
  23-29  RESERVED          All zeros in all captures
  30     CRC               Two's complement checksum
  31     EPILOGUE          0x55
 ```
 
-Session 7 confirmed: byte[19] (Tp) and byte[20] remain constant (`0xBC`, `0xD6`)
-across all modes (Heat, Cool, Dry, Fan). Byte[21] (T4) drifts ±1°C with ambient.
-Byte[22] varies significantly with operating mode — likely indoor coil temperature
-from a different measurement point than C0 T2A.
+Session 7 confirmed: byte[19] (device-type `0xBC`) and byte[20] (unknown `0xD6`) are
+constant across all modes. Byte[21] (T4) drifts ±1°C with ambient.
+Byte[22] is Tp (compressor discharge temperature), confirmed: 329 matched pairs across
+Sessions 3–8 vs UART R/T C1-G1, mean diff −0.02°C. Byte[22] varies 30–74°C with
+compressor load, not with mode — confirms it is a thermal sensor, not a control field.
 
 ---
 
@@ -427,7 +585,7 @@ These are available on XYE and have no equivalent on Midea UART:
 
 - **Multi-unit addressing** — up to 64 units on one bus (DEST_ID / SRC_ID fields)
 - **T2A / T2B coil temperatures** — evaporator inlet and outlet (bytes 0x0C / 0x0D)
-- **Current draw** — byte 0x0F, direct Ampere value
+- **Current draw** — byte 0x0F, direct Ampere value (always 0x00 on tested HW — see §2.2)
 - **Follow-Me** — room temperature from a remote sensor (cmd `0xC6`)
 - **Static pressure control** — for ventilation/duct applications
 - **Emergency heat** mode

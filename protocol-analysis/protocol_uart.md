@@ -237,9 +237,10 @@ Page 0x45 response:  C1 21 01 45  [16 data bytes]
 
 #### 4b-i — Group Page 0x41 Response — Group 1: Base Run Info (R/T bus)
 
-Source: own Session 1 captures, 15 frames, 13 unique bodies (R/T bus, 83-second window).
+Source: own Session 1 captures (15 frames, 13 unique bodies, R/T bus, 83-second window).
 Field labels from mill1000/midea-msmart (see `midea-msmart-mill1000.md`, Finding 11).
-All labels **Hypothesis** — single source, not verified at field level against own captures.
+**Session 6 service menu ground truth** confirms T1, T3, T4 formulas and Tp encoding.
+Cross-session comparison (Sessions 3–8, 329 matched pairs vs XYE byte[22]) confirms Tp.
 
 | Offset | Bytes | Observed values | Field | Encoding | Confidence |
 |--------|-------|-----------------|-------|----------|------------|
@@ -249,11 +250,11 @@ All labels **Hypothesis** — single source, not verified at field level against
 | body[7] | 1 | 0x01 or 0x02 | Outdoor total current | raw × 4 | Hypothesis |
 | body[8] | 1 | varies | Outdoor supply voltage | raw | Hypothesis |
 | body[9] | 1 | varies | Indoor actual operating mode | raw | Hypothesis |
-| body[10] | 1 | varies | T1 indoor coil temp | (val−30)/2 °C (offset 30) | Hypothesis |
+| body[10] | 1 | varies | T1 indoor coil temp | (val−30)/2 °C (offset 30) | **Confirmed S6** (raw=0x42→18°C) |
 | body[11] | 1 | varies | T2 temp | (val−30)/2 °C (offset 30) | Hypothesis |
-| body[12] | 1 | varies | T3 outdoor coil temp | (val−50)/2 °C (offset 50) | Hypothesis |
-| body[13] | 1 | varies | T4 outdoor ambient temp | (val−50)/2 °C (offset 50) | Hypothesis |
-| body[14] | 1 | 0x1C–0x1E (28–30) | Discharge pipe temp (Tp) | lookup table (raw shown) | Hypothesis |
+| body[12] | 1 | varies | T3 outdoor coil temp | (val−50)/2 °C (offset 50) | **Confirmed S6** (raw=0x36→2°C) |
+| body[13] | 1 | varies | T4 outdoor ambient temp | (val−50)/2 °C (offset 50) | **Confirmed S6** (raw=0x3B→4.5°C≈4°C) |
+| body[14] | 1 | 0x1C–0x1E (S1); 0x37–0x4A (S3–S8) | Discharge pipe temp (Tp) | **direct integer °C** | **Confirmed** — S6: raw=0x4A=74→74°C; cross-UART: 329 pairs mean diff −0.02°C |
 | body[15] | 1 | 0x00 | Outdoor DC fan stator flux | raw | Hypothesis |
 | body[16] | 1 | 0x00 | Outdoor voltage (duplicate?) | raw | Hypothesis |
 | body[17] | 1 | 0x00 | Indoor fan stator flux | raw | Hypothesis |
@@ -265,6 +266,9 @@ fields** (outdoor voltage + indoor operating mode). Similarly, body[10..13] (pre
 "Unknown — all vary independently") are four individual temperature sensor readings
 (T1–T4) with different offset encodings. body[14] (previously "slow counter") is
 the discharge pipe temperature — the slow increment is consistent with thermal inertia.
+Tp encoding is **direct integer °C**: the outdoor unit MCU applies ucPQTempTab (NTC
+thermistor lookup) internally and transmits the result. The Session 1 low values
+(28–30°C) reflect cold-start warm-up; Sessions 3–8 show 6–74°C under varying load.
 
 ---
 
@@ -835,36 +839,54 @@ top-level sub-type, now unified under the group page dispatcher.
 
 body[0] = `0xC1`, body[3] = `0x44`.
 
-Power usage is BCD-encoded across body bytes 16, 17, 18:
+Four power fields, each BCD-encoded. `bcd(b) = ((b >> 4) & 0xF) * 10 + (b & 0xF)`.
+
+| body offset | Field | Formula | Unit | Notes |
+|-------------|-------|---------|------|-------|
+| [4..7] | totalPowerConsume | `bcd[4]×10000 + bcd[5]×100 + bcd[6] + bcd[7]/100` | kWh | Cumulative lifetime energy |
+| [8..11] | totalRunPower | same 4-byte pattern | kWh | All zeros in own captures |
+| [12..15] | curRunPower | same 4-byte pattern | kWh | All zeros in own captures |
+| [16..18] | curRealTimePower | `bcd[16] + bcd[17]/100 + bcd[18]/10000` | kW | Instantaneous draw |
+
+Note: nibbles > 9 (e.g. 0xA=10, 0xD=13, 0xF=15) appear in the data and are treated
+as their hex integer value by `bcd()` — effectively hexadecimal digit encoding, not strict BCD.
+
+**Validated from captures (Sessions 1 and 8, UART bus):**
+
+| Session | totalPowerConsume | curRealTimePower | Conditions |
+|---------|-------------------|-----------------|------------|
+| 1 (t≈9s) | **111.45 kWh** | **5 W** | Compressor off, standby |
+| 1 (t≈35s) | **111.45 kWh** | **11 W** | Compressor off, standby |
+| 8 (t≈42s) | **113.81 kWh** | **381.4 W** | Compressor running ~80 Hz, heat mode |
+
+Cumulative increase Session 1→8: +2.36 kWh. curRealTimePower 381 W at 80 Hz heat is physically consistent.
 
 ```python
-def parse_power_usage(body):
-    """Parse power usage from C1 response. Returns value in Wh (or 0.1 kWh)."""
-    power = 0
-    multiplier = 1
-    for i in range(3):
-        byte = body[18 - i]
-        low_nibble = byte & 0x0F
-        high_nibble = (byte >> 4) & 0x0F
-        power += low_nibble * multiplier
-        power += high_nibble * multiplier * 10
-        multiplier *= 100
-    return power
+def bcd(b):
+    """Midea 'BCD' decode: treats each nibble as decimal digit, incl. A-F."""
+    return ((b >> 4) & 0xF) * 10 + (b & 0xF)
+
+def parse_power_group4(body):
+    """Decode C1 Group-4 power response. body[0]=0xC1, body[3]=0x44.
+    Returns dict with totalPowerConsume (kWh) and curRealTimePower (kW).
+    Source: mill1000/midea-msmart Finding 11 (see midea-msmart-mill1000.md); confirmed Sessions 1 and 8.
+    """
+    tcp = bcd(body[4])*10000 + bcd(body[5])*100 + bcd(body[6]) + bcd(body[7])/100
+    trp = bcd(body[8])*10000 + bcd(body[9])*100 + bcd(body[10]) + bcd(body[11])/100
+    crp = bcd(body[12])*10000 + bcd(body[13])*100 + bcd(body[14]) + bcd(body[15])/100
+    rt  = bcd(body[16]) + bcd(body[17])/100 + bcd(body[18])/10000
+    return {
+        "totalPowerConsume_kWh": tcp,
+        "totalRunPower_kWh":     trp,
+        "curRunPower_kWh":       crp,
+        "curRealTimePower_kW":   rt,
+    }
 ```
 
-dudanov's approach (reading bytes 15-18 in a different way, returning kWh * 0.1):
-```python
-def parse_power_usage_dudanov(body):
-    """BCD decode bytes 15-18, return float kWh."""
-    def bcd2int(b):
-        return 10 * (b >> 4) + (b & 0x0F)
-    power = 0
-    weight = 1
-    for offset in [18, 17, 16, 15]:
-        power += weight * bcd2int(body[offset])
-        weight *= 100
-    return power * 0.1
-```
+> ⚠️ **Previous functions (`parse_power_usage`, `parse_power_usage_dudanov`) were wrong.**
+> Both decoded body[15..18] — the `curRealTimePower` field — and misidentified it as
+> cumulative kWh. The value "381.4 kWh" those functions produced is actually **381.4 W**
+> instantaneous draw.
 
 ---
 
@@ -1365,16 +1387,47 @@ Different sub-command bytes. Both are in active use across different device gene
 
 ---
 
-### 12.3 Additional response types not yet documented
+### 12.3 Additional response types
 
-midea-local reveals response types not covered in this document:
+| Body type | msg_type | Name | Decode status |
+|---|---|---|---|
+| `0xA0` | `0x05` | Heartbeat ACK | **Confirmed** — C0-format body (identical field layout to 0xC0, see section 6) |
+| `0xA1` | `0x04` | Heartbeat energy/temps | **Confirmed** — full decode, see below |
+| `0xA2` | `0x04` | Heartbeat device params | **Unknown** — not decoded in mill1000/midea-msmart reference material (see midea-msmart-mill1000.md) |
+| `0xA3` | `0x04` | Heartbeat device params 2 | **Unknown** — not decoded in mill1000/midea-msmart reference material (see midea-msmart-mill1000.md) |
+| `0xA5` | `0x04` | Heartbeat outdoor unit | **Unknown** — not decoded in mill1000/midea-msmart reference material (see midea-msmart-mill1000.md) |
+| `0xA6` | `0x04` | Heartbeat network info | **Unknown** — not decoded in mill1000/midea-msmart reference material (see midea-msmart-mill1000.md) |
+| `0xBB` | — | XBB sub-protocol | Used by newer "SN8" units; completely different encoding |
+| `0xB0/0xB1` | `0x02/0x03` | TLV set/response | Tag-value pairs for indirect wind, breeze, fresh air, screen display |
 
-| Body type | Name | Notes |
-|---|---|---|
-| `0xA0` | XA0 | msg_type notify2 — alternative status format, different field layout |
-| `0xA1` | XA1 | msg_type notify1 — temperature-only notification with humidity |
-| `0xBB` | XBB sub-protocol | Used by newer "SN8" units; completely different encoding |
-| `0xB0/0xB1` | New protocol | Tag-value pairs for indirect wind, breeze, fresh air, screen display |
+---
+
+#### 0xA1 Heartbeat — confirmed field map
+
+**Sources**: mill1000/midea-msmart Finding 12 (see midea-msmart-mill1000.md).
+**Cross-validated** against Session 9 frame `AA 2B AC 00 00 00 00 00 02 04 A1 00 01 0D 8B 00 00 00 00 00 00 00 00 68 3A 00 00 00 24 00 00 00 00 00 00 00 00 00 00 00 00 00 00 9F F0 94`.
+
+| body[] | Reference field name (Q14) | Reference field name (Q11) | Formula | Status |
+|--------|--------------|---------------|---------|--------|
+| `[0]` | cmd_id | — | — | — |
+| `[1..4]` | `totalPowerConsume` | (not decoded) | BCD kWh: `bcd[1]×10000 + bcd[2]×100 + bcd[3] + bcd[4]/100` | **Confirmed** |
+| `[5..8]` | `totalRunPower` | (not decoded) | BCD kWh (same) | Consistent — always 0 on Q11 |
+| `[9..12]` | `curWorkedDay/Hour/Min` | days/hours/mins | 16-bit BE days + byte hours + byte mins | **Not implemented on Q11** — always 0 |
+| `[13]` | `t1Temp` | `indoorTemperatureValue` | `(raw−50)/2`, skip 0x00/0xFF | **Confirmed** |
+| `[14]` | `t4Temp` | `outdoorTemperatureValue` | `(raw−50)/2`, skip 0x00/0xFF | **Confirmed** |
+| `[15..16]` | `pm25Value` | (not decoded) | 16-bit BE µg/m³ | Consistent — always 0 on Q11 |
+| `[17]` | `curHum` | (not decoded) | integer % | Consistent — always 0 on Q11 |
+| `[18]` | (skipped Q14) | `smallIndoor`[3:0]/`smallOutdoor`[7:4] | nibble | **Unknown on Q11** — values random |
+| `[19]` | `lightAdValue` | (not decoded) | raw ADC | Consistent — always 0 on Q11 |
+
+**Cross-validation (55 frames, Sessions 1–9):**
+
+- `totalPowerConsume` unit is **kWh** (not Watts). Verified by exact match with C1 Group4 `totalPowerConsume` in Sessions 1 (111.45 kWh) and 8 (113.81 kWh). Cross-session trend 111.37 → 113.91 kWh monotonically increasing — consistent with a lifetime cumulative energy counter.
+- `currentWorkTime[9..12]` is **not implemented on Q11** — all 55 A1 frames contain `00 00 00 00`, including Session 7 (756 s duration). The field is documented in mill1000/midea-msmart Finding 12 (see midea-msmart-mill1000.md) but Q11 firmware does not populate it.
+- `byte[18]` is **not a reliable fractional temperature** on Q11. Values cycle through `0x00, 0x04, 0x94, 0x83, 0x90, 0x10...` in frames where T1/T4 are constant. True meaning unknown.
+- `T1/T4` readings are physically plausible in all sessions. Session 9 correctly shows `T4 = 0xFF` (N/A) at t = 22 s post-boot, recovering to 4.5 °C by t = 43 s.
+
+**A2/A3/A5/A6**: Not decoded in mill1000/midea-msmart reference material (see midea-msmart-mill1000.md). They are present in captures but not surfaced by the known reference code. Field structure **Unknown**.
 
 The `0xBB` sub-protocol in particular indicates a parallel protocol stack used by a newer device generation, with temperature precision at 1/100°C rather than 0.5°C steps.
 

@@ -40,6 +40,7 @@ f.ir_frame_type   = ProtoField.string("hvac_shark.ir.frame_type",   "Frame Type"
 local XYE_COMMANDS = {
     [0xC0] = "Query",    [0xC3] = "Set",    [0xC4] = "Ext.Query",
     [0xC6] = "FollowMe", [0xCC] = "Lock",   [0xCD] = "Unlock",
+    [0xD0] = "Broadcast",
 }
 
 function getFanString(fan)
@@ -58,22 +59,42 @@ function getOperModeString(oper_mode)
     elseif oper_mode == 0x84 then return "Heat"
     elseif oper_mode == 0x88 then return "Cool"
     elseif oper_mode == 0x90 then return "Auto"
+    elseif oper_mode == 0x91 then return "Auto (sub: Fan)"
+    elseif oper_mode == 0x94 then return "Auto (sub: Heat)"
+    elseif oper_mode == 0x98 then return "Auto (sub: Cool)"
     else return string.format("Unknown (0x%02X)", oper_mode) end
+end
+
+function getSwingString(swing)
+    if swing == 0x00 then return "Off"
+    elseif swing == 0x10 then return "Vertical (U/D)"
+    elseif swing == 0x20 then return "Horizontal (L/R)"
+    elseif swing == 0x30 then return "Both (U/D + L/R)"
+    else return string.format("Unknown (0x%02X)", swing) end
 end
 
 
 -- ── UART lookup tables ───────────────────────────────────────────────────────
 
 local UART_MSG_TYPES = {
-    [0x02] = "Command",  [0x03] = "Response/Notification",
-    [0x04] = "Network",  [0x05] = "Handshake/ACK",
-    [0x07] = "Device ID", [0x63] = "Network Status Request",
+    [0x02] = "Command",       [0x03] = "Response/Notification",
+    [0x04] = "Network Info",  [0x05] = "Handshake/ACK",
+    [0x07] = "Device ID",     [0x0D] = "Network Init",
+    [0x63] = "Network Status",[0x64] = "OTA/Key Trigger",
+    [0x65] = "RAC Serial",    [0xA0] = "Proprietary",
 }
 
 local UART_COMMAND_IDS = {
-    [0x40] = "Set Status",   [0x41] = "Query",
+    [0x40] = "Set Status",    [0x41] = "Query",
     [0x93] = "Ext Status",
-    [0xB5] = "Capabilities", [0xC0] = "Status Response",
+    [0xA0] = "Heartbeat ACK",
+    [0xA1] = "Heartbeat A1 (Energy)",
+    [0xA2] = "Heartbeat A2",
+    [0xA3] = "Heartbeat A3",
+    [0xA5] = "Heartbeat A5 (Outdoor)",
+    [0xA6] = "Heartbeat A6 (Network)",
+    [0xB0] = "TLV Set",       [0xB1] = "TLV Response",
+    [0xB5] = "Capabilities",  [0xC0] = "Status Response",
     [0xC1] = "C1 Response",
 }
 
@@ -180,11 +201,14 @@ end
 -- ── UART BODY DECODERS ──────────────────────────────────────────────────────
 -- ══════════════════════════════════════════════════════════════════════════════
 
-local function decode_uart_c0_status(body_tree, buf, body_off, body_len)
-    -- C0 Status Response (body[0] = 0xC0)
+local function decode_uart_c0_status(body_tree, buf, body_off, body_len, cmd_id)
+    -- C0 / A0 Status body decoder
+    -- cmd_id: 0xC0 = dongle status response; 0xA0 = mainboard heartbeat ACK (same layout)
     -- Reference: PI HVAC databridge docs/protocol_uart.md section 6
 
-    body_tree:add(buf(body_off + 0, 1), "Command ID: 0xC0 (Status Response)")
+    cmd_id = cmd_id or 0xC0
+    local cmd_label = cmd_id == 0xA0 and "Heartbeat ACK (C0-format status)" or "Status Response"
+    body_tree:add(buf(body_off + 0, 1), string.format("Command ID: 0x%02X (%s)", cmd_id, cmd_label))
 
     -- body[1]: power/error flags
     local b1 = buf(body_off + 1, 1):uint()
@@ -326,7 +350,10 @@ local function decode_c1_group1(body_tree, buf, body_off, body_len)
     -- Group Page 0x41 = Group 1 "Base Run Info"
     -- Source: mill1000/midea-msmart (see midea-msmart-mill1000.md, Finding 11)
     -- Cross-checked against own Session 1 captures (R/T bus, 13 unique frames).
-    -- All field labels are Hypothesis unless noted.
+    -- Session 6 service menu confirmation: T1=18°C, T3=2°C, T4=4°C, Tp=74°C
+    --   → T1/T2 formula (raw-30)/2 confirmed; T3/T4 formula (raw-50)/2 confirmed;
+    --   → Tp body[14] = direct integer °C (no lookup table needed on R/T bus).
+    -- All field labels are Hypothesis unless noted [ConfirmedS6].
 
     local d = body_off + 4  -- first data byte after the 4-byte command header
     local n = body_len - 4  -- how many data bytes actually present
@@ -374,12 +401,13 @@ local function decode_c1_group1(body_tree, buf, body_off, body_len)
             buf(d + 5, 1):uint()))
     end
 
-    -- body[10]: T1 temperature (indoor coil) — offset 30
+    -- body[10]: T1 temperature (indoor coil or Follow-Me sensor) — offset 30
+    -- Confirmed Session 6: raw=0x42=66 → (66-30)/2=18°C, service menu T1=18°C
     if n >= 7 then
         local raw = buf(d + 6, 1):uint()
         local t1 = raw >= 30 and (raw - 30) / 2.0 or (30 - raw) / -2.0
         body_tree:add(buf(d + 6, 1), string.format(
-            "T1 indoor coil: %.1f °C (raw %d, offset 30)  [Hypothesis]",
+            "T1 indoor coil: %.1f °C (raw %d, offset 30)  [ConfirmedS6]",
             t1, raw))
     end
 
@@ -393,27 +421,31 @@ local function decode_c1_group1(body_tree, buf, body_off, body_len)
     end
 
     -- body[12]: T3 temperature (outdoor coil) — offset 50
+    -- Confirmed Session 6: raw=0x36=54 → (54-50)/2=2°C, service menu T3=2°C
     if n >= 9 then
         local raw = buf(d + 8, 1):uint()
         local t3 = raw >= 50 and (raw - 50) / 2.0 or (50 - raw) / -2.0
         body_tree:add(buf(d + 8, 1), string.format(
-            "T3 outdoor coil: %.1f °C (raw %d, offset 50)  [Hypothesis]",
+            "T3 outdoor coil: %.1f °C (raw %d, offset 50)  [ConfirmedS6]",
             t3, raw))
     end
 
     -- body[13]: T4 temperature (outdoor ambient) — offset 50
+    -- Confirmed Session 6: raw=0x3B=59 → (59-50)/2=4.5°C ≈ service menu T4=4°C
     if n >= 10 then
         local raw = buf(d + 9, 1):uint()
         local t4 = raw >= 50 and (raw - 50) / 2.0 or (50 - raw) / -2.0
         body_tree:add(buf(d + 9, 1), string.format(
-            "T4 outdoor ambient: %.1f °C (raw %d, offset 50)  [Hypothesis]",
+            "T4 outdoor ambient: %.1f °C (raw %d, offset 50)  [ConfirmedS6]",
             t4, raw))
     end
 
-    -- body[14]: discharge pipe temperature (Tp) — lookup table, show raw
+    -- body[14]: discharge pipe temperature (Tp) — direct integer °C
+    -- Confirmed Session 6: raw=0x4A=74, service menu Tp=74 °C → identity mapping.
+    -- The outdoor MCU runs ucPQTempTab internally and sends the result in °C.
     if n >= 11 then
         body_tree:add(buf(d + 10, 1), string.format(
-            "Tp discharge temp: %d (raw, needs lookup table)  [Hypothesis]",
+            "Tp discharge temp: %d °C  [Confirmed S6]",
             buf(d + 10, 1):uint()))
     end
 
@@ -595,46 +627,60 @@ end
 
 local function decode_c1_group4(body_tree, buf, body_off, body_len)
     -- Group 4 "Power Consumption"
-    -- Source: mill1000/midea-msmart (see midea-msmart-mill1000.md, Finding 11)
-    -- All fields: Hypothesis.
+    -- Source: mill1000/midea-msmart Finding 11 (see midea-msmart-mill1000.md); confirmed Sessions 1 + 8, UART bus.
+    --
+    -- All energy fields use 4-byte "BCD" encoding where each byte's nibbles are treated
+    -- as decimal digits (incl. nibbles A-F = 10-15, i.e. not strict BCD).
+    -- Formula: bcd[N]*10000 + bcd[N+1]*100 + bcd[N+2] + bcd[N+3]/100  = kWh
+    --
+    -- curRealTimePower uses 3 bytes:
+    -- bcd[16] + bcd[17]/100 + bcd[18]/10000  = kW
+    --
+    -- Confirmed values:
+    --   Session 1 (compressor off): totalPowerConsume=111.45 kWh, curRealTimePower=5-11 W
+    --   Session 8 (80 Hz heat):     totalPowerConsume=113.81 kWh, curRealTimePower=381.4 W
 
     local d = body_off + 4
     local n = body_len - 4
 
-    local function bcd(byte)
-        return 10 * bit.rshift(bit.band(byte, 0xF0), 4) + bit.band(byte, 0x0F)
+    local function bcd(byte_val)
+        return bit.band(bit.rshift(byte_val, 4), 0x0F) * 10 + bit.band(byte_val, 0x0F)
     end
 
-    -- body[4..7]: total power consumed (BCD kWh)
+    local function bcd_energy_kwh(off)
+        local b0 = buf(off,   1):uint()
+        local b1 = buf(off+1, 1):uint()
+        local b2 = buf(off+2, 1):uint()
+        local b3 = buf(off+3, 1):uint()
+        return bcd(b0)*10000 + bcd(b1)*100 + bcd(b2) + bcd(b3)/100.0
+    end
+
+    -- body[4..7]: totalPowerConsume — cumulative lifetime energy
     if n >= 4 then
-        local val = bcd(buf(d+0,1):uint()) * 10000 + bcd(buf(d+1,1):uint()) * 100
-                  + bcd(buf(d+2,1):uint()) + bcd(buf(d+3,1):uint()) / 100.0
         body_tree:add(buf(d + 0, 4), string.format(
-            "Total power consumed: %.2f kWh (BCD)  [Hypothesis]", val))
+            "totalPowerConsume: %.2f kWh  [ConfirmedS1/S8]", bcd_energy_kwh(d+0)))
     end
 
-    -- body[8..11]: total running power (BCD kWh)
+    -- body[8..11]: totalRunPower — zeros in all own captures (firmware may not populate)
     if n >= 8 then
-        local val = bcd(buf(d+4,1):uint()) * 10000 + bcd(buf(d+5,1):uint()) * 100
-                  + bcd(buf(d+6,1):uint()) + bcd(buf(d+7,1):uint()) / 100.0
         body_tree:add(buf(d + 4, 4), string.format(
-            "Total running power: %.2f kWh (BCD)  [Hypothesis]", val))
+            "totalRunPower: %.2f kWh  [Hypothesis]", bcd_energy_kwh(d+4)))
     end
 
-    -- body[12..15]: current run power (BCD kWh)
+    -- body[12..15]: curRunPower — zeros in all own captures
     if n >= 12 then
-        local val = bcd(buf(d+8,1):uint()) * 10000 + bcd(buf(d+9,1):uint()) * 100
-                  + bcd(buf(d+10,1):uint()) + bcd(buf(d+11,1):uint()) / 100.0
         body_tree:add(buf(d + 8, 4), string.format(
-            "Current run power: %.2f kWh (BCD)  [Hypothesis]", val))
+            "curRunPower: %.2f kWh  [Hypothesis]", bcd_energy_kwh(d+8)))
     end
 
-    -- body[16..18]: real-time power (BCD kW)
+    -- body[16..18]: curRealTimePower — instantaneous draw in kW
     if n >= 15 then
-        local val = bcd(buf(d+12,1):uint()) + bcd(buf(d+13,1):uint()) / 100.0
-                  + bcd(buf(d+14,1):uint()) / 10000.0
+        local b16 = buf(d+12,1):uint()
+        local b17 = buf(d+13,1):uint()
+        local b18 = buf(d+14,1):uint()
+        local kw = bcd(b16) + bcd(b17)/100.0 + bcd(b18)/10000.0
         body_tree:add(buf(d + 12, 3), string.format(
-            "Real-time power: %.4f kW (BCD)  [Hypothesis]", val))
+            "curRealTimePower: %.4f kW = %.1f W  [ConfirmedS8]", kw, kw * 1000.0))
     end
 end
 
@@ -1137,6 +1183,250 @@ local function decode_uart_93(body_tree, buf, body_off, body_len)
 end
 
 
+local function decode_uart_07_devid(body_tree, buf, body_off, body_len)
+    -- 0x07 Device Identification (dispatched by msg_type=0x07)
+    -- Short form: body = {0x00, 0xFA} — dongle requesting SN from mainboard
+    -- Long form: body = 32-byte SN string (ASCII, or all 0xFF when not set)
+    -- SN all-0xFF observed in Sessions 2 and 4.
+    if body_len >= 2 and buf(body_off, 1):uint() == 0x00
+            and buf(body_off + 1, 1):uint() == 0xFA then
+        body_tree:add(buf(body_off, 2), "[Device ID 0x07] Sub-request: 00 FA  [Hypothesis: dongle requesting SN]")
+    elseif body_len >= 1 then
+        local sn_len = body_len
+        local all_ff = true
+        for i = 0, sn_len - 1 do
+            if buf(body_off + i, 1):uint() ~= 0xFF then all_ff = false; break end
+        end
+        body_tree:add(buf(body_off, sn_len), string.format(
+            "SN (%d bytes): %s%s",
+            sn_len, tostring(buf(body_off, sn_len):bytes()),
+            all_ff and "  [all 0xFF — SN not set]" or ""))
+    end
+end
+
+
+local function decode_uart_netstatus(body_tree, buf, body_off, body_len, msg_type)
+    -- 0x63 Network Status / 0x0D Network Init  (dispatched by msg_type, not body[0])
+    -- body[0] = connection status/sub-command; body[4..7] = IP (byte order TBD — Hypothesis)
+    -- Structure is shared between 0x63 and 0x0D: same field layout observed in own captures.
+    local name = msg_type == 0x63 and "Network Status" or "Network Init"
+    -- Note: these frames are dispatched by msg_type; body[0] is a status value, not a cmd_id
+    if body_len >= 1 then
+        local b0 = buf(body_off, 1):uint()
+        body_tree:add(buf(body_off, 1), string.format(
+            "[%s 0x%02X] body[0] = 0x%02X  [Hypothesis: connection status/sub-cmd]",
+            name, msg_type, b0))
+    end
+    if body_len >= 8 then
+        local b4 = buf(body_off + 4, 1):uint()
+        local b5 = buf(body_off + 5, 1):uint()
+        local b6 = buf(body_off + 6, 1):uint()
+        local b7 = buf(body_off + 7, 1):uint()
+        body_tree:add(buf(body_off + 4, 4), string.format(
+            "IP candidate (bytes[4..7]): %d.%d.%d.%d  [Hypothesis: byte order TBD]",
+            b4, b5, b6, b7))
+    end
+    if body_len > 1 then
+        body_tree:add(buf(body_off, body_len),
+            "Raw payload: " .. tostring(buf(body_off, body_len):bytes()))
+    end
+end
+
+
+local function decode_uart_a1_heartbeat(body_tree, buf, body_off, body_len)
+    -- 0xA1 Mainboard heartbeat — cumulative energy + temperatures
+    -- Source: mill1000/midea-msmart Finding 12 (see midea-msmart-mill1000.md)
+    --
+    -- Cross-validated against all 55 A1 frames across Sessions 1-9:
+    --   energy[1..4] BCD kWh: exact match with C1 Group4 totalPowerConsume
+    --     (S1: both = 111.45 kWh; S8: both = 113.81 kWh)
+    --   T1/T4: physically consistent with session conditions across all sessions
+    --   work_min[9..12]: always zero on Q11 — firmware does not populate this field
+    --     (verified: 55 frames including Session 7 spanning 756 s)
+    --   byte[18]: not a reliable fractional temp on Q11 — values jump randomly
+    --     (0x00, 0x04, 0x94, 0x83 in same session with constant T1/T4)
+    --
+    -- BCD nibbles A-F are allowed (not strict decimal BCD) — same as C1 Group4.
+
+    local function bcd(b) return math.floor(b / 16) * 10 + (b % 16) end
+    local function bcd_kwh(o)
+        if body_off + o + 3 >= buf:len() then return nil end
+        return bcd(buf(body_off+o,1):uint())*10000
+             + bcd(buf(body_off+o+1,1):uint())*100
+             + bcd(buf(body_off+o+2,1):uint())
+             + bcd(buf(body_off+o+3,1):uint())/100.0
+    end
+
+    body_tree:add(buf(body_off, 1), "Command ID: 0xA1 (Heartbeat — Cumulative Energy + Temps)")
+
+    -- body[1..4]: totalPowerConsume — cumulative lifetime energy in kWh
+    -- BCD: bcd[1]x10000 + bcd[2]x100 + bcd[3] + bcd[4]/100  kWh; nibbles A-F allowed
+    -- [Confirmed: exact match with C1 Group4, Sessions 1 and 8]
+    if body_len >= 5 then
+        local kwh = bcd_kwh(1)
+        if kwh then
+            body_tree:add(buf(body_off+1, 4), string.format(
+                "totalPowerConsume: %.2f kWh  [Confirmed — Finding 12]", kwh))
+        end
+    end
+
+    -- body[5..8]: totalRunPower — defined in spec; always 0.00 on Q11
+    if body_len >= 9 then
+        local kwh = bcd_kwh(5)
+        if kwh then
+            body_tree:add(buf(body_off+5, 4), string.format(
+                "totalRunPower: %.2f kWh  [Finding 12; always 0 on Q11]", kwh))
+        end
+    end
+
+    -- body[9..12]: currentWorkTime — defined in spec; not implemented on Q11 (always 0)
+    -- [9..10]=days 16-bit BE, [11]=hours, [12]=minutes
+    -- Verified: 0 in all 55 captures including 756 s session
+    if body_len >= 13 then
+        local days  = buf(body_off+9,1):uint() * 256 + buf(body_off+10,1):uint()
+        local hours = buf(body_off+11,1):uint()
+        local mins  = buf(body_off+12,1):uint()
+        if days == 0 and hours == 0 and mins == 0 then
+            body_tree:add(buf(body_off+9, 4),
+                "currentWorkTime: 0 (not implemented on Q11)  [Finding 12, Confirmed]")
+        else
+            body_tree:add(buf(body_off+9, 4), string.format(
+                "currentWorkTime: %dd %02dh %02dm = %d min  [Finding 12]",
+                days, hours, mins, days*1440 + hours*60 + mins))
+        end
+    end
+
+    -- body[13]: T1 indoor temperature  (raw-50)/2 °C, skip 0x00/0xFF  [Confirmed]
+    -- body[14]: T4 outdoor temperature (raw-50)/2 °C, skip 0x00/0xFF  [Confirmed]
+    if body_len >= 14 then
+        local r = buf(body_off+13,1):uint()
+        if r ~= 0x00 and r ~= 0xFF then
+            body_tree:add(buf(body_off+13,1), string.format(
+                "T1 indoor: %.1f C (raw 0x%02X, (raw-50)/2)  [Confirmed — Finding 12]",
+                (r-50)/2.0, r))
+        else
+            body_tree:add(buf(body_off+13,1), string.format(
+                "T1 indoor: N/A (raw 0x%02X — sensor not ready)", r))
+        end
+    end
+    if body_len >= 15 then
+        local r = buf(body_off+14,1):uint()
+        if r ~= 0x00 and r ~= 0xFF then
+            body_tree:add(buf(body_off+14,1), string.format(
+                "T4 outdoor: %.1f C (raw 0x%02X, (raw-50)/2)  [Confirmed — Finding 12]",
+                (r-50)/2.0, r))
+        else
+            body_tree:add(buf(body_off+14,1), string.format(
+                "T4 outdoor: N/A (raw 0x%02X — sensor not ready/absent)", r))
+        end
+    end
+
+    -- body[15..16]: pm25Value 16-bit BE (µg/m3) — always 0 on Q11 (no sensor)  [Finding 12]
+    if body_len >= 17 then
+        local pm25 = buf(body_off+15,1):uint() * 256 + buf(body_off+16,1):uint()
+        body_tree:add(buf(body_off+15,2), string.format(
+            "pm25Value: %d ug/m3  [Finding 12; 0 on Q11 — no sensor]", pm25))
+    end
+
+    -- body[17]: curHum (%) — always 0 on Q11 (no humidity sensor)  [Finding 12]
+    if body_len >= 18 then
+        body_tree:add(buf(body_off+17,1), string.format(
+            "curHum: %d%%  [Finding 12; 0 on Q11 — no sensor]",
+            buf(body_off+17,1):uint()))
+    end
+
+    -- body[18]: Unknown on Q11 — spec assigns fractional temp nibbles but values
+    -- are random on Q11 hardware (jump 0x00->0x94->0x83 with constant T1/T4)
+    if body_len >= 19 then
+        local b18 = buf(body_off+18,1):uint()
+        body_tree:add(buf(body_off+18,1), string.format(
+            "byte[18] = 0x%02X (lo=%d hi=%d)  [Unknown on Q11 — not reliable fractional temp]",
+            b18, b18 % 16, math.floor(b18 / 16)))
+    end
+
+    -- body[19]: lightAdValue (raw ADC) — always 0 on Q11  [Finding 12]
+    if body_len >= 20 then
+        body_tree:add(buf(body_off+19,1), string.format(
+            "lightAdValue: %d (raw ADC)  [Finding 12; 0 on Q11]",
+            buf(body_off+19,1):uint()))
+    end
+
+    -- remaining bytes
+    if body_len > 20 then
+        body_tree:add(buf(body_off+20, body_len-20),
+            "Tail: " .. tostring(buf(body_off+20, body_len-20):bytes()) .. "  [unknown]")
+    end
+end
+
+
+local function decode_uart_heartbeat_subpage(body_tree, buf, body_off, body_len, cmd_id)
+    -- 0xA2/A3/A5/A6 mainboard heartbeat sub-pages (msg_type=0x04, body[0]=Ax)
+    -- These are mainboard→dongle pushes for cloud forwarding.
+    -- A2/A3/A5/A6 are not decoded in mill1000/midea-msmart reference material (see midea-msmart-mill1000.md).
+    local names = {
+        [0xA2] = "Heartbeat A2 (Device Params — undecoded)",
+        [0xA3] = "Heartbeat A3 (Device Params 2 — undecoded)",
+        [0xA5] = "Heartbeat A5 (Outdoor Unit — undecoded)",
+        [0xA6] = "Heartbeat A6 (Network Info — undecoded)",
+    }
+    local name = names[cmd_id] or string.format("Heartbeat 0x%02X (undecoded)", cmd_id)
+    body_tree:add(buf(body_off, 1), string.format("Command ID: 0x%02X (%s)", cmd_id, name))
+    if body_len > 1 then
+        body_tree:add(buf(body_off + 1, body_len - 1),
+            "Payload: " .. tostring(buf(body_off + 1, body_len - 1):bytes()))
+    end
+end
+
+
+local function decode_uart_b0b1_tlv(body_tree, buf, body_off, body_len, cmd_id)
+    -- 0xB0 TLV Set / 0xB1 TLV Response (tag + len + value, repeating)
+    -- body[1]: sub-page or entry count  [Hypothesis]
+    -- TLV entries start at body[2]; each entry = tag(1) + len(1) + val(len bytes)
+    local name = cmd_id == 0xB0 and "TLV Set" or "TLV Response"
+    body_tree:add(buf(body_off, 1), string.format("Command ID: 0x%02X (%s)", cmd_id, name))
+    if body_len >= 2 then
+        body_tree:add(buf(body_off + 1, 1), string.format(
+            "body[1] = 0x%02X  [Hypothesis: sub-page or TLV count]",
+            buf(body_off + 1, 1):uint()))
+    end
+    if body_len <= 2 then return end
+    local pos = body_off + 2
+    local end_off = body_off + body_len
+    local tlv_n = 0
+    while pos + 1 < end_off do
+        local tag  = buf(pos, 1):uint()
+        local tlen = buf(pos + 1, 1):uint()
+        if pos + 2 + tlen > end_off then
+            body_tree:add(buf(pos, end_off - pos),
+                string.format("TLV[%d]: tag=0x%02X TRUNCATED (need %d, have %d)",
+                    tlv_n, tag, tlen, end_off - pos - 2))
+            break
+        end
+        if tlen == 0 then
+            body_tree:add(buf(pos, 2), string.format(
+                "TLV[%d]: tag=0x%02X len=0 (empty)", tlv_n, tag))
+            pos = pos + 2
+        else
+            body_tree:add(buf(pos, 2 + tlen), string.format(
+                "TLV[%d]: tag=0x%02X len=%d val=%s",
+                tlv_n, tag, tlen, tostring(buf(pos + 2, tlen):bytes())))
+            pos = pos + 2 + tlen
+        end
+        tlv_n = tlv_n + 1
+        if tlv_n > 64 then
+            if end_off > pos then
+                body_tree:add(buf(pos, end_off - pos), "(truncated — more than 64 TLV entries)")
+            end
+            break
+        end
+    end
+    if tlv_n == 0 and body_len > 2 then
+        body_tree:add(buf(body_off + 2, body_len - 2),
+            "Payload (no valid TLV): " .. tostring(buf(body_off + 2, body_len - 2):bytes()))
+    end
+end
+
+
 -- ══════════════════════════════════════════════════════════════════════════════
 -- ── MAIN DISSECTOR ──────────────────────────────────────────────────────────
 -- ══════════════════════════════════════════════════════════════════════════════
@@ -1309,12 +1599,27 @@ function hvac_shark_proto.dissector(udp_payload_buffer, pinfo, tree)
                 string.format("Body (%d bytes) — %s", body_len, integrity_str))
 
             if body_len > 0 then
-                local cmd_id = udp_payload_buffer(body_off, 1):uint()
-                local cmd_str = UART_COMMAND_IDS[cmd_id] or string.format("Unknown (0x%02X)", cmd_id)
+                local cmd_id   = udp_payload_buffer(body_off, 1):uint()
+                local msg_type = proto_len >= 10 and protocol_buffer(9, 1):uint() or 0
+                local cmd_str  = UART_COMMAND_IDS[cmd_id] or string.format("0x%02X", cmd_id)
                 pinfo.cols.info:append(" " .. cmd_str)
 
-                if cmd_id == 0xC0 then
+                -- Dispatch: some frame types are keyed on msg_type (body[0] is not a cmd_id)
+                if msg_type == 0x07 then
+                    decode_uart_07_devid(body_tree, udp_payload_buffer, body_off, body_len)
+                elseif msg_type == 0x63 or msg_type == 0x0D then
+                    decode_uart_netstatus(body_tree, udp_payload_buffer, body_off, body_len, msg_type)
+                -- Standard body[0]-keyed dispatch
+                elseif cmd_id == 0xC0 then
                     decode_uart_c0_status(body_tree, udp_payload_buffer, body_off, body_len)
+                elseif cmd_id == 0xA0 then
+                    -- Heartbeat ACK: body layout identical to C0
+                    decode_uart_c0_status(body_tree, udp_payload_buffer, body_off, body_len, 0xA0)
+                elseif cmd_id == 0xA1 then
+                    decode_uart_a1_heartbeat(body_tree, udp_payload_buffer, body_off, body_len)
+                elseif cmd_id == 0xA2 or cmd_id == 0xA3
+                        or cmd_id == 0xA5 or cmd_id == 0xA6 then
+                    decode_uart_heartbeat_subpage(body_tree, udp_payload_buffer, body_off, body_len, cmd_id)
                 elseif cmd_id == 0xC1 then
                     decode_uart_c1(body_tree, udp_payload_buffer, body_off, body_len)
                 elseif cmd_id == 0x40 then
@@ -1323,13 +1628,30 @@ function hvac_shark_proto.dissector(udp_payload_buffer, pinfo, tree)
                     decode_uart_41_query(body_tree, udp_payload_buffer, body_off, body_len)
                 elseif cmd_id == 0x93 then
                     decode_uart_93(body_tree, udp_payload_buffer, body_off, body_len)
+                elseif cmd_id == 0xB0 or cmd_id == 0xB1 then
+                    decode_uart_b0b1_tlv(body_tree, udp_payload_buffer, body_off, body_len, cmd_id)
                 elseif cmd_id == 0xB5 then
                     body_tree:add(udp_payload_buffer(body_off, 1), "Command ID: 0xB5 (Capabilities Query/Response)")
-                    body_tree:add(udp_payload_buffer(body_off + 1, body_len - 1),
-                        "Capability Data: " .. tostring(udp_payload_buffer(body_off + 1, body_len - 1):bytes()))
+                    if body_len > 1 then
+                        body_tree:add(udp_payload_buffer(body_off + 1, body_len - 1),
+                            "Capability Data: " .. tostring(udp_payload_buffer(body_off + 1, body_len - 1):bytes()))
+                    end
+                elseif cmd_id == 0x64 then
+                    body_tree:add(udp_payload_buffer(body_off, 1), "Command ID: 0x64 (OTA/Key Trigger)")
+                    if body_len > 1 then
+                        body_tree:add(udp_payload_buffer(body_off + 1, body_len - 1),
+                            "Payload: " .. tostring(udp_payload_buffer(body_off + 1, body_len - 1):bytes()))
+                    end
+                elseif cmd_id == 0x65 then
+                    body_tree:add(udp_payload_buffer(body_off, 1), "Command ID: 0x65 (RAC Serial)")
+                    if body_len > 1 then
+                        body_tree:add(udp_payload_buffer(body_off + 1, body_len - 1),
+                            "Payload: " .. tostring(udp_payload_buffer(body_off + 1, body_len - 1):bytes()))
+                    end
                 else
                     body_tree:add(udp_payload_buffer(body_off, body_len),
-                        "Raw Body: " .. tostring(udp_payload_buffer(body_off, body_len):bytes()))
+                        string.format("Raw Body (0x%02X): ", cmd_id) ..
+                        tostring(udp_payload_buffer(body_off, body_len):bytes()))
                 end
             end
 
@@ -1401,6 +1723,16 @@ function hvac_shark_proto.dissector(udp_payload_buffer, pinfo, tree)
                 data_subtree:add(pbuf(10, 1), "0x0A Timer Start: " .. string.format("0x%02X", protocol_buffer(10, 1):uint()))
                 data_subtree:add(pbuf(11, 1), "0x0B Timer Stop: " .. string.format("0x%02X", protocol_buffer(11, 1):uint()))
                 data_subtree:add(pbuf(12, 1), "0x0C Unknown: " .. string.format("0x%02X", protocol_buffer(12, 1):uint()))
+            elseif command_code == 0xC6 then
+                -- C6 master request: Follow-Me + Swing activation (Sessions 7/8)
+                local swing = protocol_buffer(6, 1):uint()
+                data_subtree:add(pbuf(6, 1), string.format("0x06 Swing: 0x%02X (%s)", swing, getSwingString(swing)))
+                data_subtree:add(pbuf(7, 1), string.format("0x07 Unknown: 0x%02X", protocol_buffer(7, 1):uint()))
+                data_subtree:add(pbuf(8, 1), string.format("0x08 Unknown: 0x%02X", protocol_buffer(8, 1):uint()))
+                data_subtree:add(pbuf(9, 1), string.format("0x09 Unknown: 0x%02X", protocol_buffer(9, 1):uint()))
+                data_subtree:add(pbuf(10, 1), string.format("0x0A Unknown: 0x%02X", protocol_buffer(10, 1):uint()))
+                data_subtree:add(pbuf(11, 1), string.format("0x0B Unknown: 0x%02X", protocol_buffer(11, 1):uint()))
+                data_subtree:add(pbuf(12, 1), string.format("0x0C Unknown: 0x%02X", protocol_buffer(12, 1):uint()))
             else
                 data_subtree:add(pbuf(6, 7), "Payload: " .. tostring(protocol_buffer(6, 7):bytes()))
             end
@@ -1418,7 +1750,11 @@ function hvac_shark_proto.dissector(udp_payload_buffer, pinfo, tree)
         elseif protocol_length == 32 then
             local command_code = protocol_buffer(1, 1):uint()
             local command_name = XYE_COMMANDS[command_code] or "Unknown"
-            pinfo.cols.info:append(string.format("S->M 0x%02X %s", command_code, command_name))
+            if command_code == 0xD0 then
+                pinfo.cols.info:append(string.format("BCAST 0x%02X %s", command_code, command_name))
+            else
+                pinfo.cols.info:append(string.format("S->M 0x%02X %s", command_code, command_name))
+            end
             data_subtree:add(pbuf(0, 1), "0x00 Preamble: " .. string.format("0x%02X", protocol_buffer(0, 1):uint()))
             data_subtree:add(pbuf(1, 1), "0x01 Response Code: " .. string.format("0x%02X", command_code) .. " (" .. command_name .. ")")
 
@@ -1481,14 +1817,34 @@ function hvac_shark_proto.dissector(udp_payload_buffer, pinfo, tree)
                 data_subtree:add(pbuf(17, 1), string.format("0x11 Fan: 0x%02X (%s)", c4_fan, getFanString(c4_fan)))
                 local c4_sett = protocol_buffer(18, 1):uint()
                 data_subtree:add(pbuf(18, 1), string.format("0x12 Set Temp: 0x%02X (%.0f C)", c4_sett, c4_sett - 0x40))
-                local c4_tp = protocol_buffer(19, 1):uint()
-                data_subtree:add(pbuf(19, 1), string.format("0x13 Tp (compressor): 0x%02X (%.1f C)", c4_tp, (c4_tp - 40) / 2.0))
-                data_subtree:add(pbuf(20, 1), string.format("0x14 Unknown: 0x%02X (%.1f C if sensor)", protocol_buffer(20, 1):uint(), (protocol_buffer(20, 1):uint() - 40) / 2.0))
+                -- byte[19] = 0xBC = fixed outdoor-unit device-type field, NOT Tp
+                data_subtree:add(pbuf(19, 1), string.format("0x13 Device type: 0x%02X (fixed)", protocol_buffer(19, 1):uint()))
+                data_subtree:add(pbuf(20, 1), string.format("0x14 Unknown: 0x%02X (%.1f C if XYE sensor formula)", protocol_buffer(20, 1):uint(), (protocol_buffer(20, 1):uint() - 40) / 2.0))
                 local c4_t4 = protocol_buffer(21, 1):uint()
                 data_subtree:add(pbuf(21, 1), string.format("0x15 T4 (outdoor ambient): 0x%02X (%.1f C)", c4_t4, (c4_t4 - 40) / 2.0))
-                local c4_b22 = protocol_buffer(22, 1):uint()
-                data_subtree:add(pbuf(22, 1), string.format("0x16 Coil track: 0x%02X (%.1f C)", c4_b22, (c4_b22 - 40) / 2.0))
+                -- byte[22] = Tp discharge temperature, confirmed by cross-session UART comparison
+                local c4_tp = protocol_buffer(22, 1):uint()
+                data_subtree:add(pbuf(22, 1), string.format("0x16 Tp (compressor discharge): 0x%02X (%.1f C)  [ConfirmedS6]", c4_tp, (c4_tp - 40) / 2.0))
                 for i = 23, 29 do
+                    data_subtree:add(pbuf(i, 1), string.format("0x%02X: 0x%02X", i, protocol_buffer(i, 1):uint()))
+                end
+            elseif command_code == 0xD0 then
+                -- D0 broadcast: periodic status report (Sessions 7/8)
+                for i = 2, 4 do
+                    data_subtree:add(pbuf(i, 1), string.format("0x%02X: 0x%02X", i, protocol_buffer(i, 1):uint()))
+                end
+                local d0_mode = protocol_buffer(5, 1):uint()
+                data_subtree:add(pbuf(5, 1), string.format("0x05 Operating Mode: 0x%02X (%s)", d0_mode, getOperModeString(d0_mode)))
+                local d0_fan = protocol_buffer(6, 1):uint()
+                data_subtree:add(pbuf(6, 1), string.format("0x06 Fan: 0x%02X (%s)", d0_fan, getFanString(d0_fan)))
+                local d0_sett = protocol_buffer(7, 1):uint()
+                data_subtree:add(pbuf(7, 1), string.format("0x07 Set Temp: 0x%02X (%.0f C)", d0_sett, d0_sett - 0x40))
+                for i = 8, 10 do
+                    data_subtree:add(pbuf(i, 1), string.format("0x%02X: 0x%02X", i, protocol_buffer(i, 1):uint()))
+                end
+                local d0_swing = protocol_buffer(11, 1):uint()
+                data_subtree:add(pbuf(11, 1), string.format("0x0B Swing: 0x%02X (%s)", d0_swing, getSwingString(d0_swing)))
+                for i = 12, 29 do
                     data_subtree:add(pbuf(i, 1), string.format("0x%02X: 0x%02X", i, protocol_buffer(i, 1):uint()))
                 end
             else
@@ -1520,24 +1876,80 @@ function hvac_shark_proto.dissector(udp_payload_buffer, pinfo, tree)
         -- ══════════════════════════════════════════════════════════════════
         -- ── DISPLAY ↔ MAINBOARD INTERNAL BUS ─────────────────────────────
         -- ══════════════════════════════════════════════════════════════════
+        -- Frame structure (confirmed, all 8 frame types, 50 samples each):
+        --   byte[0]    = 0xAA  (start, excluded from checksum)
+        --   byte[1]    = type  (0x20/0x30/0x31/0x50/0xFF)
+        --   byte[2]    = total frame length (includes all bytes 0..N-1)
+        --   byte[3..N-2] = payload
+        --   byte[N-1]  = checksum = (256 - sum(frame[1..N-2])) & 0xFF
+        -- See protocol_mainboard.md for full type inventory and payload notes.
         subtree:add(f.protocol_type, "Display-Mainboard Internal Bus")
-        pinfo.cols.info:prepend("DISP-MB ")
 
-        local frame_tree = subtree:add(pbuf(0, proto_len), "Internal Bus Frame")
+        -- Identify frame type and direction label
+        local frame_type = byte1
+        local type_names = {
+            [0x20] = "0x20 Status Poll",
+            [0x30] = "0x30 Extended Query A",
+            [0x31] = "0x31 Extended Query B",
+            [0x50] = "0x50 Rare/Init",
+            [0xFF] = "0xFF Anomalous",
+        }
+        local type_label = type_names[frame_type] or string.format("0x%02X Unknown", frame_type)
+
+        -- Direction hint based on length (query vs response)
+        local dir_hint = ""
+        if proto_len == 29 or proto_len == 10 or proto_len == 32 or proto_len == 21 then
+            dir_hint = " [Query?]"
+        elseif proto_len == 36 or proto_len == 64 then
+            dir_hint = " [Response?]"
+        end
+
+        pinfo.cols.info:prepend(string.format("DISP-MB %s%s ", type_label, dir_hint))
+
+        local frame_tree = subtree:add(pbuf(0, proto_len),
+            string.format("Internal Bus Frame: type=%s len=%d%s", type_label, proto_len, dir_hint))
 
         frame_tree:add(pbuf(0, 1), string.format("Start: 0x%02X", protocol_buffer(0, 1):uint()))
-        frame_tree:add(pbuf(1, 1), string.format("Device Type: 0x%02X", byte1))
+        frame_tree:add(pbuf(1, 1), string.format("Frame Type: %s", type_label))
 
         if proto_len >= 3 then
             local pkt_len = protocol_buffer(2, 1):uint()
             local len_match = (pkt_len == proto_len)
-            frame_tree:add(pbuf(2, 1), string.format("Packet Length: %d %s",
-                pkt_len, len_match and "(matches frame)" or
-                string.format("(frame is %d bytes)", proto_len)))
+            frame_tree:add(pbuf(2, 1), string.format("Length: %d %s",
+                pkt_len, len_match and "(valid)" or
+                string.format("(MISMATCH: frame=%d)", proto_len)))
 
-            -- Dump remaining bytes with offset labels
-            for i = 3, proto_len - 1 do
-                frame_tree:add(pbuf(i, 1), string.format("0x%02X: 0x%02X", i, protocol_buffer(i, 1):uint()))
+            -- Payload bytes [3..N-2]
+            if proto_len >= 4 then
+                local pay_tree = frame_tree:add(pbuf(3, proto_len - 4),
+                    string.format("Payload (%d bytes)", proto_len - 4))
+                for i = 3, proto_len - 2 do
+                    local bval = protocol_buffer(i, 1):uint()
+                    local note = ""
+                    -- Annotate known/hypothetical fields
+                    if frame_type == 0x20 and proto_len == 36 and i == 4 then
+                        note = string.format(" [Tp? direct degC = %d, Hypothesis]", bval)
+                    elseif frame_type == 0x31 and proto_len == 64 and i == 4 then
+                        note = string.format(" [Tp? direct degC = %d, Hypothesis]", bval)
+                    elseif frame_type == 0x30 and proto_len == 64 and i == 3 then
+                        note = string.format(" [Sub-type/cmd 0x%02X]", bval)
+                    end
+                    pay_tree:add(pbuf(i, 1), string.format("[%d] 0x%02X%s", i, bval, note))
+                end
+            end
+
+            -- Checksum verification
+            if proto_len >= 2 then
+                local ck_byte = protocol_buffer(proto_len - 1, 1):uint()
+                local ck_sum = 0
+                for i = 1, proto_len - 2 do
+                    ck_sum = ck_sum + protocol_buffer(i, 1):uint()
+                end
+                local ck_computed = (256 - (ck_sum % 256)) % 256
+                local ck_ok = (ck_byte == ck_computed)
+                frame_tree:add(pbuf(proto_len - 1, 1), string.format(
+                    "Checksum: 0x%02X %s (computed 0x%02X)",
+                    ck_byte, ck_ok and "(valid)" or "*** INVALID ***", ck_computed))
             end
         end
 
