@@ -3,6 +3,11 @@
 --   XYE commands (0xC0-0xCD range) → XYE decoder
 --   UART length  (0x0D-0x40 range) → UART decoder
 -- See: PI HVAC databridge docs/protocol_vs_xye.md section 11
+--
+-- NOTE: Capture files may contain cut-off packets at the start of a recording
+-- session due to frame mis-alignment (the logic analyser can begin capturing
+-- mid-frame). These partial frames will show CRC/checksum INVALID errors and
+-- may decode as garbled data. This is expected and not a dissector bug.
 
 hvac_shark_proto = Proto("HVAC_Shark", "HVAC Shark Protocol")
 
@@ -74,17 +79,25 @@ function getSwingString(swing)
 end
 
 
--- ── UART lookup tables ───────────────────────────────────────────────────────
+-- ── Serial Protocol lookup tables (shared by UART and R/T buses) ─────────────
 
-local UART_MSG_TYPES = {
+local SERIAL_MSG_TYPES = {
     [0x02] = "Command",       [0x03] = "Response/Notification",
-    [0x04] = "Network Info",  [0x05] = "Handshake/ACK",
-    [0x07] = "Device ID",     [0x0D] = "Network Init",
-    [0x63] = "Network Status",[0x64] = "OTA/Key Trigger",
-    [0x65] = "RAC Serial",    [0xA0] = "Proprietary",
+    [0x04] = "Heartbeat",     [0x05] = "Handshake/ACK",
+    [0x06] = "Status Upload", [0x07] = "Device ID",
+    [0x0A] = "Error Report",  [0x0D] = "Network Init",
+    [0x0F] = "Status Transport", [0x11] = "Status Transport",
+    [0x13] = "Config Data",   [0x14] = "Config Accepted",
+    [0x15] = "Config Accepted", [0x16] = "Device Event",
+    [0x61] = "Time Sync",     [0x63] = "Network Status",
+    [0x64] = "OTA/Key Trigger", [0x65] = "RAC Serial",
+    [0x68] = "WiFi Config",
+    [0x82] = "Mode Check",    [0x83] = "Config Reset",
+    [0x85] = "Config Response", [0x87] = "Version Info",
+    [0x90] = "Exception",     [0xA0] = "Proprietary",
 }
 
-local UART_COMMAND_IDS = {
+local SERIAL_COMMAND_IDS = {
     [0x40] = "Set Status",    [0x41] = "Query",
     [0x93] = "Ext Status",
     [0xA0] = "Heartbeat ACK",
@@ -98,16 +111,17 @@ local UART_COMMAND_IDS = {
     [0xC1] = "C1 Response",
 }
 
-local function getUartModeString(mode_bits)
+local function getSerialModeString(mode_bits)
     if mode_bits == 1 then return "Auto"
     elseif mode_bits == 2 then return "Cool"
     elseif mode_bits == 3 then return "Dry"
     elseif mode_bits == 4 then return "Heat"
     elseif mode_bits == 5 then return "Fan Only"
+    elseif mode_bits == 6 then return "SmartDry"
     else return string.format("Unknown (%d)", mode_bits) end
 end
 
-local function getUartFanString(fan)
+local function getSerialFanString(fan)
     if fan == 102 then return "Auto"
     elseif fan == 100 then return "Turbo"
     elseif fan == 80 then return "High"
@@ -119,7 +133,7 @@ local function getUartFanString(fan)
     else return string.format("Unknown (%d)", fan) end
 end
 
-local function getUartSwingString(nibble)
+local function getSerialSwingString(nibble)
     if nibble == 0x00 then return "Off"
     elseif nibble == 0x03 then return "Horizontal"
     elseif nibble == 0x0C then return "Vertical"
@@ -224,12 +238,12 @@ local function decode_uart_c0_status(body_tree, buf, body_off, body_len, cmd_id)
     local temp_half = bit.band(b2, 0x10) ~= 0
     local set_temp = temp_int + (temp_half and 0.5 or 0)
     body_tree:add(buf(body_off + 2, 1), string.format("Mode: %s, Set Temp: %.1f C",
-        getUartModeString(mode_bits), set_temp))
+        getSerialModeString(mode_bits), set_temp))
 
     -- body[3]: fan speed
     local fan = buf(body_off + 3, 1):uint()
     body_tree:add(buf(body_off + 3, 1), string.format("Fan Speed: %d (%s)",
-        fan, getUartFanString(fan)))
+        fan, getSerialFanString(fan)))
 
     -- body[4-6]: timer fields
     body_tree:add(buf(body_off + 4, 3), "Timer bytes: " ..
@@ -238,15 +252,18 @@ local function decode_uart_c0_status(body_tree, buf, body_off, body_len, cmd_id)
     -- body[7]: swing mode
     local swing_val = bit.band(buf(body_off + 7, 1):uint(), 0x0F)
     body_tree:add(buf(body_off + 7, 1), string.format("Swing: %s",
-        getUartSwingString(swing_val)))
+        getSerialSwingString(swing_val)))
 
-    -- body[8]: cosy sleep, turbo (location 2), save
+    -- body[8]: cosy sleep, turbo (location 2), save, Follow Me
     local b8 = buf(body_off + 8, 1):uint()
     local turbo2 = bit.band(b8, 0x20) ~= 0
-    body_tree:add(buf(body_off + 8, 1), string.format("Cosy Sleep: %d, Save: %s, Turbo2: %s",
+    local follow_me = bit.band(b8, 0x80) ~= 0
+    body_tree:add(buf(body_off + 8, 1), string.format(
+        "Cosy Sleep: %d, Save: %s, Turbo2: %s, FollowMe: %s",
         bit.band(b8, 0x03),
         bit.band(b8, 0x08) ~= 0 and "yes" or "no",
-        turbo2 and "yes" or "no"))
+        turbo2 and "yes" or "no",
+        follow_me and "yes" or "no"))
 
     -- body[9]: eco, child sleep, PTC, dry clean
     -- *** CONTROVERSY: ECO bit position ***
@@ -261,20 +278,27 @@ local function decode_uart_c0_status(body_tree, buf, body_off, body_len, cmd_id)
     if eco_bit7 then eco_str = eco_str .. (eco_str ~= "" and "+ECO(bit7)" or "ECO(bit7)") end
     if eco_str == "" then eco_str = "no" end
     body_tree:add(buf(body_off + 9, 1), string.format(
-        "ECO: %s, ChildSleep: %s, DryClean: %s, PTC: %s   [NOTE: ECO bit controversial - bit4=dudanov/midea-local, bit7=set-cmd]",
+        "ECO: %s, ChildSleep: %s, NaturalFan: %s, DryClean: %s, PTC: %s, CleanUp: %s   [NOTE: ECO bit controversial - bit4=dudanov/midea-local, bit7=set-cmd]",
         eco_str,
         bit.band(b9, 0x01) ~= 0 and "yes" or "no",
+        bit.band(b9, 0x02) ~= 0 and "yes" or "no",
         bit.band(b9, 0x04) ~= 0 and "yes" or "no",
-        bit.band(b9, 0x08) ~= 0 and "yes" or "no"))
+        bit.band(b9, 0x08) ~= 0 and "yes" or "no",
+        bit.band(b9, 0x20) ~= 0 and "yes" or "no"))
 
-    -- body[10]: sleep, turbo (primary), temp unit
+    -- body[10]: sleep, turbo (primary), temp unit, exchange air, night light, etc.
     local b10 = buf(body_off + 10, 1):uint()
     local sleep = bit.band(b10, 0x01) ~= 0
     local turbo = bit.band(b10, 0x02) ~= 0
     local temp_unit = bit.band(b10, 0x04) ~= 0 and "F" or "C"
     body_tree:add(buf(body_off + 10, 1), string.format(
-        "Sleep: %s, Turbo: %s, Temp Unit: %s",
-        sleep and "yes" or "no", turbo and "yes" or "no", temp_unit))
+        "Sleep: %s, Turbo: %s, Unit: %s, ExchAir: %s, NightLight: %s, CatchCold: %s, PeakElec: %s, CoolFan: %s",
+        sleep and "yes" or "no", turbo and "yes" or "no", temp_unit,
+        bit.band(b10, 0x08) ~= 0 and "yes" or "no",
+        bit.band(b10, 0x10) ~= 0 and "yes" or "no",
+        bit.band(b10, 0x20) ~= 0 and "yes" or "no",
+        bit.band(b10, 0x40) ~= 0 and "yes" or "no",
+        bit.band(b10, 0x80) ~= 0 and "yes" or "no"))
 
     -- body[11]: indoor temperature
     if body_len > 11 then
@@ -307,18 +331,31 @@ local function decode_uart_c0_status(body_tree, buf, body_off, body_len, cmd_id)
         end
     end
 
-    -- body[14]: display state
+    -- body[14]: display state + PMV (Predicted Mean Vote)
     -- *** CONTROVERSY: display ON condition ***
     -- This doc: bits[6:4] == 0x7 → ON
     -- midea-local: bits[6:4] != 0x7 → ON (inverted!) + gated on power
     if body_len > 14 then
         local b14 = buf(body_off + 14, 1):uint()
         local disp_bits = bit.band(bit.rshift(b14, 4), 0x07)
+        local pmv_raw = bit.band(b14, 0x0F)
+        local pmv_str = pmv_raw == 0 and "disabled" or string.format("%.1f", pmv_raw * 0.5 - 3.5)
         body_tree:add(buf(body_off + 14, 1), string.format(
-            "Display bits: 0x%X (%s=ON, %s=ON)   [CONTROVERSIAL: interpretation inverted between sources]",
+            "Display bits: 0x%X (%s=ON, %s=ON), PMV: %s   [CONTROVERSIAL: display interpretation inverted between sources]",
             disp_bits,
             disp_bits == 0x07 and "this-doc" or "midea-local",
-            disp_bits ~= 0x07 and "this-doc=OFF" or "midea-local=OFF"))
+            disp_bits ~= 0x07 and "this-doc=OFF" or "midea-local=OFF",
+            pmv_str))
+    end
+
+    -- body[15]: temperature decimal precision (t1Dot = low nibble, t4Dot = high nibble)
+    if body_len > 15 then
+        local b15 = buf(body_off + 15, 1):uint()
+        local t1_dot = bit.band(b15, 0x0F)
+        local t4_dot = bit.rshift(b15, 4)
+        body_tree:add(buf(body_off + 15, 1), string.format(
+            "Temp decimals: indoor +0.%d, outdoor +0.%d  [tenths of degree]",
+            t1_dot, t4_dot))
     end
 
     -- body[16]: error code
@@ -795,6 +832,31 @@ local function decode_c1_extstate_01(body_tree, buf, body_off, body_len)
 
     body_tree:add(buf(body_off, 2), "Extended State Sub-page: 0x01 (Hypothesis — not in own captures)")
 
+    -- body[2]: device status flags
+    if body_len > 2 then
+        body_tree:add(buf(body_off + 2, 1), string.format(
+            "Device status 1: 0x%02X  b7=newWindMode b6=smartClean b5=sterilize  [Hypothesis]",
+            buf(body_off + 2, 1):uint()))
+    end
+    -- body[3]: device status flags 2
+    if body_len > 3 then
+        body_tree:add(buf(body_off + 3, 1), string.format(
+            "Device status 2: 0x%02X  b5=AC-filter-dirty b4=elecHeat  [Hypothesis]",
+            buf(body_off + 3, 1):uint()))
+    end
+    -- body[4]: run status flags
+    if body_len > 4 then
+        body_tree:add(buf(body_off + 4, 1), string.format(
+            "Run status: 0x%02X  b1=runCurrentStatus b0=deviceCurrentRunStatus  [Hypothesis]",
+            buf(body_off + 4, 1):uint()))
+    end
+    -- body[6]: current run mode
+    if body_len > 6 then
+        local mode = bit.band(buf(body_off + 6, 1):uint(), 0x0F)
+        body_tree:add(buf(body_off + 6, 1), string.format(
+            "Current run mode: %d (%s)  [Hypothesis]", mode, getSerialModeString(mode)))
+    end
+
     if body_len > 10 then
         local v = t16(9)
         if v then body_tree:add(buf(body_off + 9,  2), string.format("T1 indoor coil (evap): %.2f °C  [Hypothesis: 16-bit LE ×0.01]", v)) end
@@ -826,15 +888,64 @@ local function decode_c1_extstate_01(body_tree, buf, body_off, body_len)
             "Outdoor supply voltage (raw AD): 0x%02X  [Hypothesis]",
             buf(body_off + 22, 1):uint()))
     end
+    -- body[17]: Tp discharge pipe temp
+    if body_len > 17 then
+        body_tree:add(buf(body_off + 17, 1), string.format(
+            "Tp discharge temp (raw AD): %d  [Hypothesis]", buf(body_off + 17, 1):uint()))
+    end
+    -- body[18-19]: compressor actual/target frequency
+    if body_len > 18 then
+        body_tree:add(buf(body_off + 18, 1), string.format(
+            "Compressor actual freq: %d Hz  [Hypothesis]", buf(body_off + 18, 1):uint()))
+    end
+    if body_len > 19 then
+        body_tree:add(buf(body_off + 19, 1), string.format(
+            "Compressor target freq: %d Hz  [Hypothesis]", buf(body_off + 19, 1):uint()))
+    end
+    -- body[23]: indoor operating mode
+    if body_len > 23 then
+        body_tree:add(buf(body_off + 23, 1), string.format(
+            "Indoor operating mode: %d  [Hypothesis]", buf(body_off + 23, 1):uint()))
+    end
     if body_len > 26 then
         body_tree:add(buf(body_off + 26, 1), string.format(
             "Indoor fault byte 1: 0x%02X  b0=env-sensor b1=pipe-sensor b2=E2 b3=DC-fan-stall b4=indoor-outdoor-comm b5=smart-eye b6=display-E2 b7=RF-module  [Hypothesis]",
             buf(body_off + 26, 1):uint()))
     end
+    -- body[27-28]: indoor fault bytes 2-3
+    if body_len > 27 then
+        body_tree:add(buf(body_off + 27, 1), string.format(
+            "Indoor fault byte 2: 0x%02X  [Hypothesis]", buf(body_off + 27, 1):uint()))
+    end
+    if body_len > 28 then
+        body_tree:add(buf(body_off + 28, 1), string.format(
+            "Indoor fault byte 3: 0x%02X  [Hypothesis]", buf(body_off + 28, 1):uint()))
+    end
+    -- body[29-30]: freq-limit state bytes
+    if body_len > 29 then
+        body_tree:add(buf(body_off + 29, 1), string.format(
+            "Freq-limit state 1: 0x%02X  [Hypothesis]", buf(body_off + 29, 1):uint()))
+    end
+    if body_len > 30 then
+        body_tree:add(buf(body_off + 30, 1), string.format(
+            "Freq-limit state 2: 0x%02X  [Hypothesis]", buf(body_off + 30, 1):uint()))
+    end
     if body_len > 32 then
         body_tree:add(buf(body_off + 32, 1), string.format(
             "Load state: 0x%02X  b0=defrost b1=aux-heat b6=indoor-fan-run b7=purifier  [Hypothesis]",
             buf(body_off + 32, 1):uint()))
+    end
+    -- body[35-39]: outdoor fault bytes 1-5
+    if body_len > 35 then
+        body_tree:add(buf(body_off + 35, 1), string.format(
+            "Outdoor fault 1: 0x%02X  b0=E2/E51 b1=T3/E52 b2=T4/E53 b3=discharge/E54  [Hypothesis]",
+            buf(body_off + 35, 1):uint()))
+    end
+    -- body[40]: outdoor AC fan state
+    if body_len > 40 then
+        body_tree:add(buf(body_off + 40, 1), string.format(
+            "Outdoor AC fan: 0x%02X  b3=4-way-valve  [Hypothesis]",
+            buf(body_off + 40, 1):uint()))
     end
     if body_len > 41 then
         body_tree:add(buf(body_off + 41, 1), string.format(
@@ -845,6 +956,42 @@ local function decode_c1_extstate_01(body_tree, buf, body_off, body_len)
         body_tree:add(buf(body_off + 42, 1), string.format(
             "EEV position: %d steps  [Hypothesis: raw×8]",
             buf(body_off + 42, 1):uint() * 8))
+    end
+    -- body[43]: outdoor suction temp (raw AD)
+    if body_len > 43 then
+        body_tree:add(buf(body_off + 43, 1), string.format(
+            "Outdoor suction temp (raw AD): %d  [Hypothesis]", buf(body_off + 43, 1):uint()))
+    end
+    -- body[44]: outdoor DC bus voltage (raw AD)
+    if body_len > 44 then
+        body_tree:add(buf(body_off + 44, 1), string.format(
+            "Outdoor DC bus voltage (raw AD): %d  [Hypothesis]", buf(body_off + 44, 1):uint()))
+    end
+    -- body[45]: IPM module temp
+    if body_len > 45 then
+        body_tree:add(buf(body_off + 45, 1), string.format(
+            "IPM module temp: %d  [Hypothesis: raw, may be AD not °C]", buf(body_off + 45, 1):uint()))
+    end
+    -- body[53-54]: dry/heat cleanup timer (16-bit LE)
+    if body_len > 54 then
+        body_tree:add(buf(body_off + 53, 2), string.format(
+            "Dry/heat cleanup timer: %d min  [Hypothesis: 16-bit LE]",
+            buf(body_off + 53, 2):le_uint()))
+    end
+    -- body[55-56]: CO2/TVOC (16-bit LE)
+    if body_len > 56 then
+        body_tree:add(buf(body_off + 55, 2), string.format(
+            "CO2/TVOC: %d  [Hypothesis: 16-bit LE]", buf(body_off + 55, 2):le_uint()))
+    end
+    -- body[57-58]: dust/PM2.5 (16-bit LE)
+    if body_len > 58 then
+        body_tree:add(buf(body_off + 57, 2), string.format(
+            "Dust/PM2.5: %d  [Hypothesis: 16-bit LE]", buf(body_off + 57, 2):le_uint()))
+    end
+    -- body[59]: mainboard humidity
+    if body_len > 59 then
+        body_tree:add(buf(body_off + 59, 1), string.format(
+            "Mainboard humidity: %d %%  [Hypothesis]", buf(body_off + 59, 1):uint()))
     end
     if body_len > 77 then
         body_tree:add(buf(body_off + 77, 1), string.format(
@@ -889,6 +1036,15 @@ local function decode_c1_extstate_02(body_tree, buf, body_off, body_len)
             "Status flags C: 0x%02X  b3=display-on/off b2=self-clean b1=no-direct-wind  [Hypothesis]",
             buf(body_off + 8, 1):uint()))
     end
+    -- body[9-10]: vane swing states
+    if body_len > 9 then
+        body_tree:add(buf(body_off + 9, 1), string.format(
+            "Vane swing 1: 0x%02X  [Hypothesis: UD/LR swing bits]", buf(body_off + 9, 1):uint()))
+    end
+    if body_len > 10 then
+        body_tree:add(buf(body_off + 10, 1), string.format(
+            "Vane swing 2: 0x%02X  [Hypothesis: top vane swing bits]", buf(body_off + 10, 1):uint()))
+    end
     if body_len > 11 then
         body_tree:add(buf(body_off + 11, 1), string.format(
             "Current humidity: %d %%  [Hypothesis]", buf(body_off + 11, 1):uint()))
@@ -897,6 +1053,24 @@ local function decode_c1_extstate_02(body_tree, buf, body_off, body_len)
         body_tree:add(buf(body_off + 12, 1), string.format(
             "Temp setpoint (compensated): %.1f °C  [Hypothesis: (raw-30)×0.5]",
             (buf(body_off + 12, 1):uint() - 30) * 0.5))
+    end
+    -- body[13-14]: indoor fan runtime (16-bit LE, minutes)
+    if body_len > 14 then
+        body_tree:add(buf(body_off + 13, 2), string.format(
+            "Indoor fan runtime: %d min  [Hypothesis: 16-bit LE]",
+            buf(body_off + 13, 2):le_uint()))
+    end
+    -- body[15]: outdoor fan target speed (×8 RPM)
+    if body_len > 15 then
+        body_tree:add(buf(body_off + 15, 1), string.format(
+            "Outdoor fan target: %d RPM  [Hypothesis: raw×8]",
+            buf(body_off + 15, 1):uint() * 8))
+    end
+    -- body[16]: EEV target position (×8 steps)
+    if body_len > 16 then
+        body_tree:add(buf(body_off + 16, 1), string.format(
+            "EEV target: %d steps  [Hypothesis: raw×8]",
+            buf(body_off + 16, 1):uint() * 8))
     end
     if body_len > 17 then
         local step = buf(body_off + 17, 1):uint()
@@ -914,6 +1088,23 @@ local function decode_c1_extstate_02(body_tree, buf, body_off, body_len)
             "Compressor cumulative run time: %d h  [Hypothesis: 16-bit LE]",
             buf(body_off + 21, 2):le_uint()))
     end
+    -- body[24-25]: max/min bus voltage (raw + 60 V)
+    if body_len > 24 then
+        body_tree:add(buf(body_off + 24, 1), string.format(
+            "Max bus voltage (hist): %d V  [Hypothesis: raw+60]",
+            buf(body_off + 24, 1):uint() + 60))
+    end
+    if body_len > 25 then
+        body_tree:add(buf(body_off + 25, 1), string.format(
+            "Min bus voltage (hist): %d V  [Hypothesis: raw+60]",
+            buf(body_off + 25, 1):uint() + 60))
+    end
+    -- body[30]: compressor flux (×8)
+    if body_len > 30 then
+        body_tree:add(buf(body_off + 30, 1), string.format(
+            "Compressor flux: %d  [Hypothesis: raw×8]",
+            buf(body_off + 30, 1):uint() * 8))
+    end
     if body_len > 48 then
         body_tree:add(buf(body_off + 47, 2), string.format(
             "Outdoor unit power: %d W  [Hypothesis: 16-bit LE]",
@@ -929,8 +1120,29 @@ local function decode_c1_extstate_02(body_tree, buf, body_off, body_len)
     end
     if body_len > 57 then
         body_tree:add(buf(body_off + 57, 1), string.format(
-            "Outdoor target compressor frequency: %d  [Hypothesis]",
+            "Outdoor target compressor freq: %d  [Hypothesis]",
             buf(body_off + 57, 1):uint()))
+    end
+    -- body[58]: indoor target fan speed
+    if body_len > 58 then
+        body_tree:add(buf(body_off + 58, 1), string.format(
+            "Indoor target fan speed: %d %%  [Hypothesis]", buf(body_off + 58, 1):uint()))
+    end
+    -- body[67]: second humidity sensor
+    if body_len > 67 then
+        body_tree:add(buf(body_off + 67, 1), string.format(
+            "Second humidity sensor: %d %%  [Hypothesis]", buf(body_off + 67, 1):uint()))
+    end
+    -- body[68]: extended status flags
+    if body_len > 68 then
+        body_tree:add(buf(body_off + 68, 1), string.format(
+            "Extended status: 0x%02X  b5=strong b4=sterilize b3=newWind b2=humidity b1=clean  [Hypothesis]",
+            buf(body_off + 68, 1):uint()))
+    end
+    -- body[69]: wind-free and panel flags
+    if body_len > 69 then
+        body_tree:add(buf(body_off + 69, 1), string.format(
+            "Wind-free/panel: 0x%02X  [Hypothesis]", buf(body_off + 69, 1):uint()))
     end
     if body_len > 1 then
         body_tree:add(buf(body_off + 1, body_len - 1),
@@ -999,11 +1211,15 @@ local function decode_uart_40_set(body_tree, buf, body_off, body_len)
     -- 0x40 Set Command
     body_tree:add(buf(body_off + 0, 1), "Command ID: 0x40 (Set Status)")
 
-    -- body[1]: power + beep
+    -- body[1]: power, beep, resume, child sleep, timer mode, test2
     local b1 = buf(body_off + 1, 1):uint()
-    body_tree:add(buf(body_off + 1, 1), string.format("Power: %s, Beep: %s",
+    body_tree:add(buf(body_off + 1, 1), string.format(
+        "Power: %s, Beep: %s, Resume: %s, ChildSleep: %s, TimerMode: %s",
         bit.band(b1, 0x01) ~= 0 and "ON" or "OFF",
-        bit.band(b1, 0x40) ~= 0 and "yes" or "no"))
+        bit.band(b1, 0x40) ~= 0 and "yes" or "no",
+        bit.band(b1, 0x04) ~= 0 and "yes" or "no",
+        bit.band(b1, 0x08) ~= 0 and "yes" or "no",
+        bit.band(b1, 0x10) ~= 0 and "yes" or "no"))
 
     -- body[2]: mode + temp
     local b2 = buf(body_off + 2, 1):uint()
@@ -1011,25 +1227,63 @@ local function decode_uart_40_set(body_tree, buf, body_off, body_len)
     local temp_int = bit.band(b2, 0x0F) + 16
     local temp_half = bit.band(b2, 0x10) ~= 0
     body_tree:add(buf(body_off + 2, 1), string.format("Mode: %s, Temp: %.1f C",
-        getUartModeString(mode_bits), temp_int + (temp_half and 0.5 or 0)))
+        getSerialModeString(mode_bits), temp_int + (temp_half and 0.5 or 0)))
 
     -- body[3]: fan
     local fan = buf(body_off + 3, 1):uint()
     body_tree:add(buf(body_off + 3, 1), string.format("Fan: %d (%s)",
-        fan, getUartFanString(fan)))
+        fan, getSerialFanString(fan)))
+
+    -- body[4-6]: timer fields
+    if body_len > 6 then
+        local b4 = buf(body_off + 4, 1):uint()
+        local b5 = buf(body_off + 5, 1):uint()
+        local b6 = buf(body_off + 6, 1):uint()
+        local on_en = bit.band(b4, 0x80) ~= 0
+        local on_h = bit.band(bit.rshift(b4, 2), 0x1F)
+        local on_m_hi = bit.band(b4, 0x03)
+        local on_m_lo = bit.rshift(b6, 4)
+        local off_en = bit.band(b5, 0x80) ~= 0
+        local off_h = bit.band(bit.rshift(b5, 2), 0x1F)
+        local off_m_hi = bit.band(b5, 0x03)
+        local off_m_lo = bit.band(b6, 0x0F)
+        body_tree:add(buf(body_off + 4, 3), string.format(
+            "On-timer: %s (%dh%02dm), Off-timer: %s (%dh%02dm)",
+            on_en and "ON" or "off", on_h, on_m_hi * 16 + on_m_lo,
+            off_en and "ON" or "off", off_h, off_m_hi * 16 + off_m_lo))
+    end
 
     -- body[7]: swing
     if body_len > 7 then
         local swing = bit.band(buf(body_off + 7, 1):uint(), 0x0F)
         body_tree:add(buf(body_off + 7, 1), string.format("Swing: %s",
-            getUartSwingString(swing)))
+            getSerialSwingString(swing)))
     end
 
-    -- body[9]: eco (SET uses bit 7 — this is correct for set direction!)
+    -- body[8]: cosy sleep, turbo(loc1), power saver, Follow Me
+    if body_len > 8 then
+        local b8 = buf(body_off + 8, 1):uint()
+        body_tree:add(buf(body_off + 8, 1), string.format(
+            "CosySleep: %d, Save: %s, LowFreqFan: %s, Turbo1: %s, PowerSaver: %s, FollowMe: %s",
+            bit.band(b8, 0x03),
+            bit.band(b8, 0x08) ~= 0 and "yes" or "no",
+            bit.band(b8, 0x10) ~= 0 and "yes" or "no",
+            bit.band(b8, 0x20) ~= 0 and "yes" or "no",
+            bit.band(b8, 0x40) ~= 0 and "yes" or "no",
+            bit.band(b8, 0x80) ~= 0 and "yes" or "no"))
+    end
+
+    -- body[9]: eco + other flags (SET uses bit 7 for ECO — correct for set direction!)
     if body_len > 9 then
         local b9 = buf(body_off + 9, 1):uint()
-        body_tree:add(buf(body_off + 9, 1), string.format("ECO (set): %s",
-            bit.band(b9, 0x80) ~= 0 and "yes" or "no"))
+        body_tree:add(buf(body_off + 9, 1), string.format(
+            "ECO(set): %s, WiseEye: %s, ExchAir: %s, DryClean: %s, PTC: %s, CleanUp: %s",
+            bit.band(b9, 0x80) ~= 0 and "yes" or "no",
+            bit.band(b9, 0x01) ~= 0 and "yes" or "no",
+            bit.band(b9, 0x02) ~= 0 and "yes" or "no",
+            bit.band(b9, 0x04) ~= 0 and "yes" or "no",
+            bit.band(b9, 0x08) ~= 0 and "yes" or "no",
+            bit.band(b9, 0x20) ~= 0 and "yes" or "no"))
     end
 
     -- body[10]: sleep, turbo
@@ -1109,8 +1363,10 @@ local function decode_uart_41_query(body_tree, buf, body_off, body_len)
             body_tree:add(buf(body_off + 3, 1), string.format(
                 "body[3] = 0x%02X", b3))
         end
-    elseif sub == 0x21 then
-        body_tree:add(buf(body_off + 1, 1), "body[1] = 0x21 (Dev-param query sub-command)")
+    elseif sub == 0x21 or bit.band(sub, 0x3F) == 0x21 then
+        local buzzer = bit.band(sub, 0x40) ~= 0
+        body_tree:add(buf(body_off + 1, 1), string.format(
+            "body[1] = 0x%02X (Dev-param query, buzzer=%s)", sub, buzzer and "ON" or "off"))
         if b2 == 0x01 then
             local group = bit.band(b3, 0x0F)
             local page_name = group_page_names[b3] or string.format("Group %d", group)
@@ -1119,14 +1375,37 @@ local function decode_uart_41_query(body_tree, buf, body_off, body_len)
                 "body[3] = 0x%02X → group = body[3] & 0x0F = %d → %s",
                 b3, group, page_name))
         else
+            local OPT_COMMAND_NAMES = {
+                [0x00] = "Sync/Normal Extended",
+                [0x01] = "Follow Me Temperature",
+                [0x02] = "Special Function Key",
+                [0x03] = "Query Extended State",
+                [0x04] = "Installation Position",
+                [0x05] = "Engineering/Test Mode",
+                [0x06] = "Max Freq Limit",
+            }
             local opt = body_len >= 5 and buf(body_off + 4, 1):uint() or 0
+            local opt_name = OPT_COMMAND_NAMES[opt] or string.format("Unknown(0x%02X)", opt)
             body_tree:add(buf(body_off + 2, 1), string.format(
                 "body[2] = 0x%02X (extended query)", b2))
             body_tree:add(buf(body_off + 3, 1), string.format(
                 "body[3] = 0x%02X", b3))
             if body_len >= 5 then
                 body_tree:add(buf(body_off + 4, 1), string.format(
-                    "body[4] = 0x%02X (optCommand)", opt))
+                    "body[4] = 0x%02X (optCommand: %s)", opt, opt_name))
+            end
+            -- Follow Me temperature: optCommand=0x01, body[5] = T*2+50
+            if opt == 0x01 and body_len >= 6 then
+                local fm_raw = buf(body_off + 5, 1):uint()
+                body_tree:add(buf(body_off + 5, 1), string.format(
+                    "body[5] = 0x%02X (Follow Me temp: %.1f °C)", fm_raw, (fm_raw - 50) / 2.0))
+            end
+            -- Extended state query: optCommand=0x03, body[7] = queryStat
+            if opt == 0x03 and body_len >= 8 then
+                local qs = buf(body_off + 7, 1):uint()
+                local qs_names = {[0x00]="Invalid", [0x01]="Exit query", [0x02]="Extended state", [0x03]="Outdoor query"}
+                body_tree:add(buf(body_off + 7, 1), string.format(
+                    "body[7] = 0x%02X (queryStat: %s)", qs, qs_names[qs] or "unknown"))
             end
         end
     elseif sub == 0x61 then
@@ -1173,9 +1452,45 @@ local function decode_uart_93(body_tree, buf, body_off, body_len)
     local b1 = body_len >= 2 and buf(body_off + 1, 1):uint() or 0
     local b2 = body_len >= 3 and buf(body_off + 2, 1):uint() or 0
     local b3 = body_len >= 4 and buf(body_off + 3, 1):uint() or 0
-    body_tree:add(buf(body_off, 1), "Command ID: 0x93 (Ext Status — KJR/R/T bus)")
-    body_tree:add(buf(body_off + 1, math.min(3, body_len - 1)), string.format(
-        "Params: 0x%02X 0x%02X 0x%02X [meaning unknown]", b1, b2, b3))
+
+    -- Direction heuristic: request=23 bytes, response=30 bytes
+    local dir = "?"
+    if body_len == 23 then dir = "Request"
+    elseif body_len == 30 then dir = "Response" end
+
+    body_tree:add(buf(body_off, 1), string.format(
+        "Command ID: 0x93 (Ext Status — KJR/R/T bus, %s, %d bytes)", dir, body_len))
+
+    if dir == "Request" then
+        -- Request: body[1] bit7 may indicate type, body[2]=0x80 fixed, body[3] variant
+        body_tree:add(buf(body_off + 1, 1), string.format(
+            "body[1] = 0x%02X (bit7=%d — type indicator?)  [Hypothesis]",
+            b1, bit.band(bit.rshift(b1, 7), 1)))
+        body_tree:add(buf(body_off + 2, 1), string.format(
+            "body[2] = 0x%02X%s", b2, b2 == 0x80 and " (fixed)" or ""))
+        body_tree:add(buf(body_off + 3, 1), string.format(
+            "body[3] = 0x%02X (variant: %s)  [Hypothesis]", b3,
+            b3 == 0x84 and "status" or b3 == 0x90 and "config" or b3 == 0x04 and "ack" or "unknown"))
+        if body_len > 22 then
+            body_tree:add(buf(body_off + 22, 1), string.format(
+                "body[22] = 0x%02X (MSG_ID)  [Hypothesis]", buf(body_off + 22, 1):uint()))
+        end
+    elseif dir == "Response" then
+        -- Response: body[3] = status code
+        body_tree:add(buf(body_off + 1, 3), string.format(
+            "Params: 0x%02X 0x%02X 0x%02X (status=0x%02X)", b1, b2, b3, b3))
+        -- body[24-27]: 4-zone status
+        if body_len > 27 then
+            body_tree:add(buf(body_off + 24, 4), string.format(
+                "Zone status: 0x%02X 0x%02X 0x%02X 0x%02X (0x80=nominal?)  [Hypothesis]",
+                buf(body_off + 24, 1):uint(), buf(body_off + 25, 1):uint(),
+                buf(body_off + 26, 1):uint(), buf(body_off + 27, 1):uint()))
+        end
+    else
+        body_tree:add(buf(body_off + 1, math.min(3, body_len - 1)), string.format(
+            "Params: 0x%02X 0x%02X 0x%02X", b1, b2, b3))
+    end
+
     if body_len > 4 then
         body_tree:add(buf(body_off + 4, body_len - 4),
             "Payload: " .. tostring(buf(body_off + 4, body_len - 4):bytes()))
@@ -1225,25 +1540,55 @@ end
 
 local function decode_uart_netstatus(body_tree, buf, body_off, body_len, msg_type)
     -- 0x63 Network Status / 0x0D Network Init  (dispatched by msg_type, not body[0])
-    -- body[0] = connection status/sub-command; body[4..7] = IP (byte order TBD — Hypothesis)
-    -- Structure is shared between 0x63 and 0x0D: same field layout observed in own captures.
     local name = msg_type == 0x63 and "Network Status" or "Network Init"
-    -- Note: these frames are dispatched by msg_type; body[0] is a status value, not a cmd_id
+
+    -- body[0]: connection status
     if body_len >= 1 then
         local b0 = buf(body_off, 1):uint()
+        local conn_names = {[0x00]="Disconnected", [0x01]="Connected"}
         body_tree:add(buf(body_off, 1), string.format(
-            "[%s 0x%02X] body[0] = 0x%02X  [Hypothesis: connection status/sub-cmd]",
-            name, msg_type, b0))
+            "[%s] Connection: 0x%02X (%s)", name, b0, conn_names[b0] or "unknown"))
     end
-    if body_len >= 8 then
-        local b4 = buf(body_off + 4, 1):uint()
-        local b5 = buf(body_off + 5, 1):uint()
-        local b6 = buf(body_off + 6, 1):uint()
-        local b7 = buf(body_off + 7, 1):uint()
-        body_tree:add(buf(body_off + 4, 4), string.format(
-            "IP candidate (bytes[4..7]): %d.%d.%d.%d  [Hypothesis: byte order TBD]",
-            b4, b5, b6, b7))
+
+    -- body[1]: WiFi state
+    if body_len >= 2 then
+        local b1 = buf(body_off + 1, 1):uint()
+        local wifi_names = {[0]="Off", [1]="Connected", [3]="SoftAP"}
+        body_tree:add(buf(body_off + 1, 1), string.format(
+            "WiFi state: %d (%s)", b1, wifi_names[b1] or string.format("0x%02X", b1)))
     end
+
+    -- body[2]: WiFi mode
+    if body_len >= 3 then
+        body_tree:add(buf(body_off + 2, 1), string.format(
+            "WiFi mode: 0x%02X", buf(body_off + 2, 1):uint()))
+    end
+
+    -- body[3..6]: IP address
+    if body_len >= 7 then
+        body_tree:add(buf(body_off + 3, 4), string.format(
+            "IP address: %d.%d.%d.%d",
+            buf(body_off + 3, 1):uint(), buf(body_off + 4, 1):uint(),
+            buf(body_off + 5, 1):uint(), buf(body_off + 6, 1):uint()))
+    end
+
+    -- body[8]: signal strength
+    if body_len >= 9 then
+        local sig = buf(body_off + 8, 1):uint()
+        local sig_names = {[0]="Error", [1]="None", [2]="Fair", [3]="Good", [4]="Excellent", [7]="Auto"}
+        body_tree:add(buf(body_off + 8, 1), string.format(
+            "Signal strength: %d (%s)", sig, sig_names[sig] or "unknown"))
+    end
+
+    -- body[16]: connection detail
+    if body_len >= 17 then
+        local cd = buf(body_off + 16, 1):uint()
+        local cd_names = {[0]="None", [1]="WiFi off + DHCP", [2]="Connected no IP", [3]="Fully connected"}
+        body_tree:add(buf(body_off + 16, 1), string.format(
+            "Connection detail: %d (%s)", cd, cd_names[cd] or "unknown"))
+    end
+
+    -- Raw payload for remaining analysis
     if body_len > 1 then
         body_tree:add(buf(body_off, body_len),
             "Raw payload: " .. tostring(buf(body_off, body_len):bytes()))
@@ -1397,50 +1742,182 @@ end
 
 
 local function decode_uart_b0b1_tlv(body_tree, buf, body_off, body_len, cmd_id)
-    -- 0xB0 TLV Set / 0xB1 TLV Response (tag + len + value, repeating)
-    -- body[1]: sub-page or entry count  [Hypothesis]
-    -- TLV entries start at body[2]; each entry = tag(1) + len(1) + val(len bytes)
-    local name = cmd_id == 0xB0 and "TLV Set" or "TLV Response"
+    -- 0xB0 TLV Set / 0xB1 TLV Response — property protocol (newer devices)
+    -- body[0]: 0xB0 or 0xB1
+    -- body[1]: N_props (number of properties)
+    -- body[2..]: property entries, each = prop_id_lo(1) + prop_id_hi(1) + data_len(1) + value(N)
+
+    local PROP_NAMES = {
+        [0x0009] = "wind_swing_ud_angle", [0x000A] = "wind_swing_lr_angle",
+        [0x0015] = "indoor_humidity",     [0x0018] = "no_wind_sense",
+        [0x001A] = "buzzer",              [0x0021] = "cool_hot_sense",
+        [0x0025] = "self_clean",          [0x0030] = "nobody_energy_save",
+        [0x0032] = "wind_straight_avoid", [0x0039] = "smart_eye",
+        [0x0042] = "prevent_straight_wind", [0x0043] = "gentle_wind_sense",
+        [0x0049] = "prevent_super_cool",  [0x004B] = "fresh_air",
+        [0x0090] = "cool_heat_amount",
+        [0x0226] = "auto_prevent_straight_wind",
+        [0x0225] = "temperature_ranges",
+    }
+
+    local n_props = body_len >= 2 and buf(body_off + 1, 1):uint() or 0
+
+    -- Heuristic: query format has body_len ≈ 2 + N_props × 2 (just IDs, no data)
+    -- Response format has body_len > 2 + N_props × 2 (IDs + data_len + value)
+    local is_query = (body_len <= 2 + n_props * 2 + 1)
+    local name
+    if cmd_id == 0xB0 then name = "Property Set"
+    elseif is_query then name = "Property Query"
+    else name = "Property Response" end
+
     body_tree:add(buf(body_off, 1), string.format("Command ID: 0x%02X (%s)", cmd_id, name))
     if body_len >= 2 then
-        body_tree:add(buf(body_off + 1, 1), string.format(
-            "body[1] = 0x%02X  [Hypothesis: sub-page or TLV count]",
-            buf(body_off + 1, 1):uint()))
+        body_tree:add(buf(body_off + 1, 1), string.format("N_props: %d", n_props))
     end
     if body_len <= 2 then return end
+
     local pos = body_off + 2
     local end_off = body_off + body_len
     local tlv_n = 0
-    while pos + 1 < end_off do
-        local tag  = buf(pos, 1):uint()
-        local tlen = buf(pos + 1, 1):uint()
-        if pos + 2 + tlen > end_off then
-            body_tree:add(buf(pos, end_off - pos),
-                string.format("TLV[%d]: tag=0x%02X TRUNCATED (need %d, have %d)",
-                    tlv_n, tag, tlen, end_off - pos - 2))
-            break
-        end
-        if tlen == 0 then
+
+    if is_query then
+        -- Query format: just 2-byte property IDs, no data
+        while pos + 1 < end_off and tlv_n < n_props do
+            local id_lo = buf(pos, 1):uint()
+            local id_hi = buf(pos + 1, 1):uint()
+            local prop_id = id_lo + id_hi * 256
+            local prop_name = PROP_NAMES[prop_id] or string.format("0x%04X", prop_id)
             body_tree:add(buf(pos, 2), string.format(
-                "TLV[%d]: tag=0x%02X len=0 (empty)", tlv_n, tag))
+                "Query[%d] %s (id=0x%02X,0x%02X)", tlv_n, prop_name, id_lo, id_hi))
             pos = pos + 2
-        else
-            body_tree:add(buf(pos, 2 + tlen), string.format(
-                "TLV[%d]: tag=0x%02X len=%d val=%s",
-                tlv_n, tag, tlen, tostring(buf(pos + 2, tlen):bytes())))
-            pos = pos + 2 + tlen
+            tlv_n = tlv_n + 1
         end
-        tlv_n = tlv_n + 1
-        if tlv_n > 64 then
-            if end_off > pos then
-                body_tree:add(buf(pos, end_off - pos), "(truncated — more than 64 TLV entries)")
+        if pos < end_off then
+            body_tree:add(buf(pos, end_off - pos),
+                "Trailing: " .. tostring(buf(pos, end_off - pos):bytes()))
+        end
+    else
+        -- Response/Set format: prop_id(2) + type(1) + data_len(1) + value(N)
+        -- The 'type' byte (byte[2] of each entry) is present in responses;
+        -- observed as 0x00 in all captures. Stride = 4 + data_len.
+        while pos + 3 < end_off and tlv_n < 64 do
+            local id_lo = buf(pos, 1):uint()
+            local id_hi = buf(pos + 1, 1):uint()
+            local prop_id = id_lo + id_hi * 256
+            local ptype = buf(pos + 2, 1):uint()
+            local dlen = buf(pos + 3, 1):uint()
+            local prop_name = PROP_NAMES[prop_id] or string.format("0x%04X", prop_id)
+
+            if pos + 4 + dlen > end_off then
+                body_tree:add(buf(pos, end_off - pos), string.format(
+                    "Prop[%d] %s: TRUNCATED (need %d, have %d)",
+                    tlv_n, prop_name, dlen, end_off - pos - 4))
+                break
             end
-            break
+
+            local val_str
+            if dlen == 0 then
+                val_str = "(empty)"
+            elseif dlen == 1 then
+                val_str = string.format("0x%02X (%d)", buf(pos + 4, 1):uint(), buf(pos + 4, 1):uint())
+            else
+                val_str = tostring(buf(pos + 4, dlen):bytes())
+            end
+
+            body_tree:add(buf(pos, 4 + dlen), string.format(
+                "Prop[%d] %s (id=0x%02X,0x%02X type=%d len=%d): %s",
+                tlv_n, prop_name, id_lo, id_hi, ptype, dlen, val_str))
+            pos = pos + 4 + dlen
+            tlv_n = tlv_n + 1
+        end
+        if tlv_n == 0 and body_len > 2 then
+            body_tree:add(buf(body_off + 2, body_len - 2),
+                "Payload (no valid entries): " .. tostring(buf(body_off + 2, body_len - 2):bytes()))
         end
     end
-    if tlv_n == 0 and body_len > 2 then
-        body_tree:add(buf(body_off + 2, body_len - 2),
-            "Payload (no valid TLV): " .. tostring(buf(body_off + 2, body_len - 2):bytes()))
+end
+
+
+local function decode_uart_b5_capabilities(body_tree, buf, body_off, body_len)
+    -- 0xB5 Capabilities (TLV format, new protocol dataType=0x03)
+    -- body[0]=0xB5, body[1]=record count, body[2..]=TLV records
+    -- Each TLV: cap_id(1) + type(1) + data_len(1) + data(N)
+
+    local CAP_NAMES = {
+        [0x10] = "Fan Speed Control",  [0x12] = "Eco Mode",
+        [0x13] = "Frost Protection",   [0x14] = "Operating Modes",
+        [0x15] = "Swing/Fan Direction", [0x16] = "Power Calculation",
+        [0x17] = "Nest/Filter Check",   [0x18] = "Self Clean",
+        [0x19] = "Aux Electric Heat",   [0x1A] = "Turbo Mode",
+        [0x1C] = "Comfort Sleep",       [0x1F] = "Humidity Control",
+        [0x22] = "Unit Changeable",     [0x24] = "Light/LED Control",
+        [0x25] = "Temperature Ranges",  [0x2C] = "Buzzer",
+        [0x30] = "Body Sense",          [0x32] = "Strong Wind",
+        [0x33] = "Soft Wind",           [0x39] = "Smart Eye",
+        [0x42] = "No Wind Sense",       [0x43] = "Gentle Wind",
+    }
+
+    local CAP_MODE_VALUES = {
+        [0] = "cool+dry+auto (no heat)", [1] = "all four modes",
+        [2] = "heat+auto (no cool/dry)", [3] = "cool only",
+    }
+    local CAP_TURBO_VALUES = {
+        [0] = "cool-only", [1] = "both", [2] = "neither", [3] = "heat-only",
+    }
+
+    body_tree:add(buf(body_off, 1), "Command ID: 0xB5 (Capabilities)")
+    if body_len < 2 then return end
+
+    local count = buf(body_off + 1, 1):uint()
+    body_tree:add(buf(body_off + 1, 1), string.format("Record count: %d", count))
+
+    local pos = body_off + 2
+    local end_off = body_off + body_len
+    local n = 0
+    while pos + 2 < end_off and n < count do
+        local cap_id = buf(pos, 1):uint()
+        local cap_type = buf(pos + 1, 1):uint()
+        local dlen = buf(pos + 2, 1):uint()
+        local cap_name = CAP_NAMES[cap_id] or string.format("0x%02X", cap_id)
+        local type_str = cap_type == 0x00 and "simple" or cap_type == 0x02 and "extended" or string.format("0x%02X", cap_type)
+
+        if pos + 3 + dlen > end_off then
+            body_tree:add(buf(pos, end_off - pos), string.format(
+                "Cap[%d] %s: TRUNCATED", n, cap_name))
+            break
+        end
+
+        local val_str = ""
+        if dlen > 0 then
+            local val = buf(pos + 3, 1):uint()
+            val_str = string.format("val=%d", val)
+            -- Decode known capability values
+            if cap_id == 0x14 then
+                val_str = val_str .. " (" .. (CAP_MODE_VALUES[val] or "?") .. ")"
+            elseif cap_id == 0x1A then
+                val_str = val_str .. " (" .. (CAP_TURBO_VALUES[val] or "?") .. ")"
+            elseif cap_id == 0x10 then
+                val_str = val_str .. (val ~= 1 and " (supported)" or " (NOT supported)")
+            elseif cap_id == 0x22 then
+                val_str = val_str .. (val == 0 and " (changeable)" or " (fixed)")
+            elseif cap_id == 0x25 and dlen >= 6 then
+                -- Temperature ranges: 6 bytes, each × 0.5 = °C
+                local temps = {}
+                for i = 0, 5 do
+                    temps[i+1] = buf(pos + 3 + i, 1):uint() * 0.5
+                end
+                val_str = string.format("cool=%.0f-%.0f, auto=%.0f-%.0f, heat=%.0f-%.0f °C",
+                    temps[1], temps[2], temps[3], temps[4], temps[5], temps[6])
+            end
+            if dlen > 1 and cap_id ~= 0x25 then
+                val_str = val_str .. " raw=" .. tostring(buf(pos + 3, dlen):bytes())
+            end
+        end
+
+        body_tree:add(buf(pos, 3 + dlen), string.format(
+            "Cap[%d] %s (%s): %s", n, cap_name, type_str, val_str))
+        pos = pos + 3 + dlen
+        n = n + 1
     end
 end
 
@@ -1587,7 +2064,7 @@ function hvac_shark_proto.dissector(udp_payload_buffer, pinfo, tree)
         if proto_len >= 10 then
             hdr_tree:add(f.uart_protocol, pbuf(8, 1))
             local msg_type = protocol_buffer(9, 1):uint()
-            local msg_type_str = UART_MSG_TYPES[msg_type] or "Unknown"
+            local msg_type_str = SERIAL_MSG_TYPES[msg_type] or "Unknown"
             hdr_tree:add(f.uart_msg_type, pbuf(9, 1)):append_text(" (" .. msg_type_str .. ")")
         end
 
@@ -1624,9 +2101,9 @@ function hvac_shark_proto.dissector(udp_payload_buffer, pinfo, tree)
                     or msg_type == 0x0D or msg_type == 0x65)
                 local cmd_str
                 if msg_type_dispatched then
-                    cmd_str = UART_MSG_TYPES[msg_type] or string.format("msgtype=0x%02X", msg_type)
+                    cmd_str = SERIAL_MSG_TYPES[msg_type] or string.format("msgtype=0x%02X", msg_type)
                 else
-                    cmd_str = UART_COMMAND_IDS[cmd_id] or string.format("0x%02X", cmd_id)
+                    cmd_str = SERIAL_COMMAND_IDS[cmd_id] or string.format("0x%02X", cmd_id)
                 end
                 pinfo.cols.info:append(" " .. cmd_str)
 
@@ -1659,11 +2136,7 @@ function hvac_shark_proto.dissector(udp_payload_buffer, pinfo, tree)
                 elseif cmd_id == 0xB0 or cmd_id == 0xB1 then
                     decode_uart_b0b1_tlv(body_tree, udp_payload_buffer, body_off, body_len, cmd_id)
                 elseif cmd_id == 0xB5 then
-                    body_tree:add(udp_payload_buffer(body_off, 1), "Command ID: 0xB5 (Capabilities Query/Response)")
-                    if body_len > 1 then
-                        body_tree:add(udp_payload_buffer(body_off + 1, body_len - 1),
-                            "Capability Data: " .. tostring(udp_payload_buffer(body_off + 1, body_len - 1):bytes()))
-                    end
+                    decode_uart_b5_capabilities(body_tree, udp_payload_buffer, body_off, body_len)
                 elseif cmd_id == 0x64 then
                     body_tree:add(udp_payload_buffer(body_off, 1), "Command ID: 0x64 (OTA/Key Trigger)")
                     if body_len > 1 then
@@ -2267,7 +2740,7 @@ function hvac_shark_proto.dissector(udp_payload_buffer, pinfo, tree)
         end
         if proto_len >= 11 then
             local msg_type = protocol_buffer(10, 1):uint()
-            local msg_type_str = UART_MSG_TYPES[msg_type] or "Unknown"
+            local msg_type_str = SERIAL_MSG_TYPES[msg_type] or "Unknown"
             hdr_tree:add(pbuf(10, 1), string.format("Message Type: 0x%02X (%s)", msg_type, msg_type_str))
         end
 
@@ -2298,12 +2771,19 @@ function hvac_shark_proto.dissector(udp_payload_buffer, pinfo, tree)
 
             if body_len > 0 then
                 local cmd_id = udp_payload_buffer(body_off, 1):uint()
-                local cmd_str = UART_COMMAND_IDS[cmd_id] or string.format("Unknown (0x%02X)", cmd_id)
+                local cmd_str = SERIAL_COMMAND_IDS[cmd_id] or string.format("Unknown (0x%02X)", cmd_id)
                 pinfo.cols.info:append(" " .. cmd_str)
 
-                -- Reuse UART body decoders
+                -- Reuse serial protocol body decoders (shared with UART)
                 if cmd_id == 0xC0 then
                     decode_uart_c0_status(body_tree, udp_payload_buffer, body_off, body_len)
+                elseif cmd_id == 0xA0 then
+                    decode_uart_c0_status(body_tree, udp_payload_buffer, body_off, body_len, 0xA0)
+                elseif cmd_id == 0xA1 then
+                    decode_uart_a1_heartbeat(body_tree, udp_payload_buffer, body_off, body_len)
+                elseif cmd_id == 0xA2 or cmd_id == 0xA3
+                        or cmd_id == 0xA5 or cmd_id == 0xA6 then
+                    decode_uart_heartbeat_subpage(body_tree, udp_payload_buffer, body_off, body_len, cmd_id)
                 elseif cmd_id == 0xC1 then
                     decode_uart_c1(body_tree, udp_payload_buffer, body_off, body_len)
                 elseif cmd_id == 0x40 then
@@ -2312,6 +2792,10 @@ function hvac_shark_proto.dissector(udp_payload_buffer, pinfo, tree)
                     decode_uart_41_query(body_tree, udp_payload_buffer, body_off, body_len)
                 elseif cmd_id == 0x93 then
                     decode_uart_93(body_tree, udp_payload_buffer, body_off, body_len)
+                elseif cmd_id == 0xB0 or cmd_id == 0xB1 then
+                    decode_uart_b0b1_tlv(body_tree, udp_payload_buffer, body_off, body_len, cmd_id)
+                elseif cmd_id == 0xB5 then
+                    decode_uart_b5_capabilities(body_tree, udp_payload_buffer, body_off, body_len)
                 else
                     body_tree:add(udp_payload_buffer(body_off, 1),
                         string.format("Command ID: 0x%02X (%s)", cmd_id, cmd_str))

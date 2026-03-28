@@ -6,7 +6,8 @@
 > this specific bus was found. No official Midea specification is publicly available.
 > Confidence levels are stated explicitly per field.
 
-For the relationship to Midea UART, see [protocol_uart.md](protocol_uart.md).
+For the shared command set, see [protocol_serial.md](protocol_serial.md).
+For UART transport framing, see [protocol_uart.md](protocol_uart.md).
 
 ---
 
@@ -117,10 +118,13 @@ responses at byte[2]). Both still produce full-packet sum = 0.
 
 ---
 
-## 5. Relationship to Midea UART
+## 5. Relationship to Midea UART — Serial Protocol Layer
 
-The R/T bus is not a separate protocol — it is Midea UART body commands wrapped in
-HA/HB framing. The header differs by one byte offset:
+The R/T bus is not a separate protocol — it is the shared **serial protocol** body
+commands (see [protocol_uart.md §1.4](protocol_uart.md)) wrapped in HA/HB framing.
+UART and R/T are two transport framings for the same command set.
+
+The header differs by one byte offset:
 
 | Field             | UART offset | R/T bus offset | Difference                          |
 |-------------------|-------------|----------------|-------------------------------------|
@@ -132,8 +136,30 @@ HA/HB framing. The header differs by one byte offset:
 | MSG_TYPE          | 9           | 10             | Shifted                             |
 | Body start        | 10          | 11             | Shifted                             |
 
-The UART body decoders (`0xC0` status, `0xC1` power, `0x41` query, `0x93` status)
-apply directly to R/T frames — adjust body offset from byte[10] to byte[11].
+All serial protocol body decoders apply directly to R/T frames — adjust body offset
+from byte[10] to byte[11].
+
+### 5.1 Observed Frame Types on R/T Bus
+
+Only msg_types `0x02` (Command) and `0x03` (Response) have been observed on R/T.
+The R/T bus carries a **subset** of the serial protocol commands — those relevant
+to the display↔extension-board polling cycle. UART-only frame types (heartbeats
+0xA0-A6, network 0x63/0x0D, device ID 0x07, etc.) have not been seen on R/T.
+
+| body[0] | Direction | Name | Sessions | Frames | serial ref |
+|---------|-----------|------|----------|--------|------------|
+| `0x40` | Request (0xAA) | Set Status | S1,S4,S7,S8,S9 | ~85 | [§3.2](protocol_serial.md) |
+| `0x41` | Request (0xAA) | Query (status + group pages) | S1,S4,S7,S8,S9 | ~1100 | [§3.1](protocol_serial.md) |
+| `0x93` | Request (0xAA) | Extension Board Status | S1,S4,S7,S8,S9 | ~353 | [§3.3](protocol_serial.md) |
+| `0x93` | Response (0x55) | Extension Board Status | S1,S4,S7,S8,S9 | ~351 | [§3.3](protocol_serial.md) |
+| `0xC0` | Response (0x55) | Status Response | S1,S4,S7,S8,S9 | ~477 | [§4.1](protocol_serial.md) |
+| `0xC1` | Response (0x55) | Group 1 (Base Run Info) | S1,S4,S7,S8,S9 | ~253 | [§4.2](protocol_serial.md) |
+| `0xC1` | Response (0x55) | Group 2 (Indoor Device) | S1,S4,S7,S8,S9 | ~242 | [§4.2](protocol_serial.md) |
+| `0xC1` | Response (0x55) | Group 3 (Outdoor Device) | S1,S4,S7,S8,S9 | ~231 | [§4.2](protocol_serial.md) |
+| `0xC1` | Response (0x55) | Group 5 (Extended Params) | S1,S8 | ~16 | [§4.2](protocol_serial.md) |
+| `0xC1` | Response (0x55) | Group 4 (Power) | S8 | 1 | [§4.2](protocol_serial.md) |
+
+Frame counts are approximate totals across Sessions 1-9.
 
 ---
 
@@ -170,4 +196,5 @@ The display polls the extension board in a strict 5-step repeating cycle,
 
 - Own hardware captures: HVAC-shark-dumps repository (Midea extremeSaveBlue, Session 1)
 - Session findings: [findings.md](../../../../HVAC-shark-dumps/Midea-extremeSaveBlue-display/Session%201/findings.md)
-- Midea UART reference (body command set): [protocol_uart.md](protocol_uart.md)
+- Serial protocol (shared command set): [protocol_serial.md](protocol_serial.md)
+- UART transport framing: [protocol_uart.md](protocol_uart.md)
