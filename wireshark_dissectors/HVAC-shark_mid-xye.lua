@@ -19,7 +19,7 @@ f.manufacturer    = ProtoField.uint8 ("hvac_shark.manufacturer",    "Manufacture
 f.bus_type        = ProtoField.uint8 ("hvac_shark.bus_type",        "Bus Type")
 f.header_version  = ProtoField.uint8 ("hvac_shark.header_version",  "Header Version")
 f.logic_channel   = ProtoField.string("hvac_shark.logic_channel",   "Logic Channel")
-f.circuit_board   = ProtoField.string("hvac_shark.circuit_board",   "Circuit Board")
+f.circuit_board   = ProtoField.string("hvac_shark.circuit_board",   "Connected Components")
 f.channel_comment = ProtoField.string("hvac_shark.channel_comment", "Comment")
 -- shared
 f.protocol_type   = ProtoField.string("hvac_shark.protocol_type",   "Protocol")
@@ -1564,12 +1564,12 @@ local function decode_uart_netstatus(body_tree, buf, body_off, body_len, msg_typ
             "WiFi mode: 0x%02X", buf(body_off + 2, 1):uint()))
     end
 
-    -- body[3..6]: IP address
+    -- body[3..6]: IP address (little-endian byte order — confirmed: 04.B3.A8.C0 = 192.168.179.4)
     if body_len >= 7 then
         body_tree:add(buf(body_off + 3, 4), string.format(
             "IP address: %d.%d.%d.%d",
-            buf(body_off + 3, 1):uint(), buf(body_off + 4, 1):uint(),
-            buf(body_off + 5, 1):uint(), buf(body_off + 6, 1):uint()))
+            buf(body_off + 6, 1):uint(), buf(body_off + 5, 1):uint(),
+            buf(body_off + 4, 1):uint(), buf(body_off + 3, 1):uint()))
     end
 
     -- body[8]: signal strength
@@ -1958,18 +1958,20 @@ function hvac_shark_proto.dissector(udp_payload_buffer, pinfo, tree)
 
     -- ── Header version & extended metadata ──────────────────────────────
     local data_offset = 13
+    local channel_direction = nil  -- fromAC / toAC / unknown (parsed from comment tag)
 
     if version == 0x00 then
         subtree:add(f.header_version, udp_payload_buffer(12, 1)):append_text(" (Legacy)")
     elseif version == 0x01 then
         subtree:add(f.header_version, udp_payload_buffer(12, 1)):append_text(" (Extended)")
         local pos = 13
-        -- logicChannel
+        -- logicChannel (stored for info column, appended after direction is known)
         local ch_len = udp_payload_buffer(pos, 1):uint()
+        local channel_name = nil
         pos = pos + 1
         if ch_len > 0 then
+            channel_name = udp_payload_buffer(pos, ch_len):string()
             subtree:add(f.logic_channel, udp_payload_buffer(pos, ch_len))
-            pinfo.cols.info:append(" [" .. udp_payload_buffer(pos, ch_len):string() .. "]")
             pos = pos + ch_len
         end
         -- circuitBoard
@@ -1979,12 +1981,29 @@ function hvac_shark_proto.dissector(udp_payload_buffer, pinfo, tree)
             subtree:add(f.circuit_board, udp_payload_buffer(pos, board_len))
             pos = pos + board_len
         end
-        -- comment
+        -- comment (may contain [fromAC]/[toAC]/[unknown] direction tag)
         local comment_len = udp_payload_buffer(pos, 1):uint()
         pos = pos + 1
         if comment_len > 0 then
+            local comment_str = udp_payload_buffer(pos, comment_len):string()
             subtree:add(f.channel_comment, udp_payload_buffer(pos, comment_len))
+            -- Extract direction tag from comment: [toACmainboard], [fromACmainboard],
+            -- [toACdisplay], [fromACdisplay], [unknown]
+            local dir_match = string.match(comment_str, "%[(%a+)%]")
+            if dir_match then
+                channel_direction = dir_match
+            end
             pos = pos + comment_len
+        end
+        -- Append [channel, direction] to info column
+        if channel_name then
+            local dir_str = channel_direction and channel_direction ~= "unknown"
+                and channel_direction or nil
+            if dir_str then
+                pinfo.cols.info:append(" [" .. channel_name .. ", " .. dir_str .. "]")
+            else
+                pinfo.cols.info:append(" [" .. channel_name .. "]")
+            end
         end
         data_offset = pos
     else
@@ -2709,7 +2728,14 @@ function hvac_shark_proto.dissector(udp_payload_buffer, pinfo, tree)
 
         local start_byte = protocol_buffer(0, 1):uint()
         local is_request = (start_byte == 0xAA)
-        pinfo.cols.info:prepend(is_request and "R/T-REQ " or "R/T-RSP ")
+        -- Direction: from channel_direction tag (set by converter for R/T per-frame),
+        -- or infer from start byte if tag is absent (legacy pcaps)
+        -- 0xAA = bus adapter → display (toACdisplay), 0x55 = display → bus adapter (fromACdisplay)
+        -- Resolve R/T per-frame direction for legacy pcaps without converter tags
+        if channel_direction == nil or channel_direction == "unknown" then
+            channel_direction = is_request and "toACdisplay" or "fromACdisplay"
+        end
+        pinfo.cols.info:prepend(string.format("R/T-%s ", is_request and "REQ" or "RSP"))
 
         local rt_len = proto_len >= 3 and (protocol_buffer(2, 1):uint() + 4) or proto_len
 

@@ -260,6 +260,38 @@ For full field definitions, see **[protocol_serial.md](protocol_serial.md)**.
 On UART, these appear alongside the Wi-Fi dongle's own polling cycle; on R/T they
 are part of the display↔extension-board polling cycle.
 
+### 4.3 UART Wire Direction Validation (Sessions 1-9)
+
+The CN3 connector carries two unidirectional UART wires:
+- **wifiBrown** (dongle TX → display RX): `toACdisplay`
+- **wifiOrange** (display TX → dongle RX): `fromACdisplay`
+
+Direction validation across all 9 sessions (37,579 frames) confirmed that most
+frame types appear on the expected wire. Two frame types are exceptions:
+
+#### Reflected / echoed frames (appear on BOTH wires in equal counts)
+
+| body[0] | Name | wifiBrown (toACdisplay) | wifiOrange (fromACdisplay) | Pattern |
+|---------|------|------------------------|---------------------------|---------|
+| `0xA0` | Heartbeat ACK | S1:4, S5:4, S7:28, S8:12 | S1:4, S4:3, S5:4, S7:28, S8:12 | **Equal counts** |
+| `0xB5` | Capabilities | S1:4, S7:3, S8:9 | S1:4, S7:3, S8:9 | **Equal counts** |
+
+These are handshake-type frames where both sides participate — the ACK and
+capabilities negotiation are echoed on both wires simultaneously.
+
+#### Data heartbeats (one-directional: wifiOrange only)
+
+All data heartbeats (A1 energy, A2-A3 device params, A5 outdoor, A6 network)
+appear **only on wifiOrange** (`fromACdisplay`) as expected — the AC mainboard
+sends them through the display to the dongle.
+
+#### Session 2: UART probe wires swapped
+
+Session 2 had the UART probe wires physically swapped on CN3. This was detected
+by the direction validation (heartbeats appearing on the wrong wire) and corrected
+in `channels.yaml` by swapping the direction values for wifiBrown/wifiOrange.
+After correction, all 9 sessions validate cleanly.
+
 ---
 
 ## 5. UART Frame Examples

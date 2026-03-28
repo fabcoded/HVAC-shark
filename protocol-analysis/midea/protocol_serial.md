@@ -54,49 +54,81 @@ For full source descriptions, see [protocol_uart.md §2](protocol_uart.md).
 
 ## 2. Message Types and Dispatch
 
-### 2.1 Message Types (byte 9 of frame)
+### 2.1 Known Serial Protocol Frames
 
-| msg_type | Direction | Purpose | Bus | Captured | Confidence |
-|----------|-----------|---------|-----|----------|------------|
-| `0x02` | Dongle → Appliance | Command (set): body[0]=0x40, 0xB0 | UART, R/T | ~410 | Confirmed |
-| `0x03` | Appliance → Dongle | Response: body[0]=0xC0, 0xC1, 0xB1, 0xB5 | UART, R/T | ~2925 | Confirmed |
-| `0x04` | Appliance → Dongle | Heartbeats: body[0]=0xA1-0xA6 | UART | ~296 | Confirmed |
-| `0x05` | Appliance → Dongle | Handshake / ACK: body[0]=0xA0 | UART | ~143 | Confirmed |
-| `0x06` | Appliance → Dongle | Status upload (forwarded to cloud as 0x40) | UART | — | Consistent |
-| `0x07` | Bidirectional | Device identification (SN + appliance type) | UART | 3 | Confirmed |
-| `0x0A` | Appliance → Dongle | Error report (forwarded to cloud as 0x44) | UART | — | Consistent |
-| `0x0D` | Dongle → Appliance | Network init / SoftAP init | UART | ~14 | Confirmed |
-| `0x0F` | Appliance → Dongle | Status transport (forwarded to cloud as 0x20) | UART | — | Consistent |
-| `0x11` | Appliance → Dongle | Status transport (same handler as 0x0F) | UART | — | Consistent |
-| `0x13` | Appliance → Dongle | Config data (dongle reads 6 bytes) | UART | — | Consistent |
-| `0x14` | Appliance → Dongle | Accepted (range pair with 0x15) | UART | — | Consistent |
-| `0x15` | Appliance → Dongle | Accepted (triggers reboot) | UART | — | Consistent |
-| `0x16` | Dongle → Appliance | Device event (4-byte data) | UART | — | Consistent |
-| `0x61` | Dongle → Appliance | Time sync | UART | — | Consistent |
-| `0x63` | Dongle → Appliance | Network status report | UART | ~116 | Confirmed |
-| `0x64` | Appliance → Dongle | OTA / key trigger | UART | 2 | Consistent |
-| `0x65` | Bidirectional | RAC serial number query | UART | 2 | Confirmed |
-| `0x68` | Appliance → Dongle | WiFi config (SSID/password) | UART | — | Consistent |
-| `0x6B` | Appliance → Dongle | Passthrough (raw frame forwarded) | UART | — | Consistent |
-| `0x81` | Appliance → Dongle | Ignored (not processed) | UART | — | Consistent |
-| `0x82` | Appliance → Dongle | Mode check | UART | — | Consistent |
-| `0x83` | Appliance → Dongle | Config reset | UART | — | Consistent |
-| `0x84` | Appliance → Dongle | Ignored (not processed) | UART | — | Consistent |
-| `0x85` | Appliance → Dongle | Config response | UART | — | Consistent |
-| `0x87` | Appliance → Dongle | Fixed response (version info) | UART | — | Consistent |
-| `0x90` | Appliance → Dongle | Exception (rejected if LEN <= 0x0B) | UART | — | Consistent |
-| `0x9A` | Dongle → Cloud | WiFi version report (not over UART) | — | — | Consistent |
-| `0xA0` | ? | Proprietary (unknown purpose) | UART | 8 | Observed |
+Frames are identified by the combination of **msg_type** (frame byte 9) and
+**body[0]** (first body byte). Some msg_types carry the command directly in
+body[0]; others are dispatched by msg_type alone (body[0] is payload data,
+not a command ID).
 
-**Captured** = approximate frame count across Sessions 1-9 (37,579 total frames,
-Midea XtremeSaveBlue Q11, valid CRC). **—** = not yet captured on own hardware.
+The **Captured** column shows approximate frame counts from own hardware
+captures (Sessions 1-9, 37,579 total frames, Midea XtremeSaveBlue Q11,
+valid CRC). **—** = not yet captured on own hardware.
 
-Source: mill1000/midea-msmart Finding 13 (see `midea-msmart-mill1000.md`). The
-**Confirmed** types are verified in own captures with valid CRC; **Consistent**
-types are from source code analysis only, not yet captured.
+#### Body[0]-dispatched frames (msg_type 0x02/0x03/0x04/0x05)
 
-**Cloud forwarding** — the dongle forwards certain MSG_TYPEs to the cloud without
-interpreting the body:
+These msg_types multiplex several commands via body[0]:
+
+| msg_type | body[0] | Name | Direction | Bus | Captured | Confidence | Section |
+|----------|---------|------|-----------|-----|----------|------------|---------|
+| `0x02` | `0x40` | Set Status | Dongle→AC | UART, R/T | ~192 | Confirmed | §3.2 |
+| `0x02` | `0xB0` | Property Set (TLV) | Dongle→AC | UART | ~24 | Confirmed | §3.5 |
+| `0x03` | `0xC0` | Status Response | AC→Dongle | UART, R/T | ~507 | Confirmed | §4.1 |
+| `0x03` | `0xC1` | Extended (groups, power) | AC→Dongle | UART, R/T | ~758 | Confirmed | §4.2 |
+| `0x03` | `0xB1` | Property Response | AC→Dongle | UART | ~76 | Confirmed | §3.5 |
+| `0x03` | `0xB5` | Capabilities (TLV) | AC→Dongle ¹ | UART | ~34 | Confirmed | §3.4 |
+| `0x03` | `0x93` | Extension Board Status | Bidir | R/T | ~704 | Confirmed | §3.3 |
+| `0x02` | `0x93` | Extension Board Query | Disp→ExtBd | R/T | ~353 | Confirmed | §3.3 |
+| `0x02` | `0x41` | Query (status/groups) | Dongle→AC | UART, R/T | ~1100 | Confirmed | §3.1 |
+| `0x04` | `0xA1` | Heartbeat (Energy+Temps) | AC→Dongle | UART | ~55 | Confirmed | §5.1 |
+| `0x04` | `0xA2` | Heartbeat (Device Params) | AC→Dongle | UART | ~80 | Confirmed | §5.3 |
+| `0x04` | `0xA3` | Heartbeat (Device Params 2) | AC→Dongle | UART | ~63 | Confirmed | §5.3 |
+| `0x04` | `0xA5` | Heartbeat (Outdoor Unit) | AC→Dongle | UART | ~50 | Confirmed | §5.3 |
+| `0x04` | `0xA6` | Heartbeat (Network Info) | AC→Dongle | UART | ~48 | Confirmed | §5.3 |
+| `0x05` | `0xA0` | Heartbeat ACK (C0-format) | AC→Dongle ¹ | UART | ~115 | Confirmed | §5.3 |
+
+#### msg_type-dispatched frames (body[0] is payload, not command ID)
+
+| msg_type | Name | Direction | Bus | Captured | Confidence | Section |
+|----------|------|-----------|-----|----------|------------|---------|
+| `0x07` | Device ID (SN query) | Bidir | UART | 3 | Confirmed | §5.5 |
+| `0x0D` | Network Init / SoftAP | Dongle→AC | UART | ~14 | Confirmed | §5.4 |
+| `0x63` | Network Status Report | Dongle→AC | UART | ~116 | Confirmed | §5.4 |
+| `0x65` | RAC Serial Number | Bidir | UART | 2 | Confirmed | §5.6 |
+| `0x64` | OTA / Key Trigger | AC→Dongle | UART | 2 | Observed | — |
+| `0xA0` | Proprietary (unknown) | AC→Dongle | UART | 8 | Observed | — |
+
+**¹ Reflected frames**: Heartbeat ACK (0xA0) and Capabilities (0xB5) are observed
+on **both** UART wires in equal counts — they appear on wifiBrown (toACdisplay)
+AND wifiOrange (fromACdisplay) simultaneously. All other heartbeat types (A1-A6)
+are strictly one-directional (wifiOrange only). This suggests ACK and capabilities
+are handshake-type exchanges echoed on both wires. See [protocol_uart.md §4.3](protocol_uart.md)
+for the per-session breakdown.
+
+#### Not yet captured on own hardware
+
+These msg_types are documented from source code analysis (mill1000/midea-msmart
+Finding 13) but have not been observed in own captures:
+
+| msg_type | Name | Direction | Confidence |
+|----------|------|-----------|------------|
+| `0x06` | Status upload (cloud 0x40) | AC→Dongle | Consistent |
+| `0x0A` | Error report (cloud 0x44) | AC→Dongle | Consistent |
+| `0x0F` | Status transport (cloud 0x20) | AC→Dongle | Consistent |
+| `0x11` | Status transport (=0x0F) | AC→Dongle | Consistent |
+| `0x13` | Config data (6 bytes) | AC→Dongle | Consistent |
+| `0x14` | Accepted (pair w/ 0x15) | AC→Dongle | Consistent |
+| `0x15` | Accepted (triggers reboot) | AC→Dongle | Consistent |
+| `0x16` | Device event (4-byte data) | Dongle→AC | Consistent |
+| `0x61` | Time sync | Dongle→AC | Consistent |
+| `0x68` | WiFi config (SSID/password) | AC→Dongle | Consistent |
+| `0x6B` | Passthrough (echo) | AC→Dongle | Consistent |
+| `0x81`–`0x85` | Mode check / config / ignored | AC→Dongle | Consistent |
+| `0x87` | Version info (fixed response) | AC→Dongle | Consistent |
+| `0x90` | Exception (reject LEN≤11) | AC→Dongle | Consistent |
+| `0x9A` | WiFi version (cloud, not UART) | Dongle→Cloud | Consistent |
+
+**Cloud forwarding** — the dongle forwards certain msg_types to the cloud:
 
 | MSG_TYPE received | Cloud packet type | Description |
 |-------------------|-------------------|-------------|
@@ -104,65 +136,38 @@ interpreting the body:
 | 0x05, 0x0A | 0x44 | Error upload |
 | 0x0F, 0x11 | 0x20 | Transport upload |
 
-**Silently ignored / special MSG_TYPEs** (dongle receives but takes no action):
-
-| MSG_TYPE | Behavior | Confidence |
-|----------|----------|------------|
-| `0x12` | Silently ignored | Consistent |
-| `0x6A` | Silently ignored | Consistent |
-| `0x6B` | Echo — frame sent back unchanged (passthrough) | Consistent |
-| `0x71` | Silently ignored | Consistent |
-| `0x81` | Silently ignored | Consistent |
-| `0x84` | Silently ignored | Consistent |
-| `0x90` | Rejected if frame LEN <= 11 | Consistent |
+**Silently ignored** msg_types: `0x12`, `0x6A`, `0x6B` (echo), `0x71`, `0x81`, `0x84`, `0x90` (if LEN≤11).
 
 Source: mill1000/midea-msmart Finding 13 (see `midea-msmart-mill1000.md`).
 
-### 2.1a Observed Body Commands (body[0]) in Own Captures
+### 2.2 Response Dispatch
 
-The table below breaks down which serial protocol commands were observed per bus
-across Sessions 1-9 (37,579 frames, valid CRC, Midea XtremeSaveBlue Q11).
-UART-only types (heartbeats, network, device ID) do not appear on R/T.
-R/T carries only the display↔extension-board polling subset.
+The dissector dispatches incoming frames in two stages: first by **msg_type**
+(frame byte 9), then by **body[0]** for the multiplexed types. Priority is
+msg_type first — if the msg_type has a dedicated handler, body[0] is treated
+as payload data, not a command selector.
 
-| body[0] | Name | UART | R/T | Total | Sessions |
-|---------|------|------|-----|-------|----------|
-| `0xC0` | Status Response | ~30 | ~477 | ~507 | All |
-| `0xC1` | Extended / Group Pages | ~18 | ~740+ | ~758 | All |
-| `0x93` | Extension Board | — | ~704 | ~704 | All (R/T cycle) |
-| `0x40` | Set Status | ~107 | ~85 | ~192 | S1,S4,S7,S8,S9 |
-| `0xA0` | Heartbeat ACK (C0-fmt) | ~115 | — | ~115 | S1,S4,S7,S8,S9 |
-| `0xA2` | Heartbeat (Device) | ~80 | — | ~80 | S1,S4,S7,S8,S9 |
-| `0xB1` | Property Query/Resp | ~76 | — | ~76 | S1, S8 |
-| `0xA3` | Heartbeat (Device 2) | ~63 | — | ~63 | S1,S4,S7,S8,S9 |
-| `0xA1` | Heartbeat (Energy) | ~55 | — | ~55 | S1,S4,S7,S8,S9 |
-| `0xA5` | Heartbeat (Outdoor) | ~50 | — | ~50 | S1,S4,S7,S8,S9 |
-| `0xA6` | Heartbeat (Network) | ~48 | — | ~48 | S1,S4,S7,S8,S9 |
-| `0xB5` | Capabilities (TLV) | ~34 | — | ~34 | S1,S7,S8,S9 |
-| `0xB0` | Property Set (TLV) | ~24 | — | ~24 | S8 |
-
-For per-bus frame type tables, see [protocol_uart.md §4](protocol_uart.md) and
-[protocol_rt.md §5.1](protocol_rt.md).
-
-### 2.2 Response Dispatch (msg_type + body[0])
-
-```
-msg_type 0x02 + body[0] 0xC0 → Status response (§4.1)
-msg_type 0x03 + body[0] 0xB1 → Property response (§3.5)
-msg_type 0x03 + body[0] 0xB5 → Capabilities response (§3.4)
-msg_type 0x03 + body[0] 0xC0 → Status notification (§4.1)
-msg_type 0x03 + body[0] 0xC1 → Extended response (§4.2)
-msg_type 0x04 + body[0] 0xA0 → Heartbeat ACK (§5.3)
-msg_type 0x04 + body[0] 0xA1 → Heartbeat energy/temps (§5.1)
-msg_type 0x04 + body[0] 0xA2 → Heartbeat device params (§5.3)
-msg_type 0x04 + body[0] 0xA3 → Heartbeat device params 2 (§5.3)
-msg_type 0x04 + body[0] 0xA5 → Heartbeat outdoor unit (§5.3)
-msg_type 0x04 + body[0] 0xA6 → Heartbeat network info (§5.3)
-msg_type 0x05 + body[0] 0xA0 → Handshake ACK (§6)
-msg_type 0x07                → Device identification (§5.5)
-msg_type 0x63                → Network status request (§5.4)
-msg_type 0x65                → RAC serial number (§5.6)
-```
+| msg_type | body[0] | Decoder | Section |
+|----------|---------|---------|---------|
+| `0x07` | *(any)* | Device Identification | §5.5 |
+| `0x0D` | *(any)* | Network Init | §5.4 |
+| `0x63` | *(any)* | Network Status | §5.4 |
+| `0x65` | *(any)* | RAC Serial Number | §5.6 |
+| `0x02` | `0x40` | Set Status command | §3.2 |
+| `0x02` | `0x41` | Query command | §3.1 |
+| `0x02` | `0x93` | Extension Board query | §3.3 |
+| `0x02` | `0xB0` | Property Set (TLV) | §3.5 |
+| `0x03` | `0xC0` | Status Response / Notification | §4.1 |
+| `0x03` | `0xC1` | Extended Response (groups, power, ext state) | §4.2 |
+| `0x03` | `0xB1` | Property Response (TLV) | §3.5 |
+| `0x03` | `0xB5` | Capabilities Response (TLV) | §3.4 |
+| `0x03` | `0x93` | Extension Board response | §3.3 |
+| `0x04` | `0xA1` | Heartbeat — Energy + Temperatures | §5.1 |
+| `0x04` | `0xA2` | Heartbeat — Device Params | §5.3 |
+| `0x04` | `0xA3` | Heartbeat — Device Params 2 | §5.3 |
+| `0x04` | `0xA5` | Heartbeat — Outdoor Unit | §5.3 |
+| `0x04` | `0xA6` | Heartbeat — Network Info | §5.3 |
+| `0x05` | `0xA0` | Handshake ACK (C0-format status) | §6 |
 
 ---
 
@@ -1808,11 +1813,21 @@ Source: mill1000/midea-msmart Finding 13 (see `midea-msmart-mill1000.md`). **Con
 | [0] | Connection status | 0x00=not connected, 0x01=connected |
 | [1] | WiFi state | 0=off, 1=connected, 3=SoftAP |
 | [2] | WiFi mode | raw |
-| [3..6] | IP address | 4 bytes, dongle's local IP |
+| [3..6] | IP address | 4 bytes, **little-endian** byte order (see below) |
 | [7] | Fixed | 0xFF |
 | [8] | Signal strength | 0=error, 1=none, 2=fair, 3=good, 4=excellent, 7=auto |
 | [9..15] | DHCP/DNS data | 7 bytes from network subsystem |
 | [16] | Connection detail | 0=none, 1=WiFi off+DHCP, 2=connected no IP, 3=fully connected |
+
+**IP address byte order — Confirmed (Session 7):**
+The IP is stored in **little-endian** (LSB first). Example from own capture:
+```
+body[3..6] = 04 B3 A8 C0
+             ↓  ↓  ↓  ↓
+IP:        192.168.179.4   (read bytes[6].bytes[5].bytes[4].bytes[3])
+```
+This is the dongle's actual local IP on the WiFi network (192.168.179.x subnet).
+Reading as big-endian would give `4.179.168.192` — not a valid local address.
 
 ---
 

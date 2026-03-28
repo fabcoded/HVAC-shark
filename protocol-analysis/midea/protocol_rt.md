@@ -39,12 +39,12 @@ The R/T bus uses **HA/HB framing** — a one-byte-shifted variant of the Midea U
 frame with an added device type byte. The body payload is byte-for-byte compatible
 with Midea UART commands.
 
-### 2.1 Request frame: display -> extension board (start byte `0xAA`)
+### 2.1 Request frame: bus adapter → display (start byte `0xAA`)
 
 ```
 Offset  Field             Value / Description
 ------  -----             -------------------
-  0     START             0xAA  (display -> ext. board)
+  0     START             0xAA  (bus adapter -> display)
   1     DEVICE_TYPE       0xBC  (extension board, constant)
   2     LENGTH            Data length; total frame = byte[2] + 4
   3     APPLIANCE_TYPE    0xAC  (air conditioner)
@@ -60,12 +60,12 @@ Offset  Field             Value / Description
 
 Observed length: 38 bytes (`byte[2]=0x22`), except one 5-byte startup probe.
 
-### 2.2 Response frame: extension board -> display (start byte `0x55`)
+### 2.2 Response frame: display → bus adapter (start byte `0x55`)
 
 ```
 Offset  Field             Value / Description
 ------  -----             -------------------
-  0     START             0x55  (ext. board -> display)
+  0     START             0x55  (display -> bus adapter)
   1     DEVICE_TYPE       0xBC
   2     LENGTH            Data length; total frame = byte[2] + 4
   3     APPLIANCE_TYPE    0xAC
@@ -148,16 +148,16 @@ to the display↔extension-board polling cycle. UART-only frame types (heartbeat
 
 | body[0] | Direction | Name | Sessions | Frames | serial ref |
 |---------|-----------|------|----------|--------|------------|
-| `0x40` | Request (0xAA) | Set Status | S1,S4,S7,S8,S9 | ~85 | [§3.2](protocol_serial.md) |
-| `0x41` | Request (0xAA) | Query (status + group pages) | S1,S4,S7,S8,S9 | ~1100 | [§3.1](protocol_serial.md) |
-| `0x93` | Request (0xAA) | Extension Board Status | S1,S4,S7,S8,S9 | ~353 | [§3.3](protocol_serial.md) |
-| `0x93` | Response (0x55) | Extension Board Status | S1,S4,S7,S8,S9 | ~351 | [§3.3](protocol_serial.md) |
-| `0xC0` | Response (0x55) | Status Response | S1,S4,S7,S8,S9 | ~477 | [§4.1](protocol_serial.md) |
-| `0xC1` | Response (0x55) | Group 1 (Base Run Info) | S1,S4,S7,S8,S9 | ~253 | [§4.2](protocol_serial.md) |
-| `0xC1` | Response (0x55) | Group 2 (Indoor Device) | S1,S4,S7,S8,S9 | ~242 | [§4.2](protocol_serial.md) |
-| `0xC1` | Response (0x55) | Group 3 (Outdoor Device) | S1,S4,S7,S8,S9 | ~231 | [§4.2](protocol_serial.md) |
-| `0xC1` | Response (0x55) | Group 5 (Extended Params) | S1,S8 | ~16 | [§4.2](protocol_serial.md) |
-| `0xC1` | Response (0x55) | Group 4 (Power) | S8 | 1 | [§4.2](protocol_serial.md) |
+| `0x40` | 0xAA toACdisplay | Set Status | S1,S4,S7,S8,S9 | ~85 | [§3.2](protocol_serial.md) |
+| `0x41` | 0xAA toACdisplay | Query (status + group pages) | S1,S4,S7,S8,S9 | ~1100 | [§3.1](protocol_serial.md) |
+| `0x93` | 0xAA toACdisplay | Extension Board query | S1,S4,S7,S8,S9 | ~353 | [§3.3](protocol_serial.md) |
+| `0x93` | 0x55 fromACdisplay | Extension Board response | S1,S4,S7,S8,S9 | ~351 | [§3.3](protocol_serial.md) |
+| `0xC0` | 0x55 fromACdisplay | Status Response | S1,S4,S7,S8,S9 | ~477 | [§4.1](protocol_serial.md) |
+| `0xC1` | 0x55 fromACdisplay | Group 1 (Base Run Info) | S1,S4,S7,S8,S9 | ~253 | [§4.2](protocol_serial.md) |
+| `0xC1` | 0x55 fromACdisplay | Group 2 (Indoor Device) | S1,S4,S7,S8,S9 | ~242 | [§4.2](protocol_serial.md) |
+| `0xC1` | 0x55 fromACdisplay | Group 3 (Outdoor Device) | S1,S4,S7,S8,S9 | ~231 | [§4.2](protocol_serial.md) |
+| `0xC1` | 0x55 fromACdisplay | Group 5 (Extended Params) | S1,S8 | ~16 | [§4.2](protocol_serial.md) |
+| `0xC1` | 0x55 fromACdisplay | Group 4 (Power) | S8 | 1 | [§4.2](protocol_serial.md) |
 
 Frame counts are approximate totals across Sessions 1-9.
 
@@ -165,8 +165,10 @@ Frame counts are approximate totals across Sessions 1-9.
 
 ## 6. Observed Polling Cycle
 
-The display polls the extension board in a strict 5-step repeating cycle,
-~0.198 s between request/response pairs, full cycle every ~5.5 s:
+The bus adapter (wall controller) polls the display in a strict 5-step repeating
+cycle, ~0.198 s between request/response pairs, full cycle every ~5.5 s.
+Requests are 0xAA frames (bus adapter → display), responses are 0x55 frames
+(display → bus adapter):
 
 | Step | Request body cmd | Request params | Response body cmd | Resp frame size | Description          |
 |------|------------------|----------------|-------------------|-----------------|----------------------|
