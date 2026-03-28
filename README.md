@@ -73,6 +73,13 @@ lives in the dumps repository next to the data it processes.
 - **Temperature**: all temperature values are in **°C (Celsius)** unless explicitly
   noted otherwise in the relevant file or field description.
 
+## AI-assisted research
+
+This project doubles as an experiment in using AI tools to consolidate scattered
+reverse-engineering findings — multiple codebases, forum posts, hardware captures —
+into a single cross-referenced protocol reference. All protocol knowledge traces
+back to community work or own captures; AI assists with organisation and validation.
+
 ## Contributing
 
 Contributions are welcome! Please submit a pull request or open an issue to discuss your ideas.
