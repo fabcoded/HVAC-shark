@@ -30,7 +30,7 @@ issue or contact the author directly.
 |-----------|------|-------------|
 | Wireshark Lua dissectors | `wireshark_dissectors/` | Dissects HVAC_shark UDP frames in Wireshark (one per manufacturer family) |
 | ESP32 / Python dongle | `dongle/mid-xye/` | Live-capture firmware + Python serial-to-UDP bridge |
-| Protocol reference docs | `protocol-analysis/` | Reverse-engineered protocol documentation per bus/protocol |
+| Protocol reference docs | `protocol-analysis/<manufacturer>/` | Reverse-engineered protocol documentation per bus/protocol |
 
 ## Currently supported protocols
 
@@ -41,11 +41,12 @@ issue or contact the author directly.
 ## Repository layout
 
 ```
-wireshark_dissectors/   Lua dissector loaded into Wireshark
+wireshark_dissectors/   Lua dissectors loaded into Wireshark (one per manufacturer family)
 dongle/mid-xye/         ESP32 firmware + Python serial-to-UDP bridge
   mid_xye/              Arduino project (PlatformIO)
   py-mid-xye/           Python equivalent bridge
-protocol-analysis/      Protocol reference documents and comparison notes
+protocol-analysis/      Protocol reference documents
+  midea/                Midea family protocols (UART, R/T, XYE, IR, Display-Mainboard)
 ```
 
 ## Companion repository: HVAC-shark-dumps

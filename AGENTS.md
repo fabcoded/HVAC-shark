@@ -6,9 +6,10 @@
 
 ## Project overview
 
-HVAC-shark is an open-source protocol analysis toolkit for Midea HVAC systems.
-It captures, decodes, and dissects the internal communication buses of Midea
-air conditioning units for reverse-engineering and research purposes.
+HVAC-shark is an open-source protocol analysis toolkit for HVAC systems.
+It captures, decodes, and dissects the internal communication buses of air
+conditioning units for reverse-engineering and research purposes. Currently
+focused on Midea/Carrier family protocols.
 
 Components:
 - Wireshark Lua dissector (`wireshark_dissectors/HVAC-shark_mid-xye.lua`)

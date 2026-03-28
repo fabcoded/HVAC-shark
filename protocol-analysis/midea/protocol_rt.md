@@ -169,5 +169,5 @@ The display polls the extension board in a strict 5-step repeating cycle,
 ## References
 
 - Own hardware captures: HVAC-shark-dumps repository (Midea extremeSaveBlue, Session 1)
-- Session findings: [findings.md](../../../HVAC-shark-dumps/Midea-extremeSaveBlue-display/Session%201/findings.md)
+- Session findings: [findings.md](../../../../HVAC-shark-dumps/Midea-extremeSaveBlue-display/Session%201/findings.md)
 - Midea UART reference (body command set): [protocol_uart.md](protocol_uart.md)

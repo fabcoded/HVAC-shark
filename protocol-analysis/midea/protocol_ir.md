@@ -283,8 +283,8 @@ Parameters 0x00–0x08 stepped through sequentially. What each controls is unkno
 ## References
 
 - Own hardware captures: HVAC-shark-dumps repository (Midea extremeSaveBlue, Session 2)
-- Session notes: [SessionNotes.md](../../../HVAC-shark-dumps/Midea-extremeSaveBlue-display/Session%202/SessionNotes.md)
-- Session findings: [findings.md](../../../HVAC-shark-dumps/Midea-extremeSaveBlue-display/Session%202/findings.md)
+- Session notes: [SessionNotes.md](../../../../HVAC-shark-dumps/Midea-extremeSaveBlue-display/Session%202/SessionNotes.md)
+- Session findings: [findings.md](../../../../HVAC-shark-dumps/Midea-extremeSaveBlue-display/Session%202/findings.md)
 - crankyoldgit/IRremoteESP8266 — `src/ir_Midea.h`, `src/ir_Midea.cpp`
 - ESPHome midea component — `esphome/components/midea/ir_transmitter.h`
 - IRremoteESP8266 protocol spreadsheet: https://docs.google.com/spreadsheets/d/1TZh4jWrx4h9zzpYUI9aYXMl1fYOiqu-xVuOOMqagxrs/
