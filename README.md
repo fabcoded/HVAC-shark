@@ -1,8 +1,10 @@
 # HVAC-shark
 
-Open-source protocol analysis toolkit for Midea HVAC systems. Captures, decodes,
-and dissects the internal communication buses of Midea air conditioning units for
-reverse-engineering and research purposes.
+Open-source protocol analysis toolkit for HVAC systems. Captures, decodes,
+and dissects the internal communication buses of air conditioning units for
+reverse-engineering and research purposes. Currently focused on Midea/Carrier
+family protocols, with the architecture designed to support additional
+manufacturers.
 
 ## Disclaimer and intended use
 
@@ -13,10 +15,9 @@ property damage. The author is not responsible for any harm or damage resulting
 from the use of this code.
 
 **Brand names and trademarks**: Any manufacturer, product, or model names mentioned
-in this repository (including but not limited to "Midea" and associated product
-lines) are used solely to identify the hardware under test. Their use is purely
-descriptive — to specify which physical device was captured — and does not imply
-affiliation, endorsement, or any commercial relationship with the respective
+in this repository are used solely to identify the hardware under test. Their use is
+purely descriptive — to specify which physical device was captured — and does not
+imply affiliation, endorsement, or any commercial relationship with the respective
 trademark holders. All trademarks remain the property of their respective owners.
 
 This repository aggregates publicly available information for research and debugging
@@ -27,13 +28,15 @@ issue or contact the author directly.
 
 | Component | Path | Description |
 |-----------|------|-------------|
-| Wireshark Lua dissector | `wireshark_dissectors/` | Dissects HVAC_shark UDP frames in Wireshark |
+| Wireshark Lua dissectors | `wireshark_dissectors/` | Dissects HVAC_shark UDP frames in Wireshark (one per manufacturer family) |
 | ESP32 / Python dongle | `dongle/mid-xye/` | Live-capture firmware + Python serial-to-UDP bridge |
-| Protocol reference docs | `protocol-analysis/` | Reverse-engineered protocol documentation |
+| Protocol reference docs | `protocol-analysis/` | Reverse-engineered protocol documentation per bus/protocol |
 
 ## Currently supported protocols
 
 - **mid-xye** — Midea XYE RS-485 inter-unit bus (4800 baud, 16/32-byte frames)
+  - Includes UART (WiFi module ↔ mainboard), R/T (indoor ↔ outdoor extension board),
+    Display–Mainboard internal bus, and IR remote protocols
 
 ## Repository layout
 

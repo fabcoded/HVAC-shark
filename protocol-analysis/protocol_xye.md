@@ -206,7 +206,7 @@ temperature push (room temperature, not a user-set command) and requests a full
 state echo. This is analogous to the UART `body[8] bit 7 = 0x80` enable flag
 in 0x40 Set.
 
-**UART parallel (from mill1000/Finding 10, Authoritative):**
+**UART parallel** (mill1000/midea-msmart Finding 10, see `midea-msmart-mill1000.md`):
 
 | UART Follow-Me | XYE equivalent |
 |----------------|----------------|

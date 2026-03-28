@@ -1898,82 +1898,333 @@ function hvac_shark_proto.dissector(udp_payload_buffer, pinfo, tree)
         -- ══════════════════════════════════════════════════════════════════
         -- ── DISPLAY ↔ MAINBOARD INTERNAL BUS ─────────────────────────────
         -- ══════════════════════════════════════════════════════════════════
-        -- Frame structure (confirmed, all 8 frame types, 50 samples each):
-        --   byte[0]    = 0xAA  (start, excluded from checksum)
+        -- Frame structure (confirmed across 25,832 frames, 8 sessions):
+        --   byte[0]    = 0xAA  (start)
         --   byte[1]    = type  (0x20/0x30/0x31/0x50/0xFF)
         --   byte[2]    = total frame length (includes all bytes 0..N-1)
-        --   byte[3..N-2] = payload
+        --   byte[3..N-3] = payload
+        --   byte[N-2]  = CRC-8/MAXIM over bytes[0..N-3]  (same table as UART CRC-8)
         --   byte[N-1]  = checksum = (256 - sum(frame[1..N-2])) & 0xFF
-        -- See protocol_mainboard.md for full type inventory and payload notes.
+        --
+        -- Direction by length for type 0x20:
+        --   36 bytes = Grey (display -> mainboard request)
+        --   29 bytes = Blue (mainboard -> display response)
+        -- See protocol_mainboard.md for full specification.
         subtree:add(f.protocol_type, "Display-Mainboard Internal Bus")
 
-        -- Identify frame type and direction label
         local frame_type = byte1
-        local type_names = {
-            [0x20] = "0x20 Status Poll",
-            [0x30] = "0x30 Extended Query A",
-            [0x31] = "0x31 Extended Query B",
-            [0x50] = "0x50 Rare/Init",
-            [0xFF] = "0xFF Anomalous",
-        }
-        local type_label = type_names[frame_type] or string.format("0x%02X Unknown", frame_type)
 
-        -- Direction hint based on length (query vs response)
-        local dir_hint = ""
-        if proto_len == 29 or proto_len == 10 or proto_len == 32 or proto_len == 21 then
-            dir_hint = " [Query?]"
-        elseif proto_len == 36 or proto_len == 64 then
-            dir_hint = " [Response?]"
+        -- ── Mainboard lookup tables ─────────────────────────────────────
+        local MB_MODE_NAMES = {
+            [0] = "Cool", [1] = "Dry", [2] = "Fan", [3] = "Heat", [4] = "Auto",
+            [5] = "Initializing",
+        }
+        local MB_FAN_NAMES = {
+            [0] = "Stopped", [1] = "Idle", [20] = "Silent", [23] = "Heat warm-up",
+            [40] = "Low", [60] = "Medium", [80] = "High",
+            [100] = "Max", [102] = "Auto", [103] = "Heat full",
+        }
+
+        local function getMbModeString(m)
+            return MB_MODE_NAMES[m] or string.format("Unknown(%d)", m)
+        end
+        local function getMbFanString(f_val)
+            return MB_FAN_NAMES[f_val] or string.format("%d", f_val)
         end
 
-        pinfo.cols.info:prepend(string.format("DISP-MB %s%s ", type_label, dir_hint))
+        -- ── Direction and type label ────────────────────────────────────
+        local type_names = {
+            [0x20] = "Status",
+            [0x30] = "Telemetry",
+            [0x31] = "Config",
+            [0x50] = "Boot Init",
+            [0xFF] = "Bus Sync",
+        }
+        local type_label = type_names[frame_type] or string.format("0x%02X", frame_type)
 
+        -- Direction: Grey = display->mainboard (request), Blue = mainboard->display (response)
+        local direction
+        if frame_type == 0x20 then
+            if proto_len == 36 then direction = "Grey"    -- display -> mainboard
+            elseif proto_len == 29 then direction = "Blue" -- mainboard -> display
+            end
+        elseif frame_type == 0x30 then
+            if proto_len == 10 then direction = "Grey" else direction = "Blue" end
+        elseif frame_type == 0x31 then
+            if proto_len == 32 then direction = "Grey" else direction = "Blue" end
+        elseif frame_type == 0x50 then
+            if proto_len == 21 then direction = "Grey" else direction = "Blue" end
+        end
+        local dir_label = direction or "?"
+        local dir_arrow = direction == "Grey" and "Disp->MB" or
+                          direction == "Blue" and "MB->Disp" or "?"
+
+        -- ── Build info column summary ───────────────────────────────────
+        local info_summary = string.format("DISP-MB %s %s ", type_label, dir_label)
+
+        -- ── Frame tree ──────────────────────────────────────────────────
         local frame_tree = subtree:add(pbuf(0, proto_len),
-            string.format("Internal Bus Frame: type=%s len=%d%s", type_label, proto_len, dir_hint))
+            string.format("Internal Bus: %s %s (%s) len=%d",
+                type_label, dir_label, dir_arrow, proto_len))
 
-        frame_tree:add(pbuf(0, 1), string.format("Start: 0x%02X", protocol_buffer(0, 1):uint()))
-        frame_tree:add(pbuf(1, 1), string.format("Frame Type: %s", type_label))
+        frame_tree:add(pbuf(0, 1), string.format("Start: 0xAA"))
+        frame_tree:add(pbuf(1, 1), string.format("Frame Type: 0x%02X (%s)", frame_type, type_label))
 
         if proto_len >= 3 then
             local pkt_len = protocol_buffer(2, 1):uint()
-            local len_match = (pkt_len == proto_len)
+            local len_ok = (pkt_len == proto_len)
             frame_tree:add(pbuf(2, 1), string.format("Length: %d %s",
-                pkt_len, len_match and "(valid)" or
+                pkt_len, len_ok and "(valid)" or
                 string.format("(MISMATCH: frame=%d)", proto_len)))
+        end
 
-            -- Payload bytes [3..N-2]
-            if proto_len >= 4 then
-                local pay_tree = frame_tree:add(pbuf(3, proto_len - 4),
-                    string.format("Payload (%d bytes)", proto_len - 4))
-                for i = 3, proto_len - 2 do
-                    local bval = protocol_buffer(i, 1):uint()
-                    local note = ""
-                    -- Annotate known/hypothetical fields
-                    if frame_type == 0x20 and proto_len == 36 and i == 4 then
-                        note = string.format(" [Tp? direct degC = %d, Hypothesis]", bval)
-                    elseif frame_type == 0x31 and proto_len == 64 and i == 4 then
-                        note = string.format(" [Tp? direct degC = %d, Hypothesis]", bval)
-                    elseif frame_type == 0x30 and proto_len == 64 and i == 3 then
-                        note = string.format(" [Sub-type/cmd 0x%02X]", bval)
-                    end
-                    pay_tree:add(pbuf(i, 1), string.format("[%d] 0x%02X%s", i, bval, note))
+        -- ── Type 0x20 Grey: Display -> Mainboard request (36 bytes) ────
+        if frame_type == 0x20 and proto_len == 36 then
+            local pay_tree = frame_tree:add(pbuf(3, 31), "Control Request (Grey)")
+
+            local mode = protocol_buffer(3, 1):uint()
+            pay_tree:add(pbuf(3, 1), string.format("Mode: %d (%s)",
+                mode, getMbModeString(mode)))
+
+            local temp_raw = protocol_buffer(4, 1):uint()
+            local temp_c = (temp_raw - 30) / 2.0
+            pay_tree:add(pbuf(4, 1), string.format("Set Temp: %.1f C (raw: %d)",
+                temp_c, temp_raw))
+
+            local fan = protocol_buffer(5, 1):uint()
+            pay_tree:add(pbuf(5, 1), string.format("Fan Speed: %d (%s)",
+                fan, getMbFanString(fan)))
+
+            local flags = protocol_buffer(9, 1):uint()
+            local power = bit.band(bit.rshift(flags, 6), 1)
+            local h_swing = bit.band(bit.rshift(flags, 4), 1)
+            local v_swing = bit.band(bit.rshift(flags, 2), 1)
+            pay_tree:add(pbuf(9, 1), string.format(
+                "Flags: 0x%02X  Power=%s  H-Swing=%s  V-Swing=%s",
+                flags, power == 1 and "ON" or "OFF",
+                h_swing == 1 and "ON" or "OFF",
+                v_swing == 1 and "ON" or "OFF"))
+
+            local counter = protocol_buffer(16, 1):uint()
+            pay_tree:add(pbuf(16, 1), string.format("Counter: 0x%02X  [H-05]", counter))
+
+            if proto_len > 21 then
+                local vane = protocol_buffer(21, 1):uint()
+                local h_vane = bit.rshift(vane, 4)
+                local v_vane = bit.band(vane, 0x0F)
+                if vane ~= 0 then
+                    pay_tree:add(pbuf(21, 1), string.format(
+                        "Vane Position: 0x%02X  H=%d V=%d  [H-06]", vane, h_vane, v_vane))
                 end
             end
 
-            -- Checksum verification
-            if proto_len >= 2 then
-                local ck_byte = protocol_buffer(proto_len - 1, 1):uint()
-                local ck_sum = 0
-                for i = 1, proto_len - 2 do
-                    ck_sum = ck_sum + protocol_buffer(i, 1):uint()
+            -- Info column summary
+            info_summary = string.format("DISP-MB %s Grey  %s %.0fC %s  Pwr=%s",
+                type_label, getMbModeString(mode), temp_c,
+                getMbFanString(fan), power == 1 and "ON" or "OFF")
+
+        -- ── Type 0x20 Blue: Mainboard -> Display response (29 bytes) ───
+        elseif frame_type == 0x20 and proto_len == 29 then
+            local pay_tree = frame_tree:add(pbuf(3, 24), "Status Response (Blue)")
+
+            local mode = protocol_buffer(3, 1):uint()
+            pay_tree:add(pbuf(3, 1), string.format("Mode: %d (%s)",
+                mode, getMbModeString(mode)))
+
+            local actual_fan = protocol_buffer(5, 1):uint()
+            pay_tree:add(pbuf(5, 1), string.format("Actual Fan: %d (%s)",
+                actual_fan, getMbFanString(actual_fan)))
+
+            if proto_len > 13 then
+                local status_flag = protocol_buffer(13, 1):uint()
+                pay_tree:add(pbuf(13, 1), string.format("Status Flag: 0x%02X  [H-09]",
+                    status_flag))
+            end
+
+            if proto_len > 19 then
+                local ready = protocol_buffer(19, 1):uint()
+                pay_tree:add(pbuf(19, 1), string.format("Ready: 0x%02X (%s)  [H-10]",
+                    ready, ready == 0xFF and "Ready" or
+                    ready == 0x00 and "Booting" or "Unknown"))
+            end
+
+            -- Info column summary
+            info_summary = string.format("DISP-MB %s Blue  %s  Fan=%s",
+                type_label, getMbModeString(mode), getMbFanString(actual_fan))
+
+        -- ── Type 0x30 Grey: Telemetry query (10 bytes) ─────────────────
+        elseif frame_type == 0x30 and proto_len == 10 then
+            frame_tree:add(pbuf(3, 5), "Telemetry Query (fixed)")
+            info_summary = string.format("DISP-MB %s Grey  Query", type_label)
+
+        -- ── Type 0x30 Blue: Telemetry response (64 bytes) ──────────────
+        elseif frame_type == 0x30 and proto_len == 64 then
+            local pay_tree = frame_tree:add(pbuf(3, 59), "Telemetry Response")
+
+            local sub_type = protocol_buffer(3, 1):uint()
+            pay_tree:add(pbuf(3, 1), string.format("Sub-type: 0x%02X  [H-11]", sub_type))
+
+            -- Outdoor temperature: raw / 2.0 °C
+            -- Cross-bus validated: 488 pairs vs R/T outdoor, avg_diff=0.88°C, 93.8% within 2°C
+            if proto_len > 4 then
+                local outdoor_raw = protocol_buffer(4, 1):uint()
+                local outdoor_c = outdoor_raw / 2.0
+                pay_tree:add(pbuf(4, 1), string.format(
+                    "Outdoor Temp: %.1f °C (raw: %d, encoding: raw/2)",
+                    outdoor_c, outdoor_raw))
+            end
+
+            -- Temperature candidates [T?] — require UART A1 heartbeat for validation
+            -- byte[6]: small range 2-20, varies across sessions. Unknown encoding.
+            if proto_len > 6 then
+                local t6 = protocol_buffer(6, 1):uint()
+                pay_tree:add(pbuf(6, 1), string.format(
+                    "Byte[6]: %d  [T? unknown encoding, range 2-20]", t6))
+            end
+
+            -- byte[11]: 0 when cold, 40-88 during active heating — likely compressor
+            -- discharge pipe temp (Tp). Encoding candidate: direct °C
+            if proto_len > 11 then
+                local t11 = protocol_buffer(11, 1):uint()
+                pay_tree:add(pbuf(11, 1), string.format(
+                    "Byte[11]: %d  [T? discharge pipe temp? direct °C]", t11))
+            end
+
+            -- Appliance type and protocol version [H-13]
+            if proto_len > 17 then
+                local app_type = protocol_buffer(16, 1):uint()
+                local proto_ver = protocol_buffer(17, 1):uint()
+                pay_tree:add(pbuf(16, 2), string.format(
+                    "Appliance: 0x%02X (%s)  Proto ver: %d  [H-13]",
+                    app_type, app_type == 0xAC and "Air Conditioner" or
+                    string.format("Unknown(0x%02X)", app_type), proto_ver))
+            end
+
+            -- byte[19]: 0 when compressor off, rises during operation (0-145)
+            if proto_len > 19 then
+                local t19 = protocol_buffer(19, 1):uint()
+                if t19 > 0 then
+                    pay_tree:add(pbuf(19, 1), string.format(
+                        "Byte[19]: %d  [T? compressor-related, 0=off]", t19))
                 end
-                local ck_computed = (256 - (ck_sum % 256)) % 256
-                local ck_ok = (ck_byte == ck_computed)
-                frame_tree:add(pbuf(proto_len - 1, 1), string.format(
-                    "Checksum: 0x%02X %s (computed 0x%02X)",
-                    ck_byte, ck_ok and "(valid)" or "*** INVALID ***", ck_computed))
+            end
+
+            -- byte[45]: mostly 0, peaks to 59 during sustained heating
+            if proto_len > 45 then
+                local t45 = protocol_buffer(45, 1):uint()
+                if t45 > 0 then
+                    pay_tree:add(pbuf(45, 1), string.format(
+                        "Byte[45]: %d  [T? heat-related, 0=idle]", t45))
+                end
+            end
+
+            -- Show remaining payload as hex dump (skip already-decoded bytes)
+            local decoded_bytes = {[3]=1, [4]=1, [6]=1, [11]=1, [16]=1, [17]=1, [19]=1, [45]=1}
+            if proto_len > 5 then
+                local rem_tree = pay_tree:add(pbuf(5, proto_len - 5 - 2),
+                    string.format("Remaining payload (%d bytes)", proto_len - 5 - 2))
+                for i = 5, proto_len - 3 do
+                    if not decoded_bytes[i] then
+                        local bval = protocol_buffer(i, 1):uint()
+                        if bval ~= 0 then
+                            rem_tree:add(pbuf(i, 1), string.format("[%d] 0x%02X (%d)", i, bval, bval))
+                        end
+                    end
+                end
+            end
+
+            info_summary = string.format("DISP-MB %s Blue  sub=0x%02X  Out=%.1f°C",
+                type_label, sub_type,
+                proto_len > 4 and protocol_buffer(4, 1):uint() / 2.0 or 0)
+
+        -- ── Type 0x31 Grey: Config query (32 bytes) ────────────────────
+        elseif frame_type == 0x31 and proto_len == 32 then
+            frame_tree:add(pbuf(3, 27), "Config Query (all-zeros)")
+            info_summary = string.format("DISP-MB %s Grey  Query", type_label)
+
+        -- ── Type 0x31 Blue: Config response (64 bytes) ─────────────────
+        elseif frame_type == 0x31 and proto_len == 64 then
+            local pay_tree = frame_tree:add(pbuf(3, 59), "Config Response")
+
+            if proto_len > 4 then
+                local temp_raw = protocol_buffer(4, 1):uint()
+                local temp_c = (temp_raw - 30) / 2.0
+                pay_tree:add(pbuf(4, 1), string.format(
+                    "Setpoint echo: %.1f °C (raw: %d)  [H-14]", temp_c, temp_raw))
+            end
+
+            -- Stored outdoor temperature: (raw - 40) / 2.0 °C
+            -- Cross-bus matched: 487 pairs vs R/T outdoor, avg_diff=0.93°C
+            -- Constant within sessions — likely a stored/config value, not live sensor
+            if proto_len > 5 then
+                local out_raw = protocol_buffer(5, 1):uint()
+                local out_c = (out_raw - 40) / 2.0
+                pay_tree:add(pbuf(5, 1), string.format(
+                    "Stored outdoor temp: %.1f °C (raw: %d, encoding: (r-40)/2)  [cross-bus candidate]",
+                    out_c, out_raw))
+            end
+
+            -- Show non-zero payload bytes
+            local rem_tree = pay_tree:add(pbuf(6, proto_len - 6 - 2),
+                string.format("Remaining payload (%d bytes)", proto_len - 6 - 2))
+            for i = 6, proto_len - 3 do
+                local bval = protocol_buffer(i, 1):uint()
+                if bval ~= 0 then
+                    rem_tree:add(pbuf(i, 1), string.format("[%d] 0x%02X (%d)", i, bval, bval))
+                end
+            end
+
+            info_summary = string.format("DISP-MB %s Blue  Config  Set=%.1f°C",
+                type_label,
+                proto_len > 4 and (protocol_buffer(4, 1):uint() - 30) / 2.0 or 0)
+
+        -- ── Type 0x50: Boot Init ────────────────────────────────────────
+        elseif frame_type == 0x50 then
+            local label = proto_len == 21 and "Boot Init Query  [H-16]" or
+                          "Boot Init Response  [H-16]"
+            frame_tree:add(pbuf(3, proto_len - 5), label)
+            info_summary = string.format("DISP-MB %s %s  BOOT", type_label, dir_label)
+
+        -- ── Type 0xFF: Bus Sync ─────────────────────────────────────────
+        elseif frame_type == 0xFF then
+            frame_tree:add(pbuf(3, proto_len - 5), "Bus Sync Handshake  [H-15]")
+            info_summary = string.format("DISP-MB %s  SYNC", type_label)
+
+        -- ── Unknown frame types: show raw payload ───────────────────────
+        else
+            if proto_len >= 5 then
+                local pay_tree = frame_tree:add(pbuf(3, proto_len - 5),
+                    string.format("Payload (%d bytes)", proto_len - 5))
+                for i = 3, proto_len - 3 do
+                    local bval = protocol_buffer(i, 1):uint()
+                    pay_tree:add(pbuf(i, 1), string.format("[%d] 0x%02X", i, bval))
+                end
             end
         end
+
+        -- ── CRC-8/MAXIM verification (byte[N-2]) ───────────────────────
+        -- Same polynomial as UART CRC-8 (table CRC8_TABLE), but computed
+        -- over bytes[0..N-3] (includes 0xAA start byte).
+        if proto_len >= 4 then
+            local crc_byte = protocol_buffer(proto_len - 2, 1):uint()
+            local crc_calc = uart_crc8(udp_payload_buffer, data_offset, proto_len - 2)
+            local crc_ok = (crc_byte == crc_calc)
+            frame_tree:add(pbuf(proto_len - 2, 1), string.format(
+                "CRC-8: 0x%02X %s (computed 0x%02X)",
+                crc_byte, crc_ok and "(valid)" or "*** INVALID ***", crc_calc))
+        end
+
+        -- ── Additive checksum verification (byte[N-1]) ─────────────────
+        if proto_len >= 3 then
+            local ck_byte = protocol_buffer(proto_len - 1, 1):uint()
+            local ck_computed = uart_checksum(udp_payload_buffer, data_offset + 1, data_offset + proto_len - 2)
+            local ck_ok = (ck_byte == ck_computed)
+            frame_tree:add(pbuf(proto_len - 1, 1), string.format(
+                "Checksum: 0x%02X %s (computed 0x%02X)",
+                ck_byte, ck_ok and "(valid)" or "*** INVALID ***", ck_computed))
+        end
+
+        pinfo.cols.info:prepend(info_summary .. " ")
 
         subtree:add(pbuf(0, proto_len), "Raw Frame: " .. tostring(protocol_buffer:bytes()))
 

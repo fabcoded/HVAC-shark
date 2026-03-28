@@ -155,9 +155,9 @@ and **body[2]** (variant selector). Do not conflate with the 0x40 set command.
 | body[1] | body[2] | body[3] | Name | Expected response |
 |---------|---------|---------|------|-------------------|
 | `0x81` | `0x00` | `0xFF` | **Status query** | `0xC0` status response |
-| `0x81` | `0x01` | page ID | **Group dev-param query** (Finding 11) | `0xC1` group page response |
+| `0x81` | `0x01` | page ID | **Group dev-param query** (mill1000/midea-msmart Finding 11) | `0xC1` group page response |
 | `0x21` | `0x01` | `0x44` | **Power usage query** (Group 4) | `0xC1` Group 4 power response (BCD) |
-| `0x21` | varies | varies | **Extended query** (optCommand, see mill1000/midea-msmart) | `0xC1` extended state |
+| `0x21` | varies | varies | **Extended query** (mill1000/midea-msmart Finding 7, see `midea-msmart-mill1000.md`) | `0xC1` extended state |
 | `0x61` | `0x00` | `0xFF` | **Display toggle** | — |
 
 ### Body layout — note on bus path differences
@@ -604,34 +604,37 @@ MODE_COOL      = 2   # 0b010  (0x40)
 MODE_DRY       = 3   # 0b011  (0x60)
 MODE_HEAT      = 4   # 0b100  (0x80)
 MODE_FAN_ONLY  = 5   # 0b101  (0xA0)
-MODE_SMART_DRY = 6   # 0b110  (0xC0) — confirmed by mill1000/midea-msmart (BYTE_MODE_SMART_DRY)
+MODE_SMART_DRY = 6   # 0b110  (0xC0) — confirmed (BYTE_MODE_SMART_DRY)
 ```
 All six values are confirmed consistent between `protocol_uart.md` existing sources
-and mill1000/midea-msmart (`BYTE_MODE_*`).
+and mill1000/midea-msmart Finding 1 (see `midea-msmart-mill1000.md`).
 
 ### Fan Speed Values (body byte 3):
 ```python
-FAN_AUTO   = 102  # 0x66 — Consistent (mill1000/midea-msmart:BYTE_FANSPEED_AUTO)
-FAN_SILENT = 20   # 0x14 — Consistent (mill1000/midea-msmart:BYTE_FANSPEED_MUTE)
-FAN_LOW    = 40   # 0x28 — Consistent (mill1000/midea-msmart:BYTE_FANSPEED_LOW)
-FAN_MEDIUM = 60   # 0x3C — Consistent (mill1000/midea-msmart:BYTE_FANSPEED_MID)
-FAN_HIGH   = 80   # 0x50 — Consistent (mill1000/midea-msmart:BYTE_FANSPEED_HIGH)
+FAN_AUTO   = 102  # 0x66 — Consistent (BYTE_FANSPEED_AUTO)
+FAN_SILENT = 20   # 0x14 — Consistent (BYTE_FANSPEED_MUTE)
+FAN_LOW    = 40   # 0x28 — Consistent (BYTE_FANSPEED_LOW)
+FAN_MEDIUM = 60   # 0x3C — Consistent (BYTE_FANSPEED_MID)
+FAN_HIGH   = 80   # 0x50 — Consistent (BYTE_FANSPEED_HIGH)
 FAN_TURBO  = 100  # 0x64 — from existing sources; Lua does not list separately
 ```
+Source: mill1000/midea-msmart Finding 2 (see `midea-msmart-mill1000.md`).
 
 ### Swing Mode (body byte 7, lower nibble):
 ```python
-SWING_OFF        = 0b0000  # 0x00 — Consistent (mill1000/midea-msmart:BYTE_SWING_LR_OFF + BYTE_SWING_UD_OFF)
-SWING_VERTICAL   = 0b1100  # 0x0C — Consistent (mill1000/midea-msmart:BYTE_SWING_UD_ON)
-SWING_HORIZONTAL = 0b0011  # 0x03 — Consistent (mill1000/midea-msmart:BYTE_SWING_LR_ON)
+SWING_OFF        = 0b0000  # 0x00 — Consistent (BYTE_SWING_LR_OFF + BYTE_SWING_UD_OFF)
+SWING_VERTICAL   = 0b1100  # 0x0C — Consistent (BYTE_SWING_UD_ON)
+SWING_HORIZONTAL = 0b0011  # 0x03 — Consistent (BYTE_SWING_LR_ON)
 SWING_BOTH       = 0b1111  # 0x0F — derived (both bits combined)
 ```
 Bits [5:4] of byte 7 are set to `0x30` as a constant in the control command —
-confirmed by mill1000/midea-msmart:`bodyBytes[7] = swingLRValue | swingUDValue | 0x30`.
+the swing nibbles are OR'd with 0x30: `byte[7] = swingLR | swingUD | 0x30`.
 
-mill1000/midea-msmart also references a `BYTE_SWING_LR_UNDER_ON = 0x80` (a secondary LR swing
-for "under" units), stored in byte 7 bit 7. This is a feature variant not yet
-observed in own captures — treat as Hypothesis.
+A secondary horizontal swing flag `BYTE_SWING_LR_UNDER_ON = 0x80` (for "under" units)
+is documented at byte 7 bit 7. This is a feature variant not yet observed in own
+captures — treat as Hypothesis.
+
+Source: mill1000/midea-msmart Finding 3 (see `midea-msmart-mill1000.md`).
 
 ### Temperature Setting (dudanov's approach):
 ```python
@@ -655,13 +658,15 @@ def set_target_temp(body, temp_celsius):
 
 The AC responds to 0x40 (set) and 0x41 (query) with a **0xC0** response.
 
-**0xA0 variant** (mill1000/midea-msmart): Parses msg_type `0x05` with body[0] = `0xA0`
-using the same field layout as `0xC0`. Purpose unknown — treat as Hypothesis.
+**0xA0 variant**: msg_type `0x05` with body[0] = `0xA0` uses the same field layout
+as `0xC0`. Purpose unknown — treat as Hypothesis.
+Source: mill1000/midea-msmart Finding 9 (see `midea-msmart-mill1000.md`).
 
-**Multi-unit / new protocol detection** (mill1000/midea-msmart):
+**Multi-unit / new protocol detection**:
 - `body[0] == 0xBC` or `0xBA` → multi-unit protocol variant
 - `body[0] == 0xBF` → "new protocol" variant
-These trigger alternate parsing paths in the reference app. Not yet seen in own captures.
+These trigger alternate parsing paths. Not yet seen in own captures.
+Source: mill1000/midea-msmart Finding 9 (see `midea-msmart-mill1000.md`).
 
 Response data starts at frame offset 10. The response `data[0]` = `0xC0`.
 All byte references below are **relative to body start** (body[0] = `0xC0`).
@@ -708,11 +713,12 @@ Byte  Bits        Field                   Formula
  9    bit 0       Child sleep
       bit 1       Natural fan
       bit 2       Dry clean
-      bits [4:3]  PTC heater (2-bit field; mill1000/midea-msmart reads as PTCValue = bits[4:3] combined)
+      bits [4:3]  PTC heater (2-bit field, PTCValue = bits[4:3] combined; Finding 5)
       bit 4       Eco mode (read position in 0xC0 response)
                   NOTE: ECO write position in 0x40 command is bit 7 of byte 9 (0x80).
-                  The mill1000/midea-msmart reads bit 4 from response and writes bit 7 to command —
-                  these are different bit positions for the same logical flag.
+                  Bit 4 is the read position in the response, bit 7 is the write position
+                  in the command — different bit positions for the same logical flag (Finding 4).
+                  Source: mill1000/midea-msmart Findings 4–5 (see `midea-msmart-mill1000.md`).
       bit 5       Clean up / purifier
       bit 6       Self cosy sleep
       bit 7       Eco mode (write position in 0x40 command — see note above)
@@ -755,9 +761,9 @@ Byte  Bits        Field                   Formula
 22    bit 3       Silky cool (if response length >= 23)
 ```
 
-### Alternative temperature packing in 0xC0 response (mill1000/midea-msmart):
+### Alternative temperature packing in 0xC0 response:
 
-mill1000/midea-msmart detects a format flag and may decode the setpoint temperature
+An alternative format flag may cause the setpoint temperature to be decoded
 from body byte[1] instead of byte[2]:
 
 - **Standard format** (byte[2]): `temp = (byte[2] & 0x0F) + 16`, `half = (byte[2] >> 4) & 0x01`
@@ -767,9 +773,10 @@ from body byte[1] instead of byte[2]:
 - **Alternative format B** (byte[1] bits[5:1]): `temp = (byte[1] >> 1) & 0x1F` (bits[5:1]) `+ 12`,
   `half = (byte[1] >> 6) & 0x01` (bit 6)
 
-The trigger condition for selecting between formats is not fully understood from
-mill1000/midea-msmart alone. **Hypothesis**: these are protocol version variants (older appliances
-may use the byte[1] packing). Not yet observed in own captures — treat as Hypothesis.
+The trigger condition for selecting between formats is not fully understood.
+**Hypothesis**: these are protocol version variants (older appliances may use the
+byte[1] packing). Not yet observed in own captures — treat as Hypothesis.
+Source: mill1000/midea-msmart (see `midea-msmart-mill1000.md`).
 
 ### Temperature Parsing with Decimal Precision:
 ```python
@@ -825,11 +832,11 @@ data[0x0d]    body[13]    humidity (& 0x7F)
 | Priority | Condition | Sub-type | Triggered by |
 |----------|-----------|----------|--------------|
 | 1 | `body[1] == 0x21 and body[2] == 0x01` | Group page response (groups 1-5+, incl. power) | `0x41/0x81/0x01/page` or `0x41/0x21/0x01/page` query |
-| 2 | `body[1] == 0x01` | Extended state sub-page 0x01 (sensors, faults) | Extended `0x41/0x21` query — mill1000/midea-msmart Finding 8 |
-| 3 | `body[1] == 0x02` | Extended state sub-page 0x02 (flags, power, vanes) | Extended `0x41/0x21` query — mill1000/midea-msmart Finding 8 |
+| 2 | `body[1] == 0x01` | Extended state sub-page 0x01 (sensors, faults) | Extended `0x41/0x21` query — mill1000/midea-msmart Finding 8 (see `midea-msmart-mill1000.md`) |
+| 3 | `body[1] == 0x02` | Extended state sub-page 0x02 (flags, power, vanes) | Extended `0x41/0x21` query — mill1000/midea-msmart Finding 8 (see `midea-msmart-mill1000.md`) |
 | — | other | Unknown | — |
 
-Group page responses dispatch further by `body[3] & 0x0F` as group number (Finding 11).
+Group page responses dispatch further by `body[3] & 0x0F` as group number (mill1000/midea-msmart Finding 11, see `midea-msmart-mill1000.md`).
 Group 4 (`body[3]=0x44`) is the power usage page — previously handled as a separate
 top-level sub-type, now unified under the group page dispatcher.
 
@@ -906,7 +913,7 @@ page label.
 Source: mill1000/midea-msmart Finding 8 (see `midea-msmart-mill1000.md`). **Not present in dudanov/MideaUART, reneklootwijk/node-mideahvac,
 or ESPHome.** All fields: **Hypothesis** — not verified against own captures.
 
-Triggered by extended `0x41/0x21` query (Finding 7 in `midea-msmart-mill1000.md`).
+Triggered by extended `0x41/0x21` query (mill1000/midea-msmart Finding 7, see `midea-msmart-mill1000.md`).
 
 `body[1] = 0x01` identifies this sub-page. `srcBuf` = full UART frame; body[N] = srcBuf[N+10].
 
