@@ -2247,13 +2247,24 @@ function hvac_shark_proto.dissector(udp_payload_buffer, pinfo, tree)
                 local swing = protocol_buffer(6, 1):uint()
                 data_subtree:add(pbuf(6, 1), string.format("0x06 Swing: 0x%02X (%s)", swing, getSwingString(swing)))
                 data_subtree:add(pbuf(7, 1), string.format("0x07 Unknown: 0x%02X", protocol_buffer(7, 1):uint()))
-                -- byte[8] = emergency heat flag [Candidate: mdrobnak]
-                local c6_emerg = protocol_buffer(8, 1):uint()
-                local c6_emerg_str = c6_emerg == 0x80 and "EMERGENCY HEAT" or
-                    (c6_emerg == 0x00 and "normal" or string.format("unknown (0x%02X)", c6_emerg))
+                -- byte[8] = C6 Mode Flags (multi-purpose)
+                -- 0x00 = normal (own captures, 107 frames)
+                -- 0x80 = emergency heat [Candidate: mdrobnak]
+                -- 0x1N = static pressure SP0..SP4 [Candidate: rymo]
+                local c6_mode = protocol_buffer(8, 1):uint()
+                local c6_mode_str
+                if c6_mode == 0x00 then
+                    c6_mode_str = "normal"
+                elseif c6_mode == 0x80 then
+                    c6_mode_str = "EMERGENCY HEAT  [Candidate: mdrobnak]"
+                elseif bit.band(c6_mode, 0xF0) == 0x10 then
+                    c6_mode_str = string.format("Static Pressure SP%d  [Candidate: rymo]",
+                        bit.band(c6_mode, 0x0F))
+                else
+                    c6_mode_str = "unknown"
+                end
                 data_subtree:add(pbuf(8, 1), string.format(
-                    "0x08 Emergency Heat: 0x%02X (%s)  [Candidate: mdrobnak]",
-                    c6_emerg, c6_emerg_str))
+                    "0x08 C6 Mode Flags: 0x%02X (%s)", c6_mode, c6_mode_str))
                 data_subtree:add(pbuf(9, 1), string.format("0x09 Unknown: 0x%02X", protocol_buffer(9, 1):uint()))
                 data_subtree:add(pbuf(10, 1), string.format("0x0A Unknown: 0x%02X", protocol_buffer(10, 1):uint()))
                 data_subtree:add(pbuf(11, 1), string.format("0x0B Unknown: 0x%02X", protocol_buffer(11, 1):uint()))
@@ -2359,7 +2370,25 @@ function hvac_shark_proto.dissector(udp_payload_buffer, pinfo, tree)
                 -- byte[22] = Tp discharge temperature, confirmed by cross-session UART comparison
                 local c4_tp = protocol_buffer(22, 1):uint()
                 data_subtree:add(pbuf(22, 1), string.format("0x16 Tp (compressor discharge): 0x%02X (%.1f C)  [ConfirmedS6]", c4_tp, (c4_tp - 40) / 2.0))
-                for i = 23, 29 do
+                for i = 23, 23 do
+                    data_subtree:add(pbuf(i, 1), string.format("0x%02X: 0x%02X", i, protocol_buffer(i, 1):uint()))
+                end
+                -- byte[24] = static pressure readback [Candidate: rymo]
+                -- Own captures: constant 0x00 (107 C6 responses, Sessions 3-9)
+                -- rymo: 0x2N where N = SP level (0x20=SP0 .. 0x24=SP4)
+                local rsp_b24 = protocol_buffer(24, 1):uint()
+                local rsp_b24_str
+                if rsp_b24 == 0x00 then
+                    rsp_b24_str = "none"
+                elseif bit.band(rsp_b24, 0xF0) == 0x20 then
+                    rsp_b24_str = string.format("Static Pressure SP%d  [Candidate: rymo]",
+                        bit.band(rsp_b24, 0x0F))
+                else
+                    rsp_b24_str = "unknown"
+                end
+                data_subtree:add(pbuf(24, 1), string.format(
+                    "0x18 SP Readback: 0x%02X (%s)", rsp_b24, rsp_b24_str))
+                for i = 25, 29 do
                     data_subtree:add(pbuf(i, 1), string.format("0x%02X: 0x%02X", i, protocol_buffer(i, 1):uint()))
                 end
             elseif command_code == 0xD0 then

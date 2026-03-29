@@ -173,12 +173,43 @@ Bytes [7..9] were always 0x00 in all observed C6 frames (Sessions 3–9 + unsort
 The room temperature is **not** embedded in the C6 request — it travels in the C3
 byte[8] that immediately precedes each C6.
 
-**Byte [8] — Emergency Heat flag** [Candidate — single external source: mdrobnak, external-captures/01_mdrobnak_ch36ahu]:
-- 0x00 = normal operation (3 non-emergency C6 commands, all with C4 byte[15]=0x20)
-- 0x80 = emergency (aux-only) heat request (1 C6 command, C4 byte[15] responded 0x60)
-- The unit confirms emergency heat by setting bit 0x40 in C4 response byte[15] (see §7a).
-- Internally consistent across 4 C4 responses (3× 0x20 normal, 1× 0x60 emergency), all CRC-valid.
-- Not observed in own logic analyzer captures (emergency heat never activated on test unit).
+**Byte [8] — C6 Mode Flags** (multi-purpose, own captures + two external sources):
+- 0x00 = normal operation. Own captures: constant 0x00 across 107 C6 commands (Sessions 3–9).
+- 0x80 = emergency (aux-only) heat request [Candidate — single source: mdrobnak, external-captures/01_mdrobnak_ch36ahu].
+  The unit confirms by setting bit 0x40 in C4 response byte[15] (see §7a).
+  Internally consistent (3× normal, 1× emergency), all CRC-valid.
+  Not observed in own captures (emergency heat never activated on test unit).
+- 0x1N = static pressure SP0..SP4 (lower nibble = level) [Candidate — single source: rymo, external-captures/02_rymo_static_pressure].
+  5 command/response pairs, all CRC-valid. Response byte[24] echoes SP level as 0x2N.
+  Not observed in own captures (test unit has no static pressure feature, always 0x00).
+
+**Byte [10] — C6 Sub-command** (three independent sources, two variants):
+
+Variant A (bit 0x40 set) — own logic analyzer captures + ESPHome esphome-mideaXYE-rs485:
+
+| Value | Meaning | Source |
+|-------|---------|--------|
+| 0x46  | Follow-Me START | Own captures: 84 frames. ESPHome: `sendFollowMeData[10] = 0x46` (first send) |
+| 0x42  | Follow-Me UPDATE | Own captures: 4 frames. ESPHome: `sendFollowMeData[10] = 0x42` (subsequent) |
+| 0x44  | Follow-Me STOP | Own captures: 19 frames. ESPHome: `sendFollowMeData[10] = 0x44` (disable) |
+
+Variant B (bit 0x40 clear) — mdrobnak KJR-120X wired controller + rymo wall controller:
+
+| Value | Meaning | Source |
+|-------|---------|--------|
+| 0x06  | Follow-Me START | mdrobnak: 3 frames |
+| 0x02  | Follow-Me UPDATE | mdrobnak: 1 frame |
+| 0x04  | Config / Static Pressure | rymo: 5 frames (all SP commands) |
+
+The lower nibble encodes the sub-command (0x02=update, 0x04=stop-or-config, 0x06=start).
+Bit 0x40 appears to be set by ESPHome/ESP-based masters but not by KJR-120X wired
+controllers. Both variants are accepted by the indoor unit. The functional meaning of
+bit 0x40 is unknown — possibly a master-type identifier.
+
+**Byte [11] — Follow-Me Temperature** (direct Celsius, all sources agree):
+- Own captures + mdrobnak + ESPHome: byte[11] = temperature in °C (direct value, no offset).
+- ESPHome code confirms: `sendFollowMeData[11] = static_cast<uint8_t>(std::round(followMeTemp))`.
+- rymo SP commands: byte[11] = 0x17 (23) — purpose unclear, consistent across all 5 SP frames.
 
 **Validation across all captures:**
 
@@ -551,7 +582,11 @@ Offset  Field             Description
                          Confirmed by cross-session comparison with UART R/T C1-G1 body[14]:
                          329 matched pairs, mean diff = −0.02°C, max |diff| = 3°C (timing).
                          Session 6: byte[22]=0xBC→74°C = service menu Tp=74°C ✓
- 23-29  RESERVED          All zeros in all captures
+ 23     RESERVED          0x00 in all own and external captures
+ 24     SP_READBACK       Own captures: constant 0x00 (107 C6 responses, Sessions 3–9).
+                         rymo: 0x2N where N = static pressure level (0x20=SP0 .. 0x24=SP4)
+                         [Candidate — single source: rymo, external-captures/02_rymo_static_pressure].
+ 25-29  RESERVED          All zeros in all own and external captures
  30     CRC               Two's complement checksum
  31     EPILOGUE          0x55
 ```
