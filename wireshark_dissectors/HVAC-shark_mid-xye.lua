@@ -2218,7 +2218,7 @@ function hvac_shark_proto.dissector(udp_payload_buffer, pinfo, tree)
             data_subtree:add(pbuf(0, 1), "0x00 Preamble: " .. string.format("0x%02X", protocol_buffer(0, 1):uint()))
             local command_code = protocol_buffer(1, 1):uint()
             local command_name = XYE_COMMANDS[command_code] or "Unknown"
-            pinfo.cols.info:append(string.format("M->S 0x%02X %s", command_code, command_name))
+            pinfo.cols.info:append(string.format("Cmd 0x%02X %s", command_code, command_name))
             data_subtree:add(pbuf(1, 1), "0x01 Command: " .. string.format("0x%02X", command_code) .. " (" .. command_name .. ")")
             data_subtree:add(pbuf(2, 1), "0x02 Destination: " .. string.format("0x%02X", protocol_buffer(2, 1):uint()))
             data_subtree:add(pbuf(3, 1), "0x03 Source / Own ID: " .. string.format("0x%02X", protocol_buffer(3, 1):uint()))
@@ -2278,7 +2278,7 @@ function hvac_shark_proto.dissector(udp_payload_buffer, pinfo, tree)
             if command_code == 0xD0 then
                 pinfo.cols.info:append(string.format("BCAST 0x%02X %s", command_code, command_name))
             else
-                pinfo.cols.info:append(string.format("S->M 0x%02X %s", command_code, command_name))
+                pinfo.cols.info:append(string.format("Rsp 0x%02X %s", command_code, command_name))
             end
             data_subtree:add(pbuf(0, 1), "0x00 Preamble: " .. string.format("0x%02X", protocol_buffer(0, 1):uint()))
             data_subtree:add(pbuf(1, 1), "0x01 Response Code: " .. string.format("0x%02X", command_code) .. " (" .. command_name .. ")")
