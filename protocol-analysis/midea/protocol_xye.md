@@ -369,6 +369,10 @@ Offset  Field             Value / Description
   4     MASTER_FLAG       Always 0x00 in all own captures (4847 frames, Sessions 3–9)
                          and in mdrobnak captures. Codeberg spec claims 0x80 = from master
                          but this is NOT observed on real hardware — **Corrected**.
+                         NOTE: ESPHome esphome-mideaXYE-rs485 sets 0x80 in C0/C3 templates
+                         (likely from Codeberg spec) but 0x00 in its C6 template — inconsistent
+                         within the same codebase. Both 0x00 and 0x80 appear to be accepted
+                         by indoor units.
   5     SRC_ID_repeat     Same as byte 3
   6-12  PAYLOAD           7 bytes of command data
  13     CMD_CHECK         255 - command_byte (e.g. 0xC0 -> 0x3F)
@@ -421,11 +425,19 @@ Offset  Field             Description
 
 ## 3. Checksum Algorithm
 
-XYE uses a single two's complement sum covering the entire frame, including the `0xAA` preamble and `0x55` epilogue (all bytes except the CRC byte itself):
+XYE uses a checksum covering the frame contents. Two equivalent formulations exist:
 
 ```
-CRC = (255 - (sum_of_all_bytes_except_CRC % 256) + 1) & 0xFF
+Formulation A (twos complement of inner bytes):
+  CRC = (-sum(bytes[1..N-2])) % 256
+
+Formulation B (ones complement of all bytes, used by ESPHome esphome-mideaXYE-rs485):
+  CRC = 0xFF - (sum(all bytes except CRC) & 0xFF)
 ```
+
+These are algebraically identical because preamble (0xAA) + epilogue (0x55) = 0xFF.
+Adding 0xFF to the inner sum before ones complement yields the same result as
+twos complement of the inner sum alone. Our dissector uses formulation A.
 
 ---
 
@@ -475,6 +487,7 @@ use the plain 0x90.
 
 | Response | Meaning | Bit pattern | Evidence |
 |----------|---------|-------------|----------|
+| `0x10`   | Auto (startup) | `0001 0000` | Not in own captures. ESPHome esphome-mideaXYE-rs485 + rymo C6 response byte[16] |
 | `0x91`   | Auto + Fan (idle) | `1001 0001` | Session 9: after cold boot, unit deciding |
 | `0x94`   | Auto + Heat | `1001 0100` | Session 8: room < setpoint 30 °C |
 | `0x98`   | Auto + Cool | `1001 1000` | Session 8: setpoint jumped to 16 °C, room > setpoint |
@@ -502,6 +515,18 @@ Byte 0x09 in the slave response (and byte[7] in the 16-byte Set command):
 | `0x04` | Low    | `0000 0100` | **Confirmed** — Erlang correct, README/ESPHome wrong (see §0.2) |
 
 One-hot encoding: bit7=auto, bit2=low, bit1=mid, bit0=high.
+
+**Fan auto sub-modes in responses** (ESPHome esphome-mideaXYE-rs485, confirms mdrobnak Session 7 claim):
+When auto is active, the response combines bit 0x80 with the actual speed:
+
+| Value  | Meaning       | Source |
+|--------|---------------|--------|
+| `0x80` | Auto (idle)   | Own captures + ESPHome + mdrobnak |
+| `0x81` | Auto + High   | ESPHome, mdrobnak claim (not in own captures) |
+| `0x82` | Auto + Medium | ESPHome, mdrobnak claim (not in own captures) |
+| `0x84` | Auto + Low    | ESPHome, mdrobnak claim (not in own captures) |
+
+Same pattern as Auto mode sub-modes in §5.2: response = 0x80 | actual_speed.
 
 **Cross-bus correlation (Session 7, XYE ↔ R-T UART):**
 
