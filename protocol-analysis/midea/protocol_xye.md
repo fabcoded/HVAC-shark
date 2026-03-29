@@ -679,6 +679,55 @@ These are available on XYE and have no equivalent on Midea UART:
 
 ---
 
+## 11. Open Questions — Setpoint / Temperature Encoding Variants
+
+The setpoint byte encoding differs across hardware and sources. The sensor
+temperature formula `(raw - 40) / 2 = °C` is consistent across all sources,
+but the setpoint byte (C3 command byte[8], C0 response byte[10]) shows at
+least two variants plus an unresolved Fahrenheit mechanism.
+
+### C3 command byte[8] — setpoint sent TO unit
+
+**Confirmed (own captures):** `raw - 0x40 = °C`. Range 0x50-0x5E = 16-30°C,
+validated against Session 7 operator notes (full 16-30°C sweep).
+
+**Consistent:** mdrobnak C3 Celsius commands use same encoding (0x56=22°C, 0x57=23°C).
+
+**Fahrenheit hypothesis (mdrobnak Session 5, 4 frames):**
+- Celsius values: 0x56/0x57/0x58 (bit 7 clear)
+- Fahrenheit values: 0xCB/0xCF (bit 7 set)
+- If bit 7 = Fahrenheit flag: `raw & 0x7F` = direct °F (0xCB → 75°F, 0xCF → 79°F)
+- Plausible but only 4 frames from single source, no ground truth.
+
+### C0/C3 response byte[10] — setpoint echoed FROM unit
+
+**Variant A (own HW):** Response echoes command encoding. 0x50-0x5E, same range as
+commands. `raw - 0x40 = °C`. Confirmed 1,357 frames.
+
+**Variant B (mdrobnak HW):** Response returns direct °C with no offset.
+0x15=21°C, 0x16=22°C, 0x18=24°C. Different encoding from commands on same unit.
+
+### ESPHome esphome-mideaXYE-rs485 temperature bugs
+
+ESPHome sends raw Fahrenheit values (e.g. 70, 86) as byte[8] without any
+conversion or bit 7 flag. It displays response byte[10] as °F without applying
+`raw - 0x40`. Users report it "works" but temperature accuracy issues are common.
+
+Possible explanations (unresolved):
+1. **Accidental roundtrip**: On Variant A HW, the unit echoes the raw value back,
+   so the display roundtrips (86 in → 86 out) even though the unit interprets it
+   as 22°C not 86°F. User sees correct display but wrong actual temperature.
+2. **Range-based auto-detect**: The unit firmware may interpret values > ~50 as
+   Fahrenheit and < ~50 as Celsius without needing bit 7. This would explain
+   why ESPHome works and why mdrobnak's unit returns direct °C in responses.
+3. **Firmware variant**: Different indoor unit firmware versions may handle the
+   encoding differently.
+
+**Cannot be resolved without controlled testing:** Set a known temperature via XYE,
+verify with a physical thermometer or the wired controller display.
+
+---
+
 ## References
 
 - XYE reverse engineering: https://codeberg.org/xye/xye
