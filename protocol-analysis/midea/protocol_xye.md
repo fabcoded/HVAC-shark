@@ -173,6 +173,13 @@ Bytes [7..9] were always 0x00 in all observed C6 frames (Sessions 3–9 + unsort
 The room temperature is **not** embedded in the C6 request — it travels in the C3
 byte[8] that immediately precedes each C6.
 
+**Byte [8] — Emergency Heat flag** [Candidate — single external source: mdrobnak, external-captures/01_mdrobnak_ch36ahu]:
+- 0x00 = normal operation (3 non-emergency C6 commands, all with C4 byte[15]=0x20)
+- 0x80 = emergency (aux-only) heat request (1 C6 command, C4 byte[15] responded 0x60)
+- The unit confirms emergency heat by setting bit 0x40 in C4 response byte[15] (see §7a).
+- Internally consistent across 4 C4 responses (3× 0x20 normal, 1× 0x60 emergency), all CRC-valid.
+- Not observed in own logic analyzer captures (emergency heat never activated on test unit).
+
 **Validation across all captures:**
 
 | Session | C6 byte[6] values | Notes |
@@ -328,7 +335,9 @@ Offset  Field             Value / Description
                             0xC4, 0xC6: see §0.4 — not all sources agree on existence/meaning
   2     DEST_ID           Target unit 0x00-0x3F; 0xFF=broadcast
   3     SRC_ID            Master address
-  4     DIR_FLAG          0x80 = from master (all sources agree)
+  4     MASTER_FLAG       Always 0x00 in all own captures (4847 frames, Sessions 3–9)
+                         and in mdrobnak captures. Codeberg spec claims 0x80 = from master
+                         but this is NOT observed on real hardware — **Corrected**.
   5     SRC_ID_repeat     Same as byte 3
   6-12  PAYLOAD           7 bytes of command data
  13     CMD_CHECK         255 - command_byte (e.g. 0xC0 -> 0x3F)
@@ -343,7 +352,9 @@ Offset  Field             Description
 ------  -----             -----------
   0     PREAMBLE          0xAA
   1     RESPONSE_CODE     Same code as the query command (e.g. 0xC0)
-  2     DIR_FLAG          0x80 = slave->master
+  2     SLAVE_FLAG        Always 0x00 in all own captures (4847 frames, Sessions 3–9)
+                         and in mdrobnak captures. Codeberg spec claims 0x80 = slave->master
+                         but this is NOT observed on real hardware — **Corrected**.
   3     DEST_ID           Master address
   4     SRC_ID            Unit address
   5     SRC_ID_repeat     Same as byte 4
@@ -521,7 +532,13 @@ Offset  Field             Description
   0     PREAMBLE          0xAA
   1     RESPONSE_CODE     0xC4 or 0xC6
   2-5   ADDRESS           00 00 00 00
-  6-15  FLAGS             05 00 02 30 0E 00 00 00 00 00 (constant in all captures)
+  6-14  FLAGS             05 00 02 30 0E 00 00 00 00 (mostly constant — byte[14] varies: 0x00 or 0x01)
+ 15     EXT_STATUS        Own captures: constant 0x00 across all 1,348 C4/C6 responses (Sessions 3–9).
+                         mdrobnak (CH-36AHU): 0x20 = normal, 0x60 = emergency heat.
+                         bit 0x40 = emergency heat active [Candidate — single source: mdrobnak,
+                         not observed in own captures — emergency heat never activated on test unit].
+                         mdrobnak values: 0x20 (normal, 3 frames), 0x60 (emergency, 1 frame).
+                         Own HW baseline differs (0x00 vs 0x20) — hardware-variant dependent.
  16     OPERATING_MODE    Same encoding as C0 byte[8] (see §5)
  17     FAN_SPEED         Same encoding as C0 byte[9] (see §6)
  18     SET_TEMP          Same encoding as C0 byte[10]: raw - 0x40 = °C

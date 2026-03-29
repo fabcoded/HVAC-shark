@@ -2222,7 +2222,7 @@ function hvac_shark_proto.dissector(udp_payload_buffer, pinfo, tree)
             data_subtree:add(pbuf(1, 1), "0x01 Command: " .. string.format("0x%02X", command_code) .. " (" .. command_name .. ")")
             data_subtree:add(pbuf(2, 1), "0x02 Destination: " .. string.format("0x%02X", protocol_buffer(2, 1):uint()))
             data_subtree:add(pbuf(3, 1), "0x03 Source / Own ID: " .. string.format("0x%02X", protocol_buffer(3, 1):uint()))
-            data_subtree:add(pbuf(4, 1), "0x04 From Master: " .. string.format("0x%02X", protocol_buffer(4, 1):uint()))
+            data_subtree:add(pbuf(4, 1), "0x04 Master Flag: " .. string.format("0x%02X", protocol_buffer(4, 1):uint()))
             data_subtree:add(pbuf(5, 1), "0x05 Source / Own ID: " .. string.format("0x%02X", protocol_buffer(5, 1):uint()))
 
             if command_code == 0xC3 then
@@ -2247,7 +2247,13 @@ function hvac_shark_proto.dissector(udp_payload_buffer, pinfo, tree)
                 local swing = protocol_buffer(6, 1):uint()
                 data_subtree:add(pbuf(6, 1), string.format("0x06 Swing: 0x%02X (%s)", swing, getSwingString(swing)))
                 data_subtree:add(pbuf(7, 1), string.format("0x07 Unknown: 0x%02X", protocol_buffer(7, 1):uint()))
-                data_subtree:add(pbuf(8, 1), string.format("0x08 Unknown: 0x%02X", protocol_buffer(8, 1):uint()))
+                -- byte[8] = emergency heat flag [Candidate: mdrobnak]
+                local c6_emerg = protocol_buffer(8, 1):uint()
+                local c6_emerg_str = c6_emerg == 0x80 and "EMERGENCY HEAT" or
+                    (c6_emerg == 0x00 and "normal" or string.format("unknown (0x%02X)", c6_emerg))
+                data_subtree:add(pbuf(8, 1), string.format(
+                    "0x08 Emergency Heat: 0x%02X (%s)  [Candidate: mdrobnak]",
+                    c6_emerg, c6_emerg_str))
                 data_subtree:add(pbuf(9, 1), string.format("0x09 Unknown: 0x%02X", protocol_buffer(9, 1):uint()))
                 data_subtree:add(pbuf(10, 1), string.format("0x0A Unknown: 0x%02X", protocol_buffer(10, 1):uint()))
                 data_subtree:add(pbuf(11, 1), string.format("0x0B Unknown: 0x%02X", protocol_buffer(11, 1):uint()))
@@ -2278,7 +2284,7 @@ function hvac_shark_proto.dissector(udp_payload_buffer, pinfo, tree)
             data_subtree:add(pbuf(1, 1), "0x01 Response Code: " .. string.format("0x%02X", command_code) .. " (" .. command_name .. ")")
 
             if command_code == 0xC0 or command_code == 0xC3 then
-                data_subtree:add(pbuf(2, 1), "0x02 To Master: " .. string.format("0x%02X", protocol_buffer(2, 1):uint()))
+                data_subtree:add(pbuf(2, 1), "0x02 Slave Flag: " .. string.format("0x%02X", protocol_buffer(2, 1):uint()))
                 data_subtree:add(pbuf(3, 1), "0x03 Destination: " .. string.format("0x%02X", protocol_buffer(3, 1):uint()))
                 data_subtree:add(pbuf(4, 1), "0x04 Source/Own ID: " .. string.format("0x%02X", protocol_buffer(4, 1):uint()))
                 data_subtree:add(pbuf(5, 1), "0x05 Destination (masterID): " .. string.format("0x%02X", protocol_buffer(5, 1):uint()))
@@ -2327,9 +2333,18 @@ function hvac_shark_proto.dissector(udp_payload_buffer, pinfo, tree)
                 end
             elseif command_code == 0xC4 or command_code == 0xC6 then
                 -- C4/C6 extended response: partially decoded (Sessions 6/7)
-                for i = 2, 15 do
+                for i = 2, 14 do
                     data_subtree:add(pbuf(i, 1), string.format("0x%02X: 0x%02X", i, protocol_buffer(i, 1):uint()))
                 end
+                -- byte[15] = EXT_STATUS: bit 0x40 = emergency heat [Candidate: mdrobnak]
+                local ext_status = protocol_buffer(15, 1):uint()
+                local ext_status_str = "normal"
+                if bit.band(ext_status, 0x40) ~= 0 then
+                    ext_status_str = "EMERGENCY HEAT"
+                end
+                data_subtree:add(pbuf(15, 1), string.format(
+                    "0x0F Ext Status: 0x%02X (%s)  [Candidate: mdrobnak]",
+                    ext_status, ext_status_str))
                 local c4_mode = protocol_buffer(16, 1):uint()
                 data_subtree:add(pbuf(16, 1), string.format("0x10 Operating Mode: 0x%02X (%s)", c4_mode, getOperModeString(c4_mode)))
                 local c4_fan = protocol_buffer(17, 1):uint()
