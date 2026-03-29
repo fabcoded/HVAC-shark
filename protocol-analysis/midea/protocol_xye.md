@@ -55,8 +55,8 @@ climate — the error was small enough not to be noticed. For indoor T1, raw ≈
 gives ~19 °C (believable for a heated room), masking the ~6 °C error.
 
 **Additional finding — T1 = Follow-Me reference, not local sensor**: Sessions 5 and 6
-confirm that T1 (byte 0x0B) tracks the KJR-12x wall-controller sensor, not the indoor
-unit's own thermistor. When the KJR-12x was moved outside (~11 °C) T1 = 10–11 °C; when
+confirm that T1 (byte 0x0B) tracks the KJR-120M wall-controller sensor, not the indoor
+unit's own thermistor. When the KJR-120M was moved outside (~11 °C) T1 = 10–11 °C; when
 indoors (18 °C) T1 = 18 °C. The display-board service menu labels this field
 "tindoor air (followme)" — confirming it is the Follow-Me room-temperature reference.
 
@@ -102,7 +102,7 @@ The codeberg README documents only 4 commands: 0xC0 (Query), 0xC3 (Set), 0xCC (L
 |---------|--------------------|---------------------------|-------|
 | 0xC0    | all three sources  | 16-byte request → 32-byte response | Well documented |
 | 0xC3    | all three sources  | 16-byte request → 32-byte response | Well documented |
-| 0xC4    | own captures | 16-byte request → 32-byte response | **Device enumeration + extended query.** At cold boot, the master scans addresses 0x00–0x0F with C4 requests (200 ms interval). Only responding slaves are added to the poll list. In steady state, C4 continues polling the known slave(s) plus one non-zero probe address per cycle. See §0.4c. Response layout: see §7a. |
+| 0xC4    | own captures | 16-byte request → 32-byte response | **Device enumeration + extended query.** KJR-120M cold boot: scans addresses 0x00–0x0F (200 ms interval); steady-state continues probing non-zero addresses. KJR-120X: no cold boot data; steady-state polls only addr 0x00. See §0.4c–§0.4f. Response layout: see §7a. |
 | 0xC6    | ESPHome + Session 3 captures | 16-byte request → 32-byte response | **Confirmed frame pattern** (Session 3). See §0.4a. |
 | 0xCC    | codeberg           | 16-byte request → 32-byte response | Lock. Emulator responds with `0xC0 | 0x0C = 0xCC` in the response code. |
 | 0xCD    | codeberg           | 16-byte request → 32-byte response | Unlock. Emulator responds with `0xC0 | 0x0D = 0xCD`. |
@@ -112,33 +112,186 @@ framing, same as C0/C3. The earlier confusion arose because unanswered C4 probes
 (to non-existent slaves) produced only 16-byte request frames with no 32-byte
 response. The 32-byte C4 responses use the same layout as C6 responses (see §7a).
 
-### 0.4c Command 0xC4 — Device Enumeration — **Confirmed** (own captures, Session 9)
+### 0.4c KJR-120M Cold Boot & Polling — **Confirmed** (own captures, Sessions 4 & 9)
 
-Session 9 captured a cold boot (power off → standby → on). The XYE bus startup
-reveals C4 as the device enumeration mechanism:
+Sessions 4 and 9 both captured cold boots (power off → on) with HAHB bus recording.
+The KJR-120M performs a full device enumeration using C4 before any other traffic:
 
-**Phase 1 — Fast scan (t=2.7–5.9s):** Master sends C4 to addresses 0x00 through
-0x0F in sequence (200 ms interval, 16 addresses). No responses — the indoor unit
-hasn't booted its communication stack yet.
+**Phase 1 — Fast C4 scan (~3.2 s):** Master sends C4 to addresses 0x00 through
+0x0F in sequence. Each unanswered probe is followed by a 200 ms silence before the
+next address is tried — this is the response window. A 16-byte C4 frame at 4800 bps
+takes ~33 ms to transmit, leaving ~167 ms of listening time per probe. If no slave
+responds within 200 ms of the probe start, the master moves to the next address.
+16 addresses × 200 ms = 3.2 s per full sweep. During Phase 1, no unit has booted
+its communication stack yet, so all 16 probes go unanswered.
 
-**Phase 2 — First response (t=5.92s):** Address 0x00 responds to C4. Master
-immediately sends C0 Query → gets OFF mode (0x00) response. Unit is in standby.
+**Phase 2 — First response:** On the second sweep, address 0x00 responds to C4
+within ~19 ms of the probe (32-byte response at 4800 bps takes ~66 ms). The master
+detects the response, immediately sends a C0 Query (40 ms after C4 response ends),
+and gets a C0 response (~20 ms latency) with mode 0x00 (OFF/standby). It then
+continues probing the remaining addresses (0x01–0x0F) with the same 200 ms timeout
+per unanswered probe.
+Confirmed identical in both Session 4 (first response after ~3.2 s) and Session 9
+(first response after ~3.2 s).
 
-**Phase 3 — Power on (t=9.2s):** After a second full scan, address 0x00 responds
-again. Master sends C3 Set (Fan mode 0x81) + C6 — user pressed power on the
-KJR-12x.
+**Phase 3 — Post-discovery sequence (identical in both sessions):**
 
-**Phase 4 — Steady-state polling (t=17s+):** The master settles into a repeating
-pattern: poll address 0x00 twice (~600 ms each), then probe one non-zero address
-(cycling 0x01→0x0F). Non-zero probes never get responses (single indoor unit).
-This continuous background scanning would detect additional slaves joining the bus
-(e.g., second indoor unit in a multi-split system).
+After the first C4 response, the master follows a fixed sequence before entering
+steady-state. Both Session 4 (Follow-Me ON) and Session 9 (Follow-Me OFF) produce
+the same frame sequence:
+
+```
++  0 ms  M→S  C4 addr=0x00                  ← probe that gets answered
++ 19 ms  S→M  C4 response                   ← slave responds in ~19 ms
++ 60 ms  M→S  C0 addr=0x00                  ← immediate status query
++ 80 ms  S→M  C0 response (mode=0x00, OFF)  ← unit reports OFF
++130 ms  M→S  C4 addr=0x01                  ← resume sweep, remaining addresses
++330 ms  M→S  C4 addr=0x02                  ← 200 ms timeout, no response
+  …                                          ← 0x03–0x0F, all unanswered
++3130 ms M→S  C4 addr=0x00                  ← second pass, addr 0x00 responds again
++3150 ms S→M  C4 response
+```
+
+Note: In both sessions the unit was turned off before the power cut, so the first
+C0 response showing mode=0x00 (OFF) is expected. Whether a unit that was running at
+the time of power loss would boot to a different mode is unknown — no capture exists
+for that scenario.
+
+**No readiness indicator observed:** The first and second C4 responses are
+byte-identical in both sessions — no field changes between sweeps. The controller
+does not appear to check a "ready" flag; it mechanically completes its two-sweep
+enumeration before transitioning to steady-state.
+
+**C4 byte[16] — NV mode memory:** The C4 response byte[16] at boot reveals the
+indoor unit's NV-stored operating mode *without the power-on bit* (0x80):
+- Session 4: byte[16]=`0x04` at boot → `0x84` (Heat) after first C3 Set
+- Session 9: byte[16]=`0x01` at boot → `0x81` (Dry) after first C3 Set
+
+The low nibble matches the last-used mode from before power loss (0x04=Heat,
+0x01=Dry). This contrasts with C0 byte[8]=`0x00` (OFF) at boot. Whether the
+KJR-120M uses this NV mode byte to pre-select the mode for the operator is
+unknown — the operator's first C3 Set happened to match the NV-stored mode in
+both sessions.
+
+**Phase 4 — Steady-state polling:** The KJR-120M enters a repeating poll cycle
+(~1.8 s per full cycle) with no C3 or C6 traffic until the operator acts. The
+non-zero probe address N cycles sequentially 0x01 → 0x02 → … → 0x0F → 0x01:
+
+```
+C4 addr=0x00 → response (19 ms) → [280 ms gap] →
+C0 addr=0x00 → response (20 ms) → [280 ms gap] →
+C4 addr=0x00 → response (19 ms) → [280 ms gap] →
+[D0 broadcast from indoor unit] → [300 ms gap] →
+C4 addr=N   → (no response, 300 ms timeout) → [next cycle]
+```
+
+Session 9: 66 non-zero probes observed across 80 s, all unanswered (single unit).
+
+**Phase 5 — First operator action (C3+C6 pair, Follow-Me behaviour):**
+
+The first C3 Set + C6 pair appears only when the operator presses a button on the
+KJR-120M. If the button was pressed during boot (before the bus was ready), the
+KJR-120M queues the command and sends it once steady-state polling is established.
+The C3+C6 pair interrupts the polling cycle:
+
+Session 9 (Follow-Me OFF — operator pressed mode button at t≈9 s, during boot):
+```
++3150 ms S→M  C4 response                        ← second sweep complete
++3290 ms M→S  C3 Set   mode=0x81 (Dry) fan=Auto setpt=21°C   ← queued button press
++3311 ms S→M  C3 response
++3360 ms M→S  C6       swing=0x00  FM=STOP (0x44)  temp=23°C
++3380 ms S→M  C6 response
++3660 ms M→S  C0 addr=0x00  ← resumes normal polling
+```
+
+Session 4 (Follow-Me ON — operator did not press any button during boot):
+```
+         … ~21.9 s of pure C4/C0 polling, no C3/C6 …
++21905 ms M→S  C3 Set   mode=0x84 (Heat) fan=Auto setpt=22°C   ← first button press
+          S→M  C3 response
++21975 ms M→S  C6       swing=0x00  FM=START (0x46)  temp=13°C
+          S→M  C6 response
+```
+
+**Follow-Me at boot — observations:**
+- C6 is never sent autonomously at boot. It always accompanies a C3 Set triggered
+  by operator input.
+- **FM was active before power loss (Session 4):** KJR-120M remembers FM state
+  across the power cycle. The first C6 sends START (0x46) with the remembered
+  sensor temperature (13 °C). All subsequent C3+C6 pairs also carry START.
+- **FM was inactive before power loss (Session 9):** Every C3+C6 pair carries
+  STOP (0x44) with temp=23 °C. This clears any stale FM state the indoor unit
+  may have retained in NV memory from before power loss.
 
 **Key observations:**
 - Address range: 0x00–0x0F (16 addresses max on this bus)
-- Boot time: ~3.2 s from first C4 probe to first slave response
+- Boot time: ~3.2 s from first C4 probe to first slave response (both sessions)
 - C4 request byte[6..7] = `0xA5 0x5A` — magic marker, constant across all probes
 - No C0 or C3 traffic until at least one C4 response is received
+- **Probe-to-response latency**: ~19–20 ms (slave starts transmitting 32-byte
+  response ~19 ms after the 16-byte command ends). Observed across all C0/C3/C4/C6
+  responses in Sessions 4 and 9.
+- **Unanswered probe spacing**: exactly 200 ms between start of one probe and start
+  of next (±1 ms jitter). This 200 ms window = ~33 ms transmit + ~167 ms listen.
+- **Answered probe spacing**: after a response is received, the master waits ~40 ms
+  before sending the next command (C0 follow-up or next C4 probe)
+
+### 0.4d KJR-120X Polling Pattern — **Confirmed** (own dongle captures, Sessions 1–2)
+
+The KJR-120X was captured mid-operation via passive ESP dongle sniffing (no cold
+boot data available). Its polling behavior differs fundamentally from the KJR-120M:
+
+**No address sweep:** All 534 master commands in dongle Session 1 (167 s) target
+dest=0x00 exclusively. Zero commands to any non-zero address were observed at
+any point — not during startup, not during steady-state, not after mode changes.
+
+**Steady-state polling pattern:** Simple C0/C4 alternation to address 0x00:
+
+```
+C0 addr=0x00 → response (~20 ms) → C4 addr=0x00 → response (~20 ms) → …
+```
+
+Inter-command spacing: ~300 ms typical (range 150–700 ms, median ~300 ms).
+No non-zero address probing. No D0 broadcasts visible (dongle is on the XYE bus
+directly, not the HAHB side where D0 originates).
+
+**HYPOTHESIS — no boot enumeration:** The KJR-120X likely skips C4 address
+enumeration entirely and assumes a single indoor unit at address 0x00. This is
+consistent with its design as a dedicated single-unit controller (the MFB-C XYE
+adapter connects one controller to one indoor unit). No cold boot capture exists
+to confirm — planned experiment.
+
+**C6 Follow-Me variant:** KJR-120X uses Variant B (bit 0x40 clear):
+- 0x06 = START (Session 1: 9×, Session 2: 3×)
+- 0x04 = STOP (Session 1: 3×, Session 2: 3×)
+- 0x02 = UPDATE (Session 1: 1×)
+
+This contrasts with KJR-120M Variant A (0x46/0x44/0x42). See §0.4a for details.
+
+### 0.4e Controller Comparison — KJR-120M vs KJR-120X
+
+| Behavior | KJR-120M (Sessions 1–9, logic analyzer) | KJR-120X (Sessions 1–2, dongle) |
+|----------|----------------------------------------|----------------------------------|
+| Boot address sweep | C4 scan 0x00–0x0F, 200 ms interval | Not observed (**HYPOTHESIS**: none) |
+| Sweeps before first response | 1–2 full sweeps (~3.2–6.4 s) | N/A |
+| Steady-state non-zero probing | Yes, 1 per cycle cycling 0x01–0x0F | No |
+| Polling cadence (addr=0x00) | ~1.8 s full cycle (C4+C0+C4+probe) | ~600 ms (C0+C4 pair) |
+| C6 Follow-Me variant | Variant A (0x46/0x44/0x42) | Variant B (0x06/0x04/0x02) |
+| D0 broadcasts visible | Yes (src=0x01, dest=0x20) | No (dongle on XYE bus, not HAHB) |
+| Bus adapter | MFB-X (HA/HB differential, transformer-coupled) | MFB-C (XYE RS-485, 4-terminal) |
+
+### 0.4f No-Response Debugging Notes
+
+Common causes when an ESP/dongle-based master gets no responses from an indoor unit:
+
+1. **Polling too early after power-on:** The indoor unit needs ~3.2 s to boot its
+   communication stack. C4 probes sent before this will get no response. Retry
+   the full 0x00–0x0F sweep after a timeout.
+2. **Wrong unit address:** If emulating the KJR-120X pattern (poll only addr 0x00),
+   a unit configured to a different address will never respond. Use the KJR-120M
+   C4 sweep pattern (0x00–0x0F) to discover units at any address.
+3. **Stale Follow-Me state:** After boot, send C6 with byte[10]=0x44 (STOP) to
+   clear any Follow-Me state the indoor unit retained from before power loss.
 
 ### 0.4a Command 0xC6 — Dual-purpose: Follow-Me + Swing — **Confirmed** (own captures, Sessions 3/7/8)
 
@@ -148,10 +301,29 @@ frame — byte[7] selects swing mode while the C3+C6 pairing signals Follow-Me.
 
 #### C6 framing pattern
 
-C6 never appears standalone. It always follows a C3 Set as an atomic pair (~60 ms):
+C6 appears in two contexts — paired with C3 or standalone — depending on the
+controller and the Follow-Me sub-command:
+
+**Paired (C3+C6 atomic pair, ~60 ms gap):**
 ```
-C3 Set  (M→S 16b) → C3 Response (S→M 32b) → C6 (M→S 16b) → C6 Response (S→M 32b)
+C3 Set (controller → AC) → C3 Response (AC → controller) →
+C6     (controller → AC) → C6 Response (AC → controller)
 ```
+KJR-120M: START and STOP are always paired with C3. Every C3 Set is followed by
+a C6 — START when FM is active, STOP when FM is inactive.
+KJR-120X: START and STOP are paired with C3 when the operator changes settings
+(mode/fan/setpoint) while toggling FM. Dongle Session 1: 11 of 12 C6 paired with C3.
+
+**Standalone (C6 without preceding C3):**
+```
+C0/C4 Response (AC → controller) → C6 (controller → AC) → C6 Response (AC → controller)
+```
+Both controllers: UPDATE is always standalone — sent to refresh the FM temperature
+without changing any settings. KJR-120M: 4 standalone UPDATE across logic analyzer
+Sessions 6–7. KJR-120X: 1 standalone UPDATE in dongle Session 1.
+KJR-120X only: START and STOP can also be standalone for pure FM toggle without
+settings change. Dongle Session 2: all 6 C6 frames are standalone (3× START,
+3× STOP), with zero C3 commands in the entire session.
 
 #### C6 master request (16-byte) layout
 
@@ -257,10 +429,50 @@ in 0x40 Set.
 The temperature encoding differs: UART uses `T × 2 + 50`; XYE uses `T + 0x40`.
 
 **Session 7:** 81 C6 pairs observed (one per setpoint/mode/fan change). When
-Follow-Me was disabled via the KJR-12x menu, C6 pairs stopped immediately (last
+Follow-Me was disabled via the KJR-120M menu, C6 pairs stopped immediately (last
 C6 at t=762s, session continued to t=781s with no further C6). After disable,
-T1 (C0 byte[11]) changed from 24.0 °C to 20.5 °C — T1 switched from KJR-12x
+T1 (C0 byte[11]) changed from 24.0 °C to 20.5 °C — T1 switched from KJR-120M
 sensor to the indoor unit's own thermistor.
+
+#### Follow-Me lifecycle — controller-specific patterns
+
+**Activation (START):**
+The operator enables Follow-Me on the wired controller. The controller sends C6
+with byte[10]=START (0x46 KJR-120M / 0x06 KJR-120X) and byte[11]=current room
+temperature in °C. On the KJR-120M this is always paired with a C3 Set. On the
+KJR-120X, START can be standalone if no settings change simultaneously (dongle
+Session 2: 3× standalone START, pure FM toggle).
+
+**Steady-state (START repeated + periodic UPDATE):**
+While Follow-Me is active, every operator action (mode/fan/setpoint change) on
+the KJR-120M triggers a C3+C6 pair with byte[10]=START. The FM temperature in
+byte[11] is refreshed with each pair:
+- Logic analyzer Session 4: 8× START at 13 °C (temperature constant, operator changed setpoint/fan)
+- Logic analyzer Session 7: 69× START at 24 °C (temperature constant across mode/fan/setpoint sweep)
+
+Periodically, the controller sends a standalone C6 UPDATE (0x42 KJR-120M / 0x02
+KJR-120X) to refresh the FM temperature without any operator action:
+- KJR-120M logic analyzer Session 7: 3× UPDATE at t=120 s, 302 s, 596 s (~3–5 min intervals)
+- KJR-120M logic analyzer Session 6: 1× UPDATE at t=81 s (standalone, no C3)
+- KJR-120X dongle Session 1: 1× UPDATE at t=113 s (standalone, no C3)
+
+UPDATE is always standalone (never paired with C3) on both controllers.
+
+**Deactivation (STOP):**
+The operator disables Follow-Me. The controller sends C6 with byte[10]=STOP
+(0x44 KJR-120M / 0x04 KJR-120X). On the KJR-120X, STOP can be standalone
+(dongle Session 2: 3× standalone STOP). On the KJR-120M, STOP is always
+paired with C3.
+
+**KJR-120M special behaviour — STOP on every C3 when FM is inactive:**
+When Follow-Me is not active, the KJR-120M still sends a C6 STOP after every
+C3 Set. This means every KJR-120M settings change produces a C3+C6 pair
+regardless of FM state — STOP when FM is off, START when FM is on:
+- Logic analyzer Session 8: 4× STOP (FM was disabled, operator only changed swing)
+- Logic analyzer Session 9: 6× STOP (FM was disabled, operator cycled modes at cold boot)
+
+This contrasts with the KJR-120X, where C6 only appears when FM is explicitly
+toggled or updated — no C6 accompanies C3 when FM is inactive.
 
 #### Swing activation function (Session 8)
 
@@ -275,16 +487,24 @@ Note: C3 response byte[20] bit 2 carries vertical swing flag but does **not**
 report horizontal swing. Horizontal swing state is only visible in the D0
 broadcast (see §0.4b) and in C6 byte[6].
 
-**Open question:** Does the KJR-12x populate C6 bytes [6..9] with a measured
+**Open question:** Does the wired controller (KJR-120M/X) populate C6 bytes [6..9] with a measured
 room temperature when an external sensor is wired? Not observed — payload bytes
 other than [7] were always zero. ESPHome uses C6 for room temperature; the exact
 byte layout is not confirmed against own captures.
 
 ### 0.4b Command 0xD0 — Broadcast — **Confirmed** (own captures, Sessions 3–9)
 
-D0 is a 32-byte broadcast frame on the HAHB XYE bus — a periodic status report
-from the display board containing the full operating state. It appears every
-polling cycle alongside C0/C3/C4 traffic.
+D0 is a 32-byte unsolicited broadcast frame (src=0x01, dest=0x20) observed
+only on the HAHB bus (logic analyzer Sessions 3–9, KJR-120M via MFB-X adapter).
+It is a periodic status report containing the full operating state, appearing
+once per polling cycle (~1.2 s intervals). No command from the controller
+triggers it — the AC unit emits D0 autonomously.
+
+**Not observed on the XYE bus:** Dongle Sessions 1–2 (KJR-120X via MFB-C adapter,
+XYE bus) contain zero D0 frames across 1,326 total frames. The dongle firmware
+(`decode_xye.cpp`) forwards every frame between 0xAA and 0x55 without filtering —
+no command codes are dropped. D0 appears to be specific to the HAHB bus and is not
+emitted on the XYE bus.
 
 **D0 layout (32 bytes):**
 
@@ -402,7 +622,7 @@ Offset  Field             Description
   8     OPERATING_MODE    Current operating mode (see §5). In Auto mode, response byte includes active sub-mode (§5.2): 0x91=fan, 0x94=heat, 0x98=cool
   9     FAN_SPEED         Fan speed (see §6)
  10     SET_TEMP          Target temperature: raw - 0x40 = °C (e.g. 0x56 = 22 °C) — Confirmed
- 11     T1_INDOOR         Follow-Me reference temperature (room temp from KJR-12x) — formula (raw-40)/2 — Confirmed §0.1
+ 11     T1_INDOOR         Follow-Me mode dependent: controller sensor when FM active, indoor thermistor when FM off — formula (raw-40)/2 — Confirmed §0.1, see §7 note
  12     T2A_COIL_IN       Indoor coil inlet — formula (raw-40)/2 — Confirmed §0.1
  13     T2B_COIL_OUT      Indoor coil outlet — formula (raw-40)/2; 0x00 = not reported on this HW
  14     T3_OUTDOOR_COIL   Outdoor coil temperature — formula (raw-40)/2 — Confirmed §0.1
@@ -573,10 +793,17 @@ interpretation are incorrect.
 
 | Byte | Field | Notes |
 |------|-------|-------|
-| 0x0B | T1 — Follow-Me room temperature reference | Tracks KJR-12x sensor, not indoor unit's own thermistor (see §0.1) |
+| 0x0B | T1 — Follow-Me room temperature reference | Follow-Me mode dependent value (see note below). See §0.1 for cross-validation. |
 | 0x0C | T2A — Indoor coil inlet (evaporator/condenser inlet) | |
 | 0x0D | T2B — Indoor coil outlet | 0x00 = not reported on this hardware |
 | 0x0E | T3 — Outdoor coil temperature | |
+
+**T1 — Follow-Me mode dependent value:** T1 changes source depending on Follow-Me
+state. When Follow-Me is active, T1 reflects the room temperature measured by the
+wired controller's (KJR-120M/X) built-in sensor — the value pushed via C6 byte[11].
+When Follow-Me is disabled, T1 reverts to the indoor AC unit's own thermistor
+reading. Confirmed in logic analyzer Session 7: T1 dropped from 24.0 °C (controller
+sensor) to 20.5 °C (indoor thermistor) immediately on FM disable.
 
 T4 (outdoor ambient) is not present in the XYE 0xC0 response. It appears in the
 C4 ExtQuery response (byte[21]) and is echoed in the R-T UART 0xC0 Outdoor Temp field.
