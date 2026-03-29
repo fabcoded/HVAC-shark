@@ -193,21 +193,24 @@ Variant A (bit 0x40 set) — own logic analyzer captures + ESPHome esphome-midea
 | 0x42  | Follow-Me UPDATE | Own captures: 4 frames. ESPHome: `sendFollowMeData[10] = 0x42` (subsequent) |
 | 0x44  | Follow-Me STOP | Own captures: 19 frames. ESPHome: `sendFollowMeData[10] = 0x44` (disable) |
 
-Variant B (bit 0x40 clear) — mdrobnak KJR-120X wired controller + rymo wall controller:
+Variant B (bit 0x40 clear) — KJR-120X wired controller (own + mdrobnak) + rymo wall controller:
 
 | Value | Meaning | Source |
 |-------|---------|--------|
-| 0x06  | Follow-Me START | mdrobnak: 3 frames |
-| 0x02  | Follow-Me UPDATE | mdrobnak: 1 frame |
-| 0x04  | Config / Static Pressure | rymo: 5 frames (all SP commands) |
+| 0x06  | Follow-Me START | Own dongle Session 1: 9 frames, Session 2: 3 frames. mdrobnak: 3 frames |
+| 0x04  | Follow-Me STOP | Own dongle Session 1: 3 frames, Session 2: 3 frames. rymo: 5 frames (SP config) |
+| 0x02  | Follow-Me UPDATE | Own dongle Session 1: 1 frame. mdrobnak: 1 frame |
 
 The lower nibble encodes the sub-command (0x02=update, 0x04=stop-or-config, 0x06=start).
-Bit 0x40 appears to be set by ESPHome/ESP-based masters but not by KJR-120X wired
-controllers. Both variants are accepted by the indoor unit. The functional meaning of
-bit 0x40 is unknown — possibly a master-type identifier.
+Bit 0x40 distinguishes master type: set by HAHB-decoded XYE (MFB-X adapter) and
+ESPHome/ESP-based masters, clear on KJR-120X wired controllers.
+**Cross-validated**: own dongle captures (Midea-XtremeSaveBlue-dongle Sessions 1-2,
+KJR-120X passive sniff) independently confirm mdrobnak's Variant B values.
+Both variants are accepted by the indoor unit.
 
 **Byte [11] — Follow-Me Temperature** (direct Celsius, all sources agree):
-- Own captures + mdrobnak + ESPHome: byte[11] = temperature in °C (direct value, no offset).
+- Own dongle captures: 0x13=19°C, 0x14=20°C, 0x15=21°C (varies between sessions, plausible room temps).
+- Own logic analyzer captures + mdrobnak + ESPHome: byte[11] = temperature in °C (direct value, no offset).
 - ESPHome code confirms: `sendFollowMeData[11] = static_cast<uint8_t>(std::round(followMeTemp))`.
 - rymo SP commands: byte[11] = 0x17 (23) — purpose unclear, consistent across all 5 SP frames.
 
@@ -223,8 +226,8 @@ bit 0x40 is unknown — possibly a master-type identifier.
 | 7 | 79× 0x00, 1× 0x10, 1× 0x20 | Phase 6 swing toggle |
 | 8 | 2× 0x00, 1× 0x10, 1× 0x20 | Dedicated swing session |
 | 9 | 6× 0x00 | No swing changes |
-| unsort/FollowMe+program | 11× 0x00, 1× 0x10 | Vertical swing |
-| unsort/FollowMe-off-on | 6× 0x00 | No swing changes |
+| dongle/Session 1 | 11× 0x00, 1× 0x10 | Vertical swing on first C6, then off |
+| dongle/Session 2 | 6× 0x00 | No swing changes, pure Follow-Me toggle |
 
 #### C6 slave response (32-byte)
 
@@ -366,9 +369,10 @@ Offset  Field             Value / Description
                             0xC4, 0xC6: see §0.4 — not all sources agree on existence/meaning
   2     DEST_ID           Target unit 0x00-0x3F; 0xFF=broadcast
   3     SRC_ID            Master address
-  4     MASTER_FLAG       Always 0x00 in all own captures (4847 frames, Sessions 3–9)
-                         and in mdrobnak captures. Codeberg spec claims 0x80 = from master
-                         but this is NOT observed on real hardware — **Corrected**.
+  4     MASTER_FLAG       Always 0x00 in all own captures (4847 logic analyzer frames Sessions 3–9
+                         + 974 dongle frames Sessions 1-2 = 5821 total) and in mdrobnak captures.
+                         Codeberg spec claims 0x80 = from master but this is NOT observed on
+                         real hardware with KJR-120X wired controllers — **Corrected**.
                          NOTE: ESPHome esphome-mideaXYE-rs485 sets 0x80 in C0/C3 templates
                          (likely from Codeberg spec) but 0x00 in its C6 template — inconsistent
                          within the same codebase. Both 0x00 and 0x80 appear to be accepted
@@ -387,7 +391,7 @@ Offset  Field             Description
 ------  -----             -----------
   0     PREAMBLE          0xAA
   1     RESPONSE_CODE     Same code as the query command (e.g. 0xC0)
-  2     SLAVE_FLAG        Always 0x00 in all own captures (4847 frames, Sessions 3–9)
+  2     SLAVE_FLAG        Always 0x00 in all own captures (5821 frames — logic analyzer + dongle)
                          and in mdrobnak captures. Codeberg spec claims 0x80 = slave->master
                          but this is NOT observed on real hardware — **Corrected**.
   3     DEST_ID           Master address
