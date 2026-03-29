@@ -732,6 +732,29 @@ verify with a physical thermometer or the wired controller display.
 
 ---
 
+## 12. Planned Experiments
+
+- [ ] **Change XYE unit address** — modify DEST_ID/SRC_ID fields via dongle to
+      observe bus behavior, KJR-120X response, and polling pattern changes.
+      Clarifies the address bytes (2-5) which are always 0x00 in current captures.
+
+- [ ] **Toggle relay on MFB-C adapter board** — capture XYE bus traffic during
+      relay activation. Determine how the adapter communicates relay state to the
+      indoor unit and what XYE command/response carries the relay control.
+
+- [ ] **Toggle relay on MFB-X adapter board** — same relay test on the HAHB
+      variant for cross-bus comparison.
+
+- [ ] **Controlled setpoint test** — set a known temperature via XYE, verify with
+      wired controller display and physical thermometer. Resolves the §11 encoding
+      variant questions (raw-0x40 vs direct vs Fahrenheit auto-detect).
+
+- [ ] **Fahrenheit mode test** — switch KJR-120X display to °F, capture C3 commands
+      during setpoint changes. Verify if bit 7 of byte[8] is the °C/°F flag, what
+      values the controller sends, and how the unit responds (byte[10] encoding).
+
+---
+
 ## References
 
 - XYE reverse engineering: https://codeberg.org/xye/xye
