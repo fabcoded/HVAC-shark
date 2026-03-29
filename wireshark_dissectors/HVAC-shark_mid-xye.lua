@@ -254,37 +254,33 @@ local function decode_uart_c0_status(body_tree, buf, body_off, body_len, cmd_id)
     body_tree:add(buf(body_off + 7, 1), string.format("Swing: %s",
         getSerialSwingString(swing_val)))
 
-    -- body[8]: cosy sleep, turbo (location 2), save, Follow Me
+    -- body[8]: cosy sleep, alarm sleep, power save, low wind, turbo, energy save, Follow Me
     local b8 = buf(body_off + 8, 1):uint()
-    local turbo2 = bit.band(b8, 0x20) ~= 0
     local follow_me = bit.band(b8, 0x80) ~= 0
     body_tree:add(buf(body_off + 8, 1), string.format(
-        "Cosy Sleep: %d, Save: %s, Turbo2: %s, FollowMe: %s",
+        "CosySleep: %d, AlarmSleep: %s, PowerSave: %s, LowWind: %s, Turbo: %s, EnergySave: %s, FollowMe: %s",
         bit.band(b8, 0x03),
+        bit.band(b8, 0x04) ~= 0 and "yes" or "no",
         bit.band(b8, 0x08) ~= 0 and "yes" or "no",
-        turbo2 and "yes" or "no",
+        bit.band(b8, 0x10) ~= 0 and "yes" or "no",
+        bit.band(b8, 0x20) ~= 0 and "yes" or "no",
+        bit.band(b8, 0x40) ~= 0 and "yes" or "no",
         follow_me and "yes" or "no"))
 
-    -- body[9]: eco, child sleep, PTC, dry clean
-    -- *** CONTROVERSY: ECO bit position ***
-    -- dudanov + midea-local: bit 4 (0x10) ← consensus
-    -- PI HVAC databridge response.py: bit 7 (0x80) ← confirmed bug
-    -- SET command (0x40) uses bit 7 — different bit for set vs response!
+    -- body[9]: child sleep, natural fan, dry clean, PTC, ECO(read), clean up, cosy sleep switch, localBodySense
+    -- ECO read position is bit 4 in 0xC0 response; write position is bit 7 in 0x40 SET (different bits!)
+    -- bit 7 in 0xC0 response = localBodySense (occupancy sensor), NOT ECO
     local b9 = buf(body_off + 9, 1):uint()
-    local eco_bit4 = bit.band(b9, 0x10) ~= 0   -- consensus: bit 4
-    local eco_bit7 = bit.band(b9, 0x80) ~= 0   -- bug: bit 7
-    local eco_str = ""
-    if eco_bit4 then eco_str = "ECO(bit4)" end
-    if eco_bit7 then eco_str = eco_str .. (eco_str ~= "" and "+ECO(bit7)" or "ECO(bit7)") end
-    if eco_str == "" then eco_str = "no" end
     body_tree:add(buf(body_off + 9, 1), string.format(
-        "ECO: %s, ChildSleep: %s, NaturalFan: %s, DryClean: %s, PTC: %s, CleanUp: %s   [NOTE: ECO bit controversial - bit4=dudanov/midea-local, bit7=set-cmd]",
-        eco_str,
+        "ChildSleep: %s, NaturalFan: %s, DryClean: %s, PTC: %s, ECO: %s, CleanUp: %s, CosySleepSw: %s, LocalBodySense: %s",
         bit.band(b9, 0x01) ~= 0 and "yes" or "no",
         bit.band(b9, 0x02) ~= 0 and "yes" or "no",
         bit.band(b9, 0x04) ~= 0 and "yes" or "no",
         bit.band(b9, 0x08) ~= 0 and "yes" or "no",
-        bit.band(b9, 0x20) ~= 0 and "yes" or "no"))
+        bit.band(b9, 0x10) ~= 0 and "yes" or "no",
+        bit.band(b9, 0x20) ~= 0 and "yes" or "no",
+        bit.band(b9, 0x40) ~= 0 and "yes" or "no",
+        bit.band(b9, 0x80) ~= 0 and "yes" or "no"))
 
     -- body[10]: sleep, turbo (primary), temp unit, exchange air, night light, etc.
     local b10 = buf(body_off + 10, 1):uint()
@@ -1260,12 +1256,13 @@ local function decode_uart_40_set(body_tree, buf, body_off, body_len)
             getSerialSwingString(swing)))
     end
 
-    -- body[8]: cosy sleep, turbo(loc1), power saver, Follow Me
+    -- body[8]: cosy sleep, alarm sleep, power save, low wind, turbo, energy save, Follow Me
     if body_len > 8 then
         local b8 = buf(body_off + 8, 1):uint()
         body_tree:add(buf(body_off + 8, 1), string.format(
-            "CosySleep: %d, Save: %s, LowFreqFan: %s, Turbo1: %s, PowerSaver: %s, FollowMe: %s",
+            "CosySleep: %d, AlarmSleep: %s, PowerSave: %s, LowWind: %s, Turbo: %s, EnergySave: %s, FollowMe: %s",
             bit.band(b8, 0x03),
+            bit.band(b8, 0x04) ~= 0 and "yes" or "no",
             bit.band(b8, 0x08) ~= 0 and "yes" or "no",
             bit.band(b8, 0x10) ~= 0 and "yes" or "no",
             bit.band(b8, 0x20) ~= 0 and "yes" or "no",
@@ -1350,6 +1347,17 @@ local function decode_uart_41_query(body_tree, buf, body_off, body_len)
             body_tree:add(buf(body_off + 2, 1), "body[2] = 0x00 (Status query)")
             body_tree:add(buf(body_off + 3, 1), string.format(
                 "body[3] = 0x%02X (query param — expects 0xC0 response)", b3))
+            -- R/T bus Follow Me temperature: standard query with body[4]=0x01, body[5]=T*2+50
+            if body_len >= 5 then
+                local opt = buf(body_off + 4, 1):uint()
+                if opt == 0x01 and body_len >= 6 then
+                    local fm_raw = buf(body_off + 5, 1):uint()
+                    body_tree:add(buf(body_off + 4, 1),
+                        "body[4] = 0x01 (Follow Me temperature — R/T bus variant)")
+                    body_tree:add(buf(body_off + 5, 1), string.format(
+                        "body[5] = 0x%02X (Follow Me temp: %.1f °C)", fm_raw, (fm_raw - 50) / 2.0))
+                end
+            end
         elseif b2 == 0x01 then
             local group = bit.band(b3, 0x0F)
             local page_name = group_page_names[b3] or string.format("Group %d", group)

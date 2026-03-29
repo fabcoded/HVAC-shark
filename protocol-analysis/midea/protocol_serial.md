@@ -14,7 +14,7 @@ by multiple transport framings:
 | Transport | Framing Document | Physical Path |
 |-----------|-----------------|---------------|
 | **UART** | [protocol_uart.md](protocol_uart.md) | Wi-Fi dongle ↔ mainboard (CN3) |
-| **R/T (HA/HB)** | [protocol_rt.md](protocol_rt.md) | Display board ↔ extension board (CN1 R/T pin) |
+| **R/T (Adapterboard for XYE or HA/HB)** | [protocol_rt.md](protocol_rt.md) | Display board ↔ extension board (CN1 R/T pin) |
 
 Each transport wraps the serial protocol body in its own header and integrity
 bytes. The body payload (msg_type + body bytes) is byte-for-byte identical
@@ -181,13 +181,14 @@ and **body[2]** (variant selector). Do not conflate with the 0x40 set command.
 
 ### Variant table
 
-| body[1] | body[2] | body[3] | Name | Expected response |
-|---------|---------|---------|------|-------------------|
-| `0x81` | `0x00` | `0xFF` | **Status query** | `0xC0` status response |
-| `0x81` | `0x01` | page ID | **Group dev-param query** (mill1000/midea-msmart Finding 11, see `midea-msmart-mill1000.md`) | `0xC1` group page response |
-| `0x21` | `0x01` | `0x44` | **Power usage query** (Group 4) | `0xC1` Group 4 power response (BCD) |
-| `0x21` | varies | varies | **Extended query** (mill1000/midea-msmart Finding 7, see `midea-msmart-mill1000.md`) | `0xC1` extended state |
-| `0x61` | `0x00` | `0xFF` | **Display toggle** | — |
+| body[1] | body[2] | body[3] | body[4] | Name | Expected response |
+|---------|---------|---------|---------|------|-------------------|
+| `0x81` | `0x00` | `0xFF` | `0x00` | **Status query** | `0xC0` status response |
+| `0x81` | `0x00` | `0xFF` | `0x01` | **Follow Me temperature** (R/T only, `body[5]=T*2+50`) — see §3.1.1, §3.1.4.6 | `0xC0` status response |
+| `0x81` | `0x01` | page ID | `0x00` | **Group dev-param query** (mill1000 Finding 11) | `0xC1` group page response |
+| `0x21` | `0x01` | `0x44` | `0x00` | **Power usage query** (Group 4) | `0xC1` Group 4 power response (BCD) |
+| `0x21` | varies | varies | optCmd | **Extended query** (mill1000 Finding 7, optCommand in body[4]) | `0xC1` extended state |
+| `0x61` | `0x00` | `0xFF` | — | **Display toggle** | — |
 
 ### Body layout — note on bus path differences
 
@@ -220,6 +221,26 @@ Captured frame (R/T bus, body shown, bytes 11..33 of 38-byte frame):
 ```
 41 81 00 FF 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 36
 ```
+
+**R/T Follow Me temperature variant**: When Follow Me is active, the R/T bus
+repurposes `body[4]` to carry optCommand=0x01 (Follow Me temperature) within
+the standard query frame. The frame structure is identical except
+`body[4]=0x01` and `body[5]=T*2+50`. This is an R/T-specific variant — the
+UART bus uses the extended format (`body[1]=0x21`) for optCommand, while the
+R/T bus uses the standard format (`body[1]=0x81`). See §3.1.4.6 for encoding
+details and §3.1.4.6 "Cross-bus comparison" table for differences between buses.
+
+Captured frame (R/T bus, Session 7, Follow Me active at 24°C):
+```
+41 81 00 FF 01 62 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 XX
+               ^^ body[4]=0x01 (optCommand: Follow Me temperature)
+                  ^^ body[5]=0x62 → (98-50)/2 = 24.0°C
+```
+
+This variant is sent by the busadapter (busadapter → display) once per R/T
+polling cycle while Follow Me is active. It stops during idle periods when
+Follow Me is off but reappears briefly during operator actions (stale
+temperature). See `analysis_follow_me_serial.md` §5 for full evidence.
 
 #### 3.1.2 Capability page query (body[1]=0x81, body[2]=0x01) — Group-Based Dev Params
 
@@ -543,16 +564,20 @@ Body (22 bytes, community sources):
   [22] MSG_ID
 ```
 
-#### 3.1.4 Extended query (body[1]=0x21, body[2] varies, optCommand in body[4])
+#### 3.1.4 optCommand queries — Follow Me, extended state, engineering modes
 
-A shorter 24-byte variant of the 0x41 command used for Follow Me temperature pushes,
-extended state queries, and engineering modes. Distinguished from the standard 0x41
-by body[1]=0x21 (vs 0x81) and a shorter frame.
+The optCommand mechanism selects query variants (Follow Me temperature push,
+extended state query, engineering modes) via `body[4]`. It appears in two
+frame formats depending on bus:
 
-Source: mill1000/midea-msmart Finding 7 and Finding 10 (see `midea-msmart-mill1000.md`).
-Confidence: optCommand 0x01 and 0x03 are **Consistent** (multi-source: weex.js + Lua + ACDriver.js agree). All other optCommand values are **Hypothesis** (single source: weex.js only).
+- **UART**: Extended query (`body[1]=0x21`, 24-byte frame) — documented in
+  mill1000/midea-msmart Finding 7 and Finding 10 (see `midea-msmart-mill1000.md`)
+- **R/T**: Standard query (`body[1]=0x81`, 38-byte frame) with `body[4]`
+  repurposed — own captures, Sessions 4, 5, 7 (see §3.1.1 for hex example)
 
-##### Frame layout (24 bytes total)
+Confidence: optCommand 0x01 and 0x03 are **Consistent** (multi-source: mill1000/midea-msmart Finding 7 + own R/T captures). All other optCommand values are **Hypothesis** (single source within mill1000/midea-msmart Finding 7, not verified on hardware).
+
+##### 3.1.4.1 UART extended frame layout (24 bytes total)
 
 ```
 Offset  Value               Field
@@ -583,23 +608,36 @@ or 1 (beep). This is one of three independent buzzer mechanisms:
 |------|----------|-------|
 | 0x40 set command | body[1] bit 6 | BYTE_BUZZER_ON = 0x40 |
 | Extended 0x41 | body[1] bit 6 | `sound << 6 \| 0x21` |
+| Standard 0x41 | body[1] bit 6 | `0x81` or `0xC1` (bit 6 = buzzer) |
 | 0xB0 property | property 0x1A, 0x00 | 0x00=off, 0x01=on |
 
-##### Comparison: Standard vs Extended 0x41
+**Own captures**: Buzzer bit 6 was **never set** on either bus — R/T body[1]=0x81
+always (937 0x41 frames, 78 0x40 frames), UART body[1]=0x21 always (11 extended
+frames). The room controller (KJR-120M) beeps locally.
+
+##### 3.1.4.2 Comparison: Standard vs Extended 0x41
 
 | Aspect | Standard 0x41 | Extended 0x41 |
 |--------|---------------|---------------|
 | Frame length | 35 bytes (0x23) | 24 bytes (0x17) |
 | body[1] | 0x81 | 0x21 (+ buzzer bit 6) |
-| body[4] | 0x00 (unused) | optCommand (selects variant) |
+| body[4] | 0x00 or optCommand *** | optCommand (selects variant) |
 | body[7] | 0x02 (fixed) | queryStat (when optCommand=0x03) |
 | Response type | 0xC0 status | 0xC1 extended (sub-pages 0x01 + 0x02) |
 | Body length | 22-23 bytes | 12 bytes |
 
-##### optCommand table (body[4])
+*** **R/T bus exception**: On the R/T extension board bus, the standard 0x41
+(`body[1]=0x81`) repurposes `body[4]` to carry the optCommand — specifically
+`body[4]=0x01` with `body[5]=T*2+50` for Follow Me temperature. The extended
+format (`body[1]=0x21`) was never observed on the R/T bus (Sessions 3–9).
+See `analysis_follow_me_serial.md` §5 for evidence.
 
-All optCommand values share the same 24-byte frame structure; only body[5], body[6],
-and body[7] payload bytes differ:
+##### 3.1.4.3 optCommand table (body[4])
+
+On the UART bus, optCommand values use the 24-byte extended frame (`body[1]=0x21`).
+On the R/T bus, optCommand=0x01 (Follow Me temperature) was observed in the
+standard 38-byte query (`body[1]=0x81`) — see §3.1.1. The payload encoding
+(`body[5..9]`) is the same in both formats:
 
 | optCommand | Purpose | body[5] | body[6] | body[7] | body[8] | body[9] | Confidence |
 |------------|---------|---------|---------|---------|---------|---------|------------|
@@ -613,10 +651,10 @@ and body[7] payload bytes differ:
 
 Note: optCommand 0x04 places its payload at **body[8]** (not body[7]). optCommand 0x05
 uses **body[9]**. optCommand 0x06 OR's `(maxCoolHeat & 0x01) << 7` into body[9] bit 7.
-Source: mill1000/midea-msmart Finding 7 (see `midea-msmart-mill1000.md`), verified against
-weex.js. optCommand values 0x04-0x06 are single-source and unverified on hardware.
+Source: mill1000/midea-msmart Finding 7 (see `midea-msmart-mill1000.md`).
+optCommand values 0x04-0x06 are single-source and unverified on hardware.
 
-##### Direct C1 sub-page query (CMDTYPE_QUERY_C1_1 / C1_2)
+##### 3.1.4.4 Direct C1 sub-page query (CMDTYPE_QUERY_C1_1 / C1_2)
 
 An alternative to optCommand=0x03 — a shorter **14-byte frame** that requests a specific
 C1 sub-page directly by number:
@@ -639,7 +677,7 @@ This bypasses the optCommand/queryStat mechanism entirely. The response is the s
 
 Source: mill1000/midea-msmart Finding 7 (see `midea-msmart-mill1000.md`). **Hypothesis**.
 
-##### queryStat values (body[7] when optCommand=0x03)
+##### 3.1.4.5 queryStat values (body[7] when optCommand=0x03)
 
 | queryStat | Purpose | Response |
 |-----------|---------|----------|
@@ -648,7 +686,7 @@ Source: mill1000/midea-msmart Finding 7 (see `midea-msmart-mill1000.md`). **Hypo
 | 0x02 | Extended state query | 0xC1 sub-pages 0x01 + 0x02 (see §4.2.3, §4.2.4) |
 | 0x03 | Outdoor-focused query | Unknown response format |
 
-##### Follow Me temperature (optCommand=0x01)
+##### 3.1.4.6 Follow Me temperature (optCommand=0x01)
 
 When Follow Me is enabled (via 0x40 set command body[8] bit 7 = 1), the remote or
 phone periodically sends its measured room temperature using optCommand=0x01.
@@ -668,25 +706,48 @@ AA 17 AC 00 00 00 00 00 00 03  41 21 00 FF 01 5E 00 00 00 00 00 00  <CRC> <CHK>
                                                ^^ 22*2+50 = 94 = 0x5E
 ```
 
+**R/T bus variant** (own captures, Sessions 4, 5, 7 — confirmed): The R/T bus
+uses the standard query format (`body[1]=0x81`, 38-byte frame) with `body[4]`
+repurposed to carry optCommand=0x01. Same temperature encoding (`body[5]=T*2+50`)
+as the UART extended format. See §3.1.1 for hex example and
+`analysis_follow_me_serial.md` §5 for full cross-session verification.
+
 **Cross-bus comparison — Follow Me temperature encoding**:
 
-| Bus | Encoding | Example: 22 C |
-|-----|----------|---------------|
-| UART extended 0x41 | `T * 2 + 50` | 0x5E (94) |
-| XYE C3 command | `T + 0x40` | 0x56 (86) |
-| UART 0xC0 indoor | `(raw - 50) / 2` | same formula, different direction |
+| Bus | Frame | Encoding | Example: 22 C |
+|-----|-------|----------|---------------|
+| UART extended 0x41 (`body[1]=0x21`) | 24-byte, body[4]=optCommand | `T * 2 + 50` | 0x5E (94) |
+| R/T standard 0x41 (`body[1]=0x81`) | 38-byte, body[4]=optCommand | `T * 2 + 50` | 0x5E (94) |
+| XYE C6 byte[11] | 16-byte command | direct Celsius | 0x16 (22) |
+| XYE C3 byte[8] (setpoint context) | 16-byte command | `T + 0x40` | 0x56 (86) |
+| R/T 0xC0 body[11] (readback) | 38-byte response | `(raw - 50) / 2` | 0x5E (94) |
 
 The UART and XYE encodings differ. See `protocol_xye.md` §0.4a for the XYE Follow-Me mechanism.
 
-##### Follow Me enable / readback
+##### 3.1.4.7 Follow Me enable / readback
 
 | Direction | Location | Bit | Field | Meaning |
 |-----------|----------|-----|-------|---------|
-| Command (0x40 set) | body[8] | bit 7 | bodySense | 1 = enable Follow Me |
-| Response (0xC0) | body[8] | bit 7 | bodySense | 1 = Follow Me active |
-| Response (0xC0) | body[9] | bit 7 | localBodySense | 1 = unit's own body-sense active |
+| Command (0x40 set) | body[8] | bit 7 | Follow Me (bodySense) | 1 = enable Follow Me |
+| Response (0xC0) | body[8] | bit 7 | Follow Me (bodySense) | 1 = Follow Me active |
+| Response (0xC0) | body[9] | bit 7 | localBodySense | 1 = built-in occupancy sensor active. **Hypothesis** — OQ-17. Own captures: always 0x00 |
 
-##### Hex template (optCommand=0x03, queryStat=0x02, extended state query)
+**Three body-sensing feature types** — the source code uses similar-sounding
+names for three distinct features:
+
+| Feature | Field name | Location | Function |
+|---------|------------|----------|----------|
+| **Follow Me** | `bodySense` | body[8] bit 7 (SET + RSP) | Overrides the unit's measured temperature with an external value sent via IR remote or serial interface (phone/controller). The unit uses this temperature for its control loop instead of its own thermistor. |
+| **Local body sense** | `localBodySense` | body[9] bit 7 (RSP only) | Occupancy sensor — detects/tracks a person in the room. Exact behavior unknown (acts according to unit settings). Only on models with a built-in sensor. |
+| **Wisdom Eye** | `wisdomEye` | body[9] bit 0 (SET) | Occupancy sensor — detects/tracks a person in the room. Exact behavior unknown. Only on models with a built-in sensor. |
+
+Follow Me is a temperature override mechanism (documented in §3.1.4.6). The
+other two are occupancy sensors — what the unit does when it detects/loses a
+person is unknown from protocol data alone and depends on unit settings and
+model. Our test unit (XtremeSave Blue) does not have a built-in occupancy
+sensor.
+
+##### 3.1.4.8 Hex template (optCommand=0x03, queryStat=0x02, extended state query)
 
 ```
 AA 17 AC 00 00 00 00 00 00 03  41 21 00 FF 03 FF 00 02 00 00 00 NN  <CRC> <CHK>
@@ -884,11 +945,11 @@ Offset  Offset  Bits        Field
 
   8      18     bits [1:0]  Cosy sleep mode (0-3)
                 bit 2       Alarm sleep
-                bit 3       Save
-                bit 4       Low frequency fan
-                bit 5       Turbo mode (duplicate, also in byte 10)
-                bit 6       Power saver
-                bit 7       Feel own
+                bit 3       Power save (powerSave)
+                bit 4       Low frequency fan (farceWind / low wind)
+                bit 5       Turbo mode (strong) (duplicate, also in byte 10)
+                bit 6       Energy save (energySave)
+                bit 7       Follow Me (bodySense) — confirmed, see §3.1.4.7; OQ-16 resolved
 
   9      19     bit 0       Wise eye / child sleep (NeoAcheron: childSleep)
                 bit 1       Exchange air
@@ -897,6 +958,8 @@ Offset  Offset  Bits        Field
                 bit 4       PTC button / eco mode (NeoAcheron: eco_mode)
                 bit 5       Clean up
                 bit 6       Change cosy sleep
+                bit 7       Eco mode (write position) — see §4.1 body[9] bit 4 for read position.
+                            Source: mill1000/midea-msmart Finding 4. dudanov + midea-local agree.
 
 **Validated from captures (Sessions 1 and 8, UART bus):**
 
@@ -1143,7 +1206,7 @@ see `midea-msmart-mill1000.md`):
 | Response | 0xC1, body[1]=0x21, one 10-byte group per page | 0xC1, body[1]=0x01/0x02, ~80 bytes per sub-page |
 | Coverage | 8 groups x ~15 fields each | 2 sub-pages, ~80 fields total |
 | Precision | Temperatures: 0.5 C steps | Temperatures: 0.01 C precision (16-bit) |
-| Protocol era | "Classic" — older/standard interface | Extended — newer devices, single-source (weex.js) |
+| Protocol era | "Classic" — older/standard interface | Extended — newer devices, single-source (mill1000/midea-msmart Finding 7) |
 | Own captures | Groups 1-5 captured on R/T bus (Session 1) | **Not captured** — requires extended query |
 
 ---
@@ -1391,7 +1454,7 @@ or deviceSN8 variants.
 ### 3.5 Command 0xB0/0xB1 — Property Protocol (newer devices)
 
 Source: mill1000/midea-msmart Finding 9 (see `midea-msmart-mill1000.md`).
-All fields: **Hypothesis** — single source (ACDriver.js), not verified against own captures.
+All fields: **Hypothesis** — single source within mill1000/midea-msmart Finding 9, not verified against own captures.
 
 A newer "property" protocol that supplements the 0x40/0x41 command set for features
 not covered by the fixed-format body (indirect wind, breeze, fresh air, screen display).
@@ -1539,24 +1602,29 @@ Byte  Bits        Field                   Formula
       bits [3:2]  Up-down fan (vertical swing)
       (NeoAcheron: byte & 0x0F = swing_mode)
 
- 8    bits [1:0]  Cosy sleep (0-3)
-      bit 3       Save
-      bit 4       Low frequency fan
-      bit 5       Turbo mode (location 2)
-      bit 7       Feel own
+ 8    bits [1:0]  Cosy sleep mode (0-3)
+      bit 2       Alarm sleep
+      bit 3       Power save (powerSave)
+      bit 4       Low frequency fan (farceWind / low wind)
+      bit 5       Turbo mode (strong)
+      bit 6       Energy save (energySave)
+      bit 7       Follow Me (bodySense) — see §3.1.4.7; OQ-16 resolved
 
  9    bit 0       Child sleep
       bit 1       Natural fan
       bit 2       Dry clean
       bits [4:3]  PTC heater (2-bit field, PTCValue = bits[4:3] combined; Finding 5)
       bit 4       Eco mode (read position in 0xC0 response)
-                  NOTE: ECO write position in 0x40 command is bit 7 of byte 9 (0x80).
-                  Bit 4 is the read position in the response, bit 7 is the write position
-                  in the command — different bit positions for the same logical flag (Finding 4).
-                  Source: mill1000/midea-msmart Findings 4–5 (see `midea-msmart-mill1000.md`).
+                  NOTE: ECO has different bit positions for read vs write:
+                  bit 4 here in the 0xC0 response (read), bit 7 in the 0x40 SET
+                  command (write) — see §3.2 body[9]. Source: mill1000/midea-msmart
+                  Findings 4–5 (see `midea-msmart-mill1000.md`).
       bit 5       Clean up / purifier
       bit 6       Self cosy sleep
-      bit 7       Eco mode (write position in 0x40 command — see note above)
+      bit 7       localBodySense — built-in occupancy sensor active.
+                  **Hypothesis** (mill1000/midea-msmart Finding 10b, OQ-17).
+                  Own captures: always 0x00 (test unit has no occupancy sensor).
+                  See §3.1.4.7 for the three body-sensing feature types.
 
 10    bit 0       Sleep mode
       bit 1       Turbo mode (primary)
@@ -1597,13 +1665,13 @@ Byte  Bits        Field                   Formula
 ```
 
 **body[8] bit 7 — Follow Me active (bodySense)**: When set, indicates the unit is using
-the remote/phone temperature as the room reference instead of its own sensor. See §3.1.4
-for the Follow Me temperature push mechanism. Source: mill1000/midea-msmart Finding 10
-(see `midea-msmart-mill1000.md`). **Consistent** (multiple sources agree).
+the remote/phone temperature as the room reference instead of its own sensor. See §3.1.4.6
+for the Follow Me temperature push mechanism and §3.1.4.7 for the enable/readback table.
+**Confirmed** — own R/T captures (Sessions 3–8) + mill1000/midea-msmart Finding 10.
 
 **body[14] bits[3:0] — PMV (Predicted Mean Vote)**: A thermal comfort index based on the
 ISO 7730 / ASHRAE 55 PMV scale. Encoding: `pmv = (bits[3:0]) * 0.5 - 3.5`.
-Source: reneklootwijk/node-mideahvac. **Consistent** (node-mideahvac + Lua Q1B agree).
+Source: reneklootwijk/node-mideahvac. **Consistent** (node-mideahvac + mill1000/midea-msmart reference agree).
 
 | Raw (bits[3:0]) | PMV value | Description |
 |-----------------|-----------|-------------|
@@ -2473,7 +2541,7 @@ Consolidated list of unresolved items from throughout this document:
 
 | ID | Topic | Section | Status | Notes |
 |----|-------|---------|--------|-------|
-| OQ-01 | ~~PMV mode value meanings~~ | §4.1 | **Resolved** | Full PMV table added (-3.0 to +2.5, 13 values) from node-mideahvac + Lua Q1B |
+| OQ-01 | ~~PMV mode value meanings~~ | §4.1 | **Resolved** | Full PMV table added (-3.0 to +2.5, 13 values) from reneklootwijk/node-mideahvac + mill1000/midea-msmart reference |
 | OQ-02 | Alternative temp packing trigger | §4.1 | Hypothesis | Trigger condition for byte[1] vs byte[2] format unknown |
 | OQ-03 | ~~Silky cool frame-length conditional~~ | §4.1 | **Resolved** | Documented: body[22] only present if body >= 23 bytes; B5 SILKY_COOL (0x0018) capability flag |
 | OQ-04 | A2/A3/A5/A6 heartbeat body structures | §5.4 | Unknown | Present in captures, no source decodes them |
@@ -2485,12 +2553,12 @@ Consolidated list of unresolved items from throughout this document:
 | OQ-10 | C1 power subbody type 0x40 | §4.2.1 | Not Covered | Only 0x44 format documented; 0x40 exists but undocumented |
 | OQ-11 | Display toggle body[1] variant | §3.1.5 | Variant | dudanov=0x61, midea-local=0x02/0x42; device generation dependent |
 | OQ-12 | ~~Section 5.1.4 extended query~~ | §3.1.4 | **Resolved** | Fully expanded: frame layout, optCommand table, Follow Me encoding, queryStat values |
-| OQ-13 | ~~B0/B1 property protocol~~ | §3.5 | **Resolved** | Expanded to 53 property IDs from Lua Q14 validation |
+| OQ-13 | ~~B0/B1 property protocol~~ | §3.5 | **Resolved** | Expanded to 53 property IDs from mill1000/midea-msmart reference validation |
 | OQ-14 | Group 0 byte order (16-bit BE vs LE) | §3.1.2 | Unknown | Group 0 uses 16-bit BE for days; Group 5 uses 16-bit LE — inconsistency needs verification |
 | OQ-15 | Old B5 fixed-format field details | §3.4.2 | Hypothesis | Cursor-based field map from single source; not verified |
-| OQ-16 | Follow Me body[8] bit 7 — Lua vs Python/weex.js | §3.1.4 | Disputed | Python/weex.js put bodySense at body[8] bit 7. Lua SET command has strongWind/comfortableSleep/power_saving at body[8] instead. Needs hardware test |
-| OQ-17 | localBodySense not found | §3.1.4 | Unknown | Finding 10b claims body[9] bit 7 = localBodySense, but not found in weex.js or Python |
-| OQ-18 | 0xA0 alternative temp encoding | §5.3 | Hypothesis | weex.js `praserA0` uses `((info[1] & 0x3E) >> 1) + 12` with half-degree in bit 6. Trigger: dataType=0x05, body[0]=0xA0 |
+| OQ-16 | Follow Me body[8] bit 7 — Lua vs mill1000/midea-msmart | §3.1.4.7 | **Confirmed** | Own R/T captures (Sessions 3–8) confirm body[8] bit 7 = Follow Me (bodySense). mill1000/midea-msmart Finding 10 is correct. See `analysis_follow_me_serial.md` §8 |
+| OQ-17 | localBodySense — occupancy sensor | §3.1.4.7 | **Hypothesis** | mill1000/midea-msmart Finding 10b: body[9] bit 7 = localBodySense (built-in occupancy sensor). Source confirmed in reference code response parser. Own captures: always 0x00 (test unit has no occupancy sensor). Previously mislabeled as ECO in §4.1 — corrected |
+| OQ-18 | 0xA0 alternative temp encoding | §5.3 | Hypothesis | mill1000/midea-msmart Finding 7: alternative temp formula `((body[1] & 0x3E) >> 1) + 12` with half-degree in bit 6. Trigger: dataType=0x05, body[0]=0xA0. Not verified on hardware |
 | OQ-19 | 20 new MSG_TYPEs unverified | §2.1 | Consistent | Firmware-verified but not captured on own hardware |
 | OQ-20 | Python msmart: no A1 heartbeat | — | Gap | Python library does not parse A1 (0xA1) heartbeat frames |
 | OQ-21 | deviceSN8 variant temperature decoding | §3.4.2 | Hypothesis | CA models use different bit positions in B5 temp field. Needs testing across model families (Finding 14a) |
@@ -2511,12 +2579,12 @@ dedicated deep-dive into specific source code or additional capture sessions.
 | DA-01 | 0xBB sub-protocol field map | `chemelli74/midea-local` | Code review of XBB parser; ~500 lines |
 | DA-02 | B0/B1 property ID complete list | `chemelli74/midea-local` | Code review of property handlers |
 | DA-03 | Alternative temp packing trigger | `mill1000/midea-msmart` | Trace format flag detection logic |
-| DA-04 | ~~PMV mode value definitions~~ | **Resolved** — found in node-mideahvac README + Lua Q1B | Encoding: `(bits[3:0]) * 0.5 - 3.5` |
+| DA-04 | ~~PMV mode value definitions~~ | **Resolved** — found in reneklootwijk/node-mideahvac + mill1000/midea-msmart reference | Encoding: `(bits[3:0]) * 0.5 - 3.5` |
 | DA-05 | A2/A3/A5/A6 body structures | Own captures + future source releases | Capture session with WiFi module paired to trigger these |
 | DA-06 | Older JS driver review | mill1000/midea-msmart (see `midea-msmart-mill1000.md`) | ~50 KB, dated 2018-07-03. Review for older protocol variants |
 | DA-07 | 0xCC dehumidifier protocol files | mill1000/midea-msmart (see `midea-msmart-mill1000.md`) | May share UART framing. 2983 + 988 lines |
 | DA-08 | UI component protocol assumptions | mill1000/midea-msmart (see `midea-msmart-mill1000.md`) | May contain implicit protocol assumptions |
 | DA-09 | ~~0xA0 response alternative temp~~ | **Documented** in OQ-18 | Encoding: `((info[1] & 0x3E) >> 1) + 12`, trigger: dataType=0x05 |
-| DA-10 | ~~B0/B1 complete property list~~ | **Resolved** — 53 IDs extracted from Lua Q14 | See §3.5 |
+| DA-10 | ~~B0/B1 complete property list~~ | **Resolved** — 53 IDs extracted from mill1000/midea-msmart reference | See §3.5 |
 | DA-11 | deviceSN8 variant mapping | Own captures from different Midea models | Which SN8 values map to which AC product lines? |
 | DA-12 | Comfort sleep curve format | mill1000/midea-msmart (see `midea-msmart-mill1000.md`) | Comma-separated hex string — trace how it's applied to temperature setpoints |
