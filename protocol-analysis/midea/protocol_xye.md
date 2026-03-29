@@ -257,9 +257,18 @@ polling cycle alongside C0/C3/C4 traffic.
 | [5] | Operating Mode | User-set mode only (§5.1), no Auto sub-modes | Session 7: all 5 modes tracked |
 | [6] | Fan Speed | Same as C0/C3 (§6) | Session 7: Auto/Low/High tracked |
 | [7] | Set Temperature | T + 0x40 (§7) | Session 7: full 16–30°C sweep |
-| [8–10] | Unknown | 0x00 | Sessions 3–9 |
-| [11] | **Swing** | See below | Sessions 7/8 |
-| [12–29] | Unknown/CRC/EOF | Various | |
+| [8–10] | Reserved | 0x00 | **Confirmed** constant (1540 frames, Sessions 3–9) |
+| [11] | **Swing** | See below | **Confirmed** Sessions 7/8 |
+| [12–14] | Reserved | 0x00 | **Confirmed** constant (1540 frames) |
+| [15] | **FLAGS_1** | 0x04 or 0x06 (2 values) | Sessions 3–9: 592× 0x04, 948× 0x06 |
+| [16] | **OUTDOOR_TEMP?** | Variable (7 distinct: 0x0A–0x19) | Hypothesis: outdoor ambient temp as direct integer (10–25 matches session ambient °C) |
+| [17] | Reserved | 0x00 | **Confirmed** constant (1540 frames) |
+| [18] | **UNKNOWN_A** | 0x61, 0x97, 0xA0–0xA2 (5 values) | Variable across sessions, stable within session |
+| [19] | **UNKNOWN_B** | 25 distinct values | Highly variable — possibly a counter or status word |
+| [20–28] | Reserved | 0x00 | **Confirmed** constant (1540 frames) |
+| [29] | **CRC** | 85 distinct values | Highly variable — almost certainly CRC byte |
+| [30] | CRC (original) | Two's complement checksum | Per protocol §3 |
+| [31] | EPILOGUE | 0x55 | All sessions |
 
 **Byte [11] — Swing state** (Sessions 7/8):
 
@@ -347,21 +356,21 @@ Offset  Field             Description
  12     T2A_COIL_IN       Indoor coil inlet — formula (raw-40)/2 — Confirmed §0.1
  13     T2B_COIL_OUT      Indoor coil outlet — formula (raw-40)/2; 0x00 = not reported on this HW
  14     T3_OUTDOOR_COIL   Outdoor coil temperature — formula (raw-40)/2 — Confirmed §0.1
- 15     CURRENT           0-99 A (direct value) — **always 0x00 on this HW** (Sessions 6–9). Current draw is only available via UART C1 Group 1 (R-T bus: body[7] outdoor current) or UART C1 Group 4 (WiFi: body[16..18] real-time power — T_0000 Lua publishes dual decode: BCD as `real_time_power_10` and binary uint24BE as `real_time_power`; body[4..7] total energy as uint32BE/100 kWh)
- 16     FREQUENCY         typically 0xFF
- 17     TIMER_START       Bitmask
- 18     TIMER_STOP        Bitmask
+ 15     CURRENT           0-99 A (direct value) — **always 0x00 on this HW** — Confirmed (1357 frames, Sessions 3–9). Current draw is only available via UART C1 Group 1 (R-T bus: body[7] outdoor current) or UART C1 Group 4 (WiFi: body[16..18] real-time power)
+ 16     FREQUENCY         **constant 0xFF** across all 1357 frames (Sessions 3–9)
+ 17     TIMER_START       Bitmask — **always 0x00** across all 1357 frames. Timer encoding not exercised in any capture.
+ 18     TIMER_STOP        Bitmask — **always 0x00** across all 1357 frames. 15-min interval hypothesis remains unvalidated.
  19     RUN_STATUS        0x01 = compressor/unit running
- 20     MODE_FLAGS        0x02=turbo, 0x01=ECO/sleep, 0x04=vertical swing only (horizontal NOT here — see §0.4a/§0.4b), 0x88=fan-only
- 21     OP_FLAGS          0x04=pump running, 0x80=locked
- 22     ERROR_1           Error/protection bitmask
- 23     ERROR_2           Error/protection bitmask
- 24     ERROR_3           Error/protection bitmask
- 25     ERROR_4           Error/protection bitmask
- 26     COMM_ERROR        0-2
- 27     L1 / UNKNOWN      codeberg Erlang: separate field; README: 0x00 (see §0.3)
- 28     L2 / UNKNOWN      codeberg Erlang: separate field; README: 0x00
- 29     L3 / UNKNOWN      codeberg Erlang: separate field; README: CRC position (likely error)
+ 20     MODE_FLAGS        0x02=turbo, 0x01=ECO/sleep, 0x04=vertical swing only (horizontal NOT here — see §0.4a/§0.4b). Cross-bus **Confirmed**: turbo (X-06, 332 pairs PASS), v-swing (X-09, 320 pairs PASS). ECO/sleep not distinguishable (always 0 in captures — ECO never toggled).
+ 21     OP_FLAGS          0x04=pump running, 0x80=locked — **always 0x00** across all 1357 frames. Pump and lock never activated in captures.
+ 22     ERROR_1           Error/protection bitmask — **always 0x00** (1357 frames)
+ 23     ERROR_2           Error/protection bitmask — **always 0x00** (1357 frames)
+ 24     ERROR_3           Error/protection bitmask — **always 0x00** (1357 frames)
+ 25     ERROR_4           Error/protection bitmask — **always 0x00** (1357 frames)
+ 26     COMM_ERROR        0-2 — **always 0x00** (1357 frames)
+ 27     L1                **constant 0xFF** across all 1357 frames — NOT 0x00 as codeberg README claims (see §0.3)
+ 28     L2                **constant 0x00** across all 1357 frames — matches codeberg README
+ 29     L3                **constant 0x00** across all 1357 frames — matches codeberg README
  30     CRC               Two's complement checksum (per Erlang emulator + our dissector)
  31     EPILOGUE          0x55
 ```
