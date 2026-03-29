@@ -1928,6 +1928,7 @@ end
 
 function hvac_shark_proto.dissector(udp_payload_buffer, pinfo, tree)
     pinfo.cols.protocol = hvac_shark_proto.name
+    pinfo.cols.info = ""
 
     local subtree = tree:add(hvac_shark_proto, udp_payload_buffer(), "HVAC Shark Protocol Data")
 
@@ -1960,6 +1961,7 @@ function hvac_shark_proto.dissector(udp_payload_buffer, pinfo, tree)
     local data_offset = 13
     local channel_direction = nil  -- fromAC / toAC / unknown (parsed from comment tag)
     local channel_info_str = ""   -- "[channel, direction] " prefix for info column
+    local channel_name = nil      -- logic channel name (used by R/T rebuild)
 
     if version == 0x00 then
         subtree:add(f.header_version, udp_payload_buffer(12, 1)):append_text(" (Legacy)")
@@ -1968,7 +1970,7 @@ function hvac_shark_proto.dissector(udp_payload_buffer, pinfo, tree)
         local pos = 13
         -- logicChannel (stored for info column, appended after direction is known)
         local ch_len = udp_payload_buffer(pos, 1):uint()
-        local channel_name = nil
+        channel_name = nil
         pos = pos + 1
         if ch_len > 0 then
             channel_name = udp_payload_buffer(pos, ch_len):string()
@@ -1989,8 +1991,8 @@ function hvac_shark_proto.dissector(udp_payload_buffer, pinfo, tree)
             local comment_str = udp_payload_buffer(pos, comment_len):string()
             subtree:add(f.channel_comment, udp_payload_buffer(pos, comment_len))
             -- Extract direction tag from comment: [toACmainboard], [fromACmainboard],
-            -- [toACdisplay], [fromACdisplay], [unknown]
-            local dir_match = string.match(comment_str, "%[(%a+)%]")
+            -- [toACdisplay], [fromACdisplay], [toACbusadapter_HAHB], [unknown]
+            local dir_match = string.match(comment_str, "%[([%w_]+)%]")
             if dir_match then
                 channel_direction = dir_match
             end
@@ -2010,6 +2012,8 @@ function hvac_shark_proto.dissector(udp_payload_buffer, pinfo, tree)
     else
         subtree:add(f.header_version, udp_payload_buffer(12, 1)):append_text(" (Unknown)")
     end
+
+    pinfo.cols.info = channel_info_str
 
     -- ── Helper: buffer slice relative to protocol data start ─────────────
     local function pbuf(offset, length)
@@ -2053,8 +2057,7 @@ function hvac_shark_proto.dissector(udp_payload_buffer, pinfo, tree)
         -- ── MIDEA UART (SmartKey) PROTOCOL ──────────────────────────────
         -- ══════════════════════════════════════════════════════════════════
         subtree:add(f.protocol_type, "Midea UART (SmartKey)")
-        pinfo.cols.info:prepend("UART ")
-        pinfo.cols.info:prepend(channel_info_str)
+        pinfo.cols.info:append("UART ")
 
         local frame_len = byte1 + 1  -- total frame = LENGTH + 1 (byte 0)
 
@@ -2191,8 +2194,7 @@ function hvac_shark_proto.dissector(udp_payload_buffer, pinfo, tree)
         -- ── XYE RS-485 PROTOCOL (existing decoder) ──────────────────────
         -- ══════════════════════════════════════════════════════════════════
         subtree:add(f.protocol_type, "XYE (RS-485)")
-        pinfo.cols.info:prepend("XYE ")
-        pinfo.cols.info:prepend(channel_info_str)
+        pinfo.cols.info:append("XYE ")
 
         subtree:add(f.command_code, pbuf(1, 1))
 
@@ -2719,8 +2721,7 @@ function hvac_shark_proto.dissector(udp_payload_buffer, pinfo, tree)
                 ck_byte, ck_ok and "(valid)" or "*** INVALID ***", ck_computed))
         end
 
-        pinfo.cols.info:prepend(info_summary .. " ")
-        pinfo.cols.info:prepend(channel_info_str)
+        pinfo.cols.info:append(info_summary)
 
         subtree:add(pbuf(0, proto_len), "Raw Frame: " .. tostring(protocol_buffer:bytes()))
 
@@ -2739,12 +2740,12 @@ function hvac_shark_proto.dissector(udp_payload_buffer, pinfo, tree)
         if channel_direction == nil or channel_direction == "unknown" then
             channel_direction = is_request and "toACdisplay" or "fromACdisplay"
         end
-        pinfo.cols.info:prepend(string.format("R/T-%s ", is_request and "REQ" or "RSP"))
         -- For R/T, update channel_info_str with resolved per-frame direction
         if channel_name then
             channel_info_str = "[" .. channel_name .. ", " .. (channel_direction or "unknown") .. "] "
+            pinfo.cols.info = channel_info_str  -- reset with per-frame direction
         end
-        pinfo.cols.info:prepend(channel_info_str)
+        pinfo.cols.info:append(string.format("R/T-%s ", is_request and "REQ" or "RSP"))
 
         local rt_len = proto_len >= 3 and (protocol_buffer(2, 1):uint() + 4) or proto_len
 
@@ -2949,8 +2950,7 @@ function hvac_shark_proto.dissector(udp_payload_buffer, pinfo, tree)
             end
 
             subtree:add(f.protocol_type, "Midea IR (" .. dev_name .. ")")
-            pinfo.cols.info:prepend("[" .. frame_label .. "] ")
-            pinfo.cols.info:prepend(channel_info_str)
+            pinfo.cols.info:append("[" .. frame_label .. "] ")
 
             -- Device ID
             subtree:add(f.ir_device_id, protocol_buffer(0, 1)):append_text(
