@@ -269,21 +269,70 @@ The CN3 connector carries two unidirectional UART wires:
 Direction validation across all 9 sessions (37,579 frames) confirmed that most
 frame types appear on the expected wire. Two frame types are exceptions:
 
-#### Reflected / echoed frames (appear on BOTH wires in equal counts)
+#### Frame types appearing on both wires (equal counts)
 
-| body[0] | Name | wifiBrown (toACdisplay) | wifiOrange (fromACdisplay) | Pattern |
-|---------|------|------------------------|---------------------------|---------|
-| `0xA0` | Heartbeat ACK | S1:4, S5:4, S7:28, S8:12 | S1:4, S4:3, S5:4, S7:28, S8:12 | **Equal counts** |
-| `0xB5` | Capabilities | S1:4, S7:3, S8:9 | S1:4, S7:3, S8:9 | **Equal counts** |
+Validated across Sessions 1, 4, 7, 8 (combined UART frames). Six frame types
+appear on **both** wifiBrown and wifiOrange in equal counts:
 
-These are handshake-type frames where both sides participate — the ACK and
-capabilities negotiation are echoed on both wires simultaneously.
+| Frame | toACdisplay | fromACdisplay | Mechanism |
+|-------|-------------|---------------|-----------|
+| Heartbeat ACK (0xA0) | 47 | 47 | **True echo** |
+| Capabilities (0xB5) | 16 | 16 | **True echo** |
+| Network Status (0x63) | 35 | 35 | **Request-response** |
+| TLV B1 (Property) | 43 | 43 | **Request-response** |
+| TLV B0 (Property Set) | 12 | 12 | **Request-response** |
+| RAC Serial (0x65) | 1 | 1 | **Request-response** |
 
-#### Data heartbeats (one-directional: wifiOrange only)
+Byte-level analysis reveals **two distinct mechanisms**:
 
-All data heartbeats (A1 energy, A2-A3 device params, A5 outdoor, A6 network)
-appear **only on wifiOrange** (`fromACdisplay`) as expected — the AC mainboard
-sends them through the display to the dongle.
+**True echo (identical bytes, ~50ms delay):**
+Heartbeat ACK and Capabilities frames appear first on wifiOrange (fromACdisplay),
+then ~50ms later on wifiBrown (toACdisplay) with **identical raw bytes**. The AC
+mainboard sends the frame through the display to the dongle; the dongle retransmits
+the exact same frame back as an acknowledgment.
+
+Example (Session 1, Heartbeat ACK):
+```
+orange  15.964727s  AA20AC00000000000205A01980667F7F0000800000070000...
+brown   16.018572s  AA20AC00000000000205A01980667F7F0000800000070000...
+                    ↑ identical bytes, 54ms later
+```
+
+**Request-response pairs (different bytes, same msg_type):**
+Network Status, TLV B0/B1, and RAC Serial frames appear on both wires but with
+**different content** — one wire carries the query, the other carries the response.
+They share the same msg_type or body[0], which is why they appear as "equal counts."
+
+Example (Session 1, Network Status 0x63):
+```
+orange  83.354764s  AA1EAC000...6300000000...  (query: connection=0x00, empty)
+brown   83.387996s  AA1EACB20...6301010404B3A8C0FF...  (response: connected, IP)
+                    ↑ different bytes — request vs response
+```
+
+Example (Session 8, TLV B1 Property):
+```
+brown   (query)     AA18AC000000000000 03 B105480009...  (short: property IDs only)
+orange  (response)  AA27AC000000000002 03 B105480000...  (long: IDs + data values)
+                    ↑ different lengths, protocol version 0x00 vs 0x02
+```
+
+#### Strictly one-directional frames
+
+| Frame | Direction | Wire |
+|-------|-----------|------|
+| Query (0x41) | toACdisplay only | wifiBrown |
+| Set Status (0x40) | toACdisplay only | wifiBrown |
+| Network Init (0x0D) | toACdisplay only | wifiBrown |
+| Status Response (0xC0) | fromACdisplay only | wifiOrange |
+| C1 Response (0xC1) | fromACdisplay only | wifiOrange |
+| Heartbeat A1 (Energy) | fromACdisplay only | wifiOrange |
+| Heartbeat A2-A3 (Device) | fromACdisplay only | wifiOrange |
+| Heartbeat A5 (Outdoor) | fromACdisplay only | wifiOrange |
+| Heartbeat A6 (Network) | fromACdisplay only | wifiOrange |
+
+Commands (0x40, 0x41, 0x0D) and data responses/heartbeats (0xC0, 0xC1, A1-A6)
+are strictly one-directional.
 
 #### Session 2: UART probe wires swapped
 

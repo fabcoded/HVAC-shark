@@ -98,12 +98,13 @@ These msg_types multiplex several commands via body[0]:
 | `0x64` | OTA / Key Trigger | AC→Dongle | UART | 2 | Observed | — |
 | `0xA0` | Proprietary (unknown) | AC→Dongle | UART | 8 | Observed | — |
 
-**¹ Reflected frames**: Heartbeat ACK (0xA0) and Capabilities (0xB5) are observed
-on **both** UART wires in equal counts — they appear on wifiBrown (toACdisplay)
-AND wifiOrange (fromACdisplay) simultaneously. All other heartbeat types (A1-A6)
-are strictly one-directional (wifiOrange only). This suggests ACK and capabilities
-are handshake-type exchanges echoed on both wires. See [protocol_uart.md §4.3](protocol_uart.md)
-for the per-session breakdown.
+**¹ Echoed frames**: Heartbeat ACK (0xA0) and Capabilities (0xB5) appear on
+**both** UART wires with identical raw bytes. The AC mainboard sends the frame
+first (wifiOrange, fromACdisplay); the dongle retransmits the exact same bytes
+~50ms later (wifiBrown, toACdisplay) as acknowledgment. All other heartbeat types
+(A1-A6) are strictly one-directional (fromACdisplay only). Note: other frame types
+(0x63, 0xB0/B1, 0x65) also appear on both wires but as request-response pairs with
+**different bytes**. See [protocol_uart.md §4.3](protocol_uart.md) for full analysis.
 
 #### Not yet captured on own hardware
 
@@ -1980,6 +1981,39 @@ For a comprehensive collection of **26 annotated frame examples** covering every
 MSG_TYPE and body[0] combination from own captures, see [uart_examples.md](uart_examples.md).
 Examples include: set commands, property TLV, all heartbeat types (A1-A6), B5 capabilities,
 boot sequence (0x07, 0x65, 0xA0, 0x0D), network status, and group page responses.
+
+---
+
+## 8. Cross-Bus Data Flow
+
+### 8.1 Bus Data Rates
+
+| Bus | Baud | Encoding | ms/byte | 38-byte frame TX |
+|-----|------|----------|---------|-----------------|
+| Display↔Mainboard (CN1) | 9600 | 8N1 | 1.04 ms | ~40 ms |
+| UART wifi dongle (CN3) | 9600 | 8N1 | 1.04 ms | ~40 ms |
+| R/T pin (CN1) | **2400** | 8N1 | 4.17 ms | **~158 ms** |
+| HA/HB RS-485 | **48000** | 8N1 nibble-pair | 0.21 ms | ~8 ms (physical) |
+
+R/T at 2400 baud is 4× slower than UART — a 38-byte R/T frame takes **158 ms**
+to transmit. This must be accounted for when correlating timestamps across buses:
+the timestamp marks the first byte, but the last byte arrives ~158 ms later.
+
+HA/HB uses nibble-pair encoding (2 physical bytes per logical byte, XOR 0xFF),
+so the effective logical data rate is ~2400 bytes/s — matching R/T throughput.
+
+### 8.2 Mode Field: User Setting vs Actual Sub-Mode
+
+The "Mode" field in C0 Status and 0x40 Set commands carries the **user-requested**
+mode (e.g., Auto), not the mainboard's actual operating sub-mode (e.g., Heat).
+In Auto mode, the mainboard independently selects the active sub-mode based on
+temperature conditions.
+
+To determine the real operating mode, read the display-mainboard internal bus
+or the C1 Group 1 "indoor operating mode" field.
+
+For device-specific observations (relay timing, polling rates, cross-bus mode
+mismatch examples), see [device_xtremesaveblue.md](device_xtremesaveblue.md).
 
 ---
 
