@@ -551,3 +551,39 @@ KJR-120M                    busadapter                       AC display board
 Note: The R/T bus is asynchronous relative to XYE. The busadapter relays each
 XYE C6 event on the next R/T polling slot (~0.8-0.9s delay). In-flight R/T
 frames sent before a XYE C6 event carry the previous state.
+
+---
+
+## Appendix A — Alternative Follow Me Paths
+
+### A.1 IR path
+
+ESPHome's midea component (dudanov/esphome, open-source) sends Follow Me via
+**IR transmission**, not serial. It constructs an IR frame containing the
+temperature and transmits it via an IR LED, emulating a physical Midea remote.
+This bypasses the serial bus entirely. The IR approach does not require a
+wired controller or busadapter.
+
+### A.2 UART extended query — not yet captured
+
+The serial protocol documentation (protocol_serial.md §3.1.4.6) describes a
+UART Follow Me temperature push using the **extended 0x41 query** format
+(`body[1]=0x21`, 24-byte frame, `body[4]=0x01, body[5]=T*2+50`). This is the
+expected Wi-Fi app path. Source: mill1000/midea-msmart Finding 10 (see
+`midea-msmart-mill1000.md`).
+
+Comparison with the R/T variant we captured:
+
+| Aspect | R/T (own captures) | UART extended (documented, not captured) |
+|--------|-------------------|----------------------------------------|
+| body[1] | `0x81` (standard query) | `0x21` (extended query) |
+| Frame length | 38 bytes | 24 bytes |
+| body[4] | `0x01` (optCommand) | `0x01` (optCommand) |
+| body[5] | `T * 2 + 50` | `T * 2 + 50` |
+| Temperature encoding | identical | identical |
+| Response | 0xC0 status | 0xC1 extended state |
+
+The payload encoding is the same — only the frame format and expected response
+differ. We have not captured the UART extended variant because the Wi-Fi dongle
+was never actively polling in our sessions (only heartbeats). A session with
+the dongle paired to an active app would be needed to observe it.
