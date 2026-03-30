@@ -345,9 +345,19 @@ or 1 (beep). This is one of three independent buzzer mechanisms:
 | Standard 0x41 | body[1] bit 6 | `0x81` or `0xC1` (bit 6 = buzzer) |
 | 0xB0 property | property 0x1A, 0x00 | 0x00=off, 0x01=on |
 
-**Own captures**: Buzzer bit 6 was **never set** on either bus — R/T body[1]=0x81
-always (937 0x41 frames, 78 0x40 frames), UART body[1]=0x21 always (11 extended
-frames). The room controller (KJR-120M) beeps locally.
+**Own captures — buzzer behavior differs by source:**
+
+| Bus | Command | body[1] bit 6 | Beep? | Frames | Why |
+|-----|---------|---------------|-------|--------|-----|
+| UART (Wi-Fi dongle) | 0x40 Set | **1** (0x42) | **yes** | 11/11 (Session 8) | App has no speaker — requests AC display board to beep as audio feedback |
+| R/T (wall controller) | 0x40 Set | 0 (0x01) | no | 0/78 (Sessions 4-8) | KJR-120M has its own speaker and beeps locally — requesting AC beep would cause double-beep |
+| R/T (wall controller) | 0x41 Query | 0 (0x81) | no | 0/937 | Queries never trigger beep |
+| UART (Wi-Fi dongle) | 0x41 Query | 0 (0x21) | no | 0/11 | Queries never trigger beep |
+
+The buzzer bit is a **per-command flag**, not a global setting. Each source
+decides whether to request a beep based on whether it has its own audio
+feedback. The Wi-Fi dongle always requests a beep on SET commands; the wall
+controller never does.
 
 ##### 3.1.4.2 Comparison: Standard (body[1]=sub-cmd 0x81) vs Extended (body[1]=sub-cmd 0x21)
 
