@@ -728,209 +728,6 @@ def parse_power_group4(body):
 > cumulative kWh. The value "381.4 kWh" those functions produced is actually **381.4 W**
 > instantaneous draw.
 
----
-
-### 4.3 Response 0xC1 — Extended State (body[1]=0x01 or 0x02) ← Triggered by: §3.1.4.4 (direct C1 query), §3.1.4.5 (queryStat=0x02)
-
-#### 4.3.1 Extended State Sub-page 0x01 — Sensor Temperatures, Fault Flags, Operating State
-
-Source: mill1000/midea-msmart Finding 8 (see `midea-msmart-mill1000.md`). **Not present in dudanov/MideaUART, reneklootwijk/node-mideahvac,
-or ESPHome.** All fields: **Hypothesis** — not verified against own captures.
-
-Triggered by extended `0x41/0x21` query (mill1000/midea-msmart Finding 7, see `midea-msmart-mill1000.md`).
-
-`body[1] = 0x01` identifies this sub-page. `srcBuf` = full UART frame; body[N] = srcBuf[N+10].
-
-| body offset | Field | Encoding | Notes |
-|-------------|-------|----------|-------|
-| [1] | Sub-page selector | `0x01` fixed | — |
-| [9..10] | T1 — indoor coil (evaporator) | 16-bit LE × 0.01 °C; negate if body[10]≥0x80 | — |
-| [11..12] | T2 temperature | 16-bit LE × 0.01 °C | — |
-| [13..14] | T3 — outdoor coil (condenser) | 16-bit LE × 0.01 °C | — |
-| [15..16] | T4 — outdoor ambient (= tempOut) | 16-bit LE × 0.01 °C | — |
-| [20] | Compressor current | byte × 0.25 A | — |
-| [21] | Outdoor total current | byte × 0.25 A | — |
-| [22] | Outdoor supply voltage | raw AD value | — |
-| [23] | Indoor actual operating mode | raw | — |
-| [24] | Indoor set fan speed — left fan | raw | — |
-| [25] | Indoor set fan speed — right fan | raw | — |
-| [26] | Indoor fault byte 1 | bit-packed | bit0=env sensor, bit1=pipe sensor, bit2=E2, bit3=DC fan stall, bit4=indoor-outdoor comm, bit5=smart-eye, bit6=display E2, bit7=RF module |
-| [27] | Indoor fault byte 2 | bit-packed | refrigerant leak, dust sensor, humidity sensor, filter stall… |
-| [28] | Indoor fault byte 3 | bit-packed | door fault, cold-air protection, voltage protection… |
-| [29] | Freq-limit state byte 1 | bit-packed | evaporator low-temp limit/protect, condenser high-temp limit/protect… |
-| [30] | Freq-limit state byte 2 | bit-packed | discharge high-temp, remote freq limit, E2 errors… |
-| [32] | Load state | bit-packed | bit0=defrost, bit1=aux heat, bit2=horiz vane L, bit3=horiz vane R, bit4=vert vane L, bit5=vert vane R, bit6=indoor fan run, bit7=purifier |
-| [33] | Outdoor temp query enable | bit0 | — |
-| [35] | Outdoor fault byte 1 | bit-packed | bit0=E2(E51), bit1=T3 sensor(E52), bit2=T4 sensor(E53), bit3=discharge(E54), bit4=suction(E55), bit5=compressor top(P2), bit6=DC fan(E7), bit7=AC current sample |
-| [36] | Outdoor fault byte 2 | bit-packed | MCU-driver comm, compressor current sample, start fault, phase-loss, zero-speed, sync fault, stall, lock |
-| [37] | Outdoor fault byte 3 | bit-packed | detuning, overcurrent(P49), IPM(P0), undervoltage(P10), overvoltage(P11), DC-side voltage(P12), current protection(P81), low pressure |
-| [38] | Outdoor fault byte 4 | bit-packed | discharge high-temp limit/protect(L2/P6), condenser high-temp limit/protect(L1), high/low pressure limit/protect |
-| [39] | Outdoor fault byte 5 | bit-packed | voltage limit, current limit, PFC faults, 341 sync/MCE faults, 3-phase reverse |
-| [40] | Outdoor AC fan state | bit-packed | bit0=low wind, bit1=mid wind, bit2=high wind, bit3=4-way valve |
-| [41] | Outdoor DC fan actual speed | byte × 8 = RPM | — |
-| [42] | EEV (electronic expansion valve) actual position | byte × 8 = steps | — |
-| [43] | Outdoor suction (return air) temperature | raw AD | — |
-| [44] | Outdoor DC bus voltage | raw AD | — |
-| [45] | IPM module temperature | raw (°C direct?) | — |
-| [70] | Left fan actual speed level | raw | — |
-| [71] | Right fan actual speed level | raw | — |
-| [72] | Down fan set speed | raw | — |
-| [73] | Down fan actual speed level | raw | — |
-| [77] | Error code | raw (0–33) | — |
-| [78] | Board fault bits | bit-packed | bit0=indoor-display comm(Eb), bit1=compressor position(P4), bit2=display-relay board comm(Eb1) |
-
-**Additional sub-page 0x01 fields** (validated 2026-03-28 from mill1000/midea-msmart Finding 8,
-see `midea-msmart-mill1000.md`):
-
-| body offset | Field | Encoding | Notes |
-|-------------|-------|----------|-------|
-| [2] | Device status flags | bit-packed | bit7=newWindMode, bit6=smartClean, bit5=sterilize, bit4=newWind, bit3=humidity, bit2=clean, bit1=runStatus, bit0=deviceSetRunStatus |
-| [3] | Device status flags 2 | bit-packed | bit5=AC filter dirty, bit4=elecHeat, bit3=strong, bit2=dry, bit1=wetfilm, bit0=purifyFilter |
-| [4] | Run status flags | bit-packed | bit1=runCurrentStatus, bit0=deviceCurrentRunStatus |
-| [6] | Current run mode | bits[3:0] | Actual operating mode |
-| [17] | Tp temperature | raw AD | Discharge pipe sensor |
-| [18] | Compressor actual frequency | raw Hz | |
-| [19] | Compressor target frequency | raw Hz | |
-| [53-54] | Dry/heat cleanup timer | 16-bit LE | Minutes remaining |
-| [55-56] | CO2 / TVOC value | 16-bit LE | |
-| [57-58] | Dust / PM2.5 | 16-bit LE | |
-| [59] | Mainboard humidity sensor | raw % | |
-| [60-61] | Sterilize run time | 16-bit LE | |
-| [62-63] | Wet film timer | 16-bit LE | |
-| [64-65] | Purify filter timer | 16-bit LE | |
-| [66] | Self-clean actual runtime | raw minutes | |
-| [74] | Humidity setpoint | raw % | |
-| [75-76] | Product code | 16-bit LE | Anti-tamper identifier |
-
-**Cross-references to Group Pages (§3.1.2)**:
-
-| Sub-page 0x01 field | Group page equivalent | Encoding difference |
-|---------------------|-----------------------|---------------------|
-| T1 body[9-10] (16-bit LE x 0.01 C) | Group 1 body[10] `(val-30)/2` | Sub-page: 0.01 C precision, signed. Group 1: 0.5 C steps, offset 30 |
-| T2 body[11-12] | Group 1 body[11] `(val-30)/2` | Same difference |
-| T3 body[13-14] | Group 1 body[12] `(val-50)/2` | Sub-page: 0.01 C. Group 1: offset 50 |
-| T4 body[15-16] | Group 1 body[13] `(val-50)/2` | Sub-page: 0.01 C. Group 1: offset 50 |
-| Indoor fault bytes [26-28] | Group 2 body[6-8] | Same bit layout |
-| Outdoor DC fan speed [41] x8 RPM | Group 3 body[10] x8 RPM | Same encoding |
-| EEV actual position [42] x8 steps | Group 3 body[11] x8 steps | Same encoding |
-| IPM module temperature [45] | Group 3 body[14] | Same (raw C) |
-
-**Temperature encoding asymmetry**: Sub-page 0x01 uses 16-bit LE x 0.01 C (high precision,
-signed), while Group 1 uses single-byte with offset-30 (T1/T2) or offset-50 (T3/T4) divided by 2
-(0.5 C steps). The 0xC0 status response (§4.1) uses yet another encoding: `(raw - 50) / 2` for
-both indoor and outdoor. Three different encodings for the same physical sensors.
-
----
-
-#### 4.3.2 Extended State Sub-page 0x02 — Status Flags, Timers, Power, Vane Angles, Compressor
-
-Source: mill1000/midea-msmart Finding 8 (see `midea-msmart-mill1000.md`).
-All fields: **Hypothesis** — not verified against own captures.
-
-`body[1] = 0x02` identifies this sub-page.
-
-| body offset | Field | Encoding | Notes |
-|-------------|-------|----------|-------|
-| [1] | Sub-page selector | `0x02` fixed | — |
-| [2..3] | On-timer (minutes) | 16-bit LE | — |
-| [4..5] | Off-timer (minutes) | 16-bit LE | — |
-| [6] | Status flags A | bit-packed | bit7=body-sense, bit6=energy-save, bit5=strong, bit4=refarce-wind, bit3=power-save, bit2=cosy-sleep, bit0=ECO |
-| [7] | Status flags B | bit-packed | bit7=dust, bit6=aux-heat-actual, bit5=dry-actual, bit4=fresh-air, bit3=smart-eye, bit2=natural-wind, bit1=peak-valley, bit0=night-light |
-| [8] | Status flags C | bit-packed | bit7=anti-cold, bit6=child-kick, bit5=sleep(export), bit4=PMV, bit3=display on/off, bit2=self-clean, bit1=no-direct-wind, bit0=8-deg-heat(export) |
-| [9] | Vane swing actual states 1 | bit-packed | bit5-3=UD vane swing (left), bit2=LR vane swing (left), bit1=top vane swing |
-| [10] | Vane swing actual states 2 | bit-packed | bit1=UD vane swing (right), bit0=LR vane swing (right) |
-| [11] | Current humidity (%) | raw | — |
-| [12] | Temperature setpoint (compensated) | `(byte − 30) × 0.5` °C | — |
-| [13..14] | Indoor fan runtime | 16-bit LE (minutes?) | — |
-| [15] | Outdoor fan target speed | byte × 8 = RPM | — |
-| [16] | EEV target position | byte × 8 = steps | — |
-| [17] | Defrost step | 0=none, 1=start, 2=in progress, 3=ending | Key diagnostic |
-| [18] | Outdoor fault extra | bit0=liquid return fault (P92) | — |
-| [19] | Outdoor fault extra 2 | bit1=IGBT sensor fault, bit0=485 fault | — |
-| [20] | Compressor current run time | seconds | — |
-| [21..22] | Compressor cumulative run time | 16-bit LE hours | — |
-| [24] | Max bus voltage (historical) | `byte + 60` V | — |
-| [25] | Min bus voltage (historical) | `byte + 60` V | — |
-| [26] | Max current (historical) | raw | — |
-| [27] | Max T4 (historical) | raw AD | — |
-| [28] | Min T4 (historical) | raw AD | — |
-| [29] | Cumulative fault count | raw | — |
-| [30] | Compressor flux | byte × 8 | — |
-| [45] | Compressor start status | raw | — |
-| [46] | Outdoor power factor | raw ÷ 256 | — |
-| [47..48] | **Outdoor unit power** | 16-bit LE watts | Key energy field |
-| [49] | UD vane cool upper limit | % | — |
-| [50] | UD vane cool lower limit | % | — |
-| [51] | UD vane heat upper limit | % | — |
-| [52] | UD vane heat lower limit | % | — |
-| [53] | UD vane current angle | % | — |
-| [54] | LR vane upper limit | % | — |
-| [55] | LR vane lower limit | % | — |
-| [56] | LR vane current angle | % | — |
-| [57] | Outdoor target compressor frequency | raw | — |
-| [58] | Indoor target fan speed | % | — |
-
-**Additional sub-page 0x02 fields** (validated 2026-03-28 from mill1000/midea-msmart Finding 8,
-see `midea-msmart-mill1000.md`):
-
-| body offset | Field | Encoding | Notes |
-|-------------|-------|----------|-------|
-| [23] | Freq-limit type 2 | raw | Reserved |
-| [31] | Fan flux | byte x 8 | Fan motor magnetic flux |
-| [32] | d-axis current | raw / 64 | FOC d-axis (signed) |
-| [33] | q-axis current | raw / 64 | FOC q-axis (signed) |
-| [34] | Compressor peak current | raw A | |
-| [35] | PFC peak current | raw A | 0-255 A |
-| [36] | Fan peak current | raw x 32 | |
-| [37-38] | Torque adjust angle | 16-bit LE | Motor compensation |
-| [39] | Torque adjust value | byte x 8 | |
-| [40] | AD calibration voltage 1 | raw / 16 | ADC reference |
-| [41] | AD calibration voltage 2 | raw / 16 | |
-| [42] | d-axis voltage | raw / 16 | |
-| [43] | q-axis voltage | raw / 16 | |
-| [44] | PFC switch status | raw | |
-| [59] | Top vane upper limit | % | Top louver (beyond UD/LR) |
-| [60] | Top vane lower limit | % | |
-| [61] | Top vane current angle | % | |
-| [62] | Bottom vane cool upper limit | % | Conditional: only if response length > 71 |
-| [63] | Bottom vane cool lower limit | % | Conditional |
-| [64] | Bottom vane heat upper limit | % | Conditional |
-| [65] | Bottom vane heat lower limit | % | Conditional |
-| [66] | Bottom vane current angle | % | Conditional |
-| [67] | Second humidity sensor | raw % | Lower humidity sensor |
-| [68] | Extended status | bit-packed | bit7=strong, bit6=sterilize, bit5=newWind, bit4=humidity, bit3=clean, bits[2:0]=self-clean stage (0-6) |
-| [69] | Wind-free and panel | bit-packed | bit7=R wind-free, bit6=L wind-free, bit5=UD swing R, bit4=LR swing R, bit3=panel protect, bit2=water tank empty, bit1=LR swing L, bit0=UD swing L |
-
-**Cross-references to Group Pages (§3.1.2)**:
-
-| Sub-page 0x02 field | Group page equivalent | Notes |
-|---------------------|-----------------------|-------|
-| Humidity [11] | Group 5 body[4] | Same (raw %) |
-| Compensated setpoint [12] | Group 5 body[5] | Sub-page: `(byte-30)*0.5`. Group 5: raw (no formula documented) |
-| Indoor fan runtime [13-14] | Group 5 body[6-7] | Both 16-bit LE |
-| Outdoor fan target speed [15] x8 | Group 5 body[8] x8 | Same encoding |
-| EEV target position [16] x8 | Group 5 body[9] x8 | Same encoding |
-| Defrost step [17] | Group 5 body[10] | Same encoding (0-3) |
-| Compressor run time [20] | Group 5 body[13] x64 s | Sub-page: seconds. Group 5: raw x64 seconds |
-| Compressor cumul. time [21-22] | Group 5 body[14-15] | Both 16-bit LE hours |
-| Max/min bus voltage [24-25] | Group 5 body[17-18] | Same (`raw + 60` V) |
-| Max current, max/min T4, fault count [26-29] | Group 6 body[4-7] | Same encoding |
-| Compressor flux [30] x8 | Group 6 body[8] x8 | Same encoding |
-| Vane limits/angles [49-56] | Group 11 body[5-12] | Same (raw %) |
-| Outdoor unit power [47-48] | *No group page equivalent* | Unique to sub-page 0x02 |
-
-**Two query paths to the same diagnostic data**:
-
-| Aspect | Group Pages (§3.1.2) | Extended State (§4.2.3/§4.2.4) |
-|--------|----------------------|--------------------------------|
-| Query | `0x41/0x81/0x01/<page>` | `0x41/0x21` with optCommand=0x03, queryStat=0x02 |
-| Response | 0xC1, body[1]=0x21, one 10-byte group per page | 0xC1, body[1]=0x01/0x02, ~80 bytes per sub-page |
-| Coverage | 8 groups x ~15 fields each | 2 sub-pages, ~80 fields total |
-| Precision | Temperatures: 0.5 C steps | Temperatures: 0.01 C precision (16-bit) |
-| Protocol era | "Classic" — older/standard interface | Extended — newer devices, single-source (mill1000/midea-msmart Finding 7) |
-| Own captures | Groups 1-5 captured on R/T bus (Session 1) | **Not captured** — requires extended query |
-
----
 
 ### 3.3 Command 0x93 — Extension Board / Wall Controller Status → Response: §4.4 (0x93)
 
@@ -1765,6 +1562,209 @@ fields not present in sub-page 0x02.
 
 ---
 
+---
+
+### 4.3 Response 0xC1 — Extended State (body[1]=0x01 or 0x02) ← Triggered by: §3.1.4.4 (direct C1 query), §3.1.4.5 (queryStat=0x02)
+
+#### 4.3.1 Extended State Sub-page 0x01 — Sensor Temperatures, Fault Flags, Operating State
+
+Source: mill1000/midea-msmart Finding 8 (see `midea-msmart-mill1000.md`). **Not present in dudanov/MideaUART, reneklootwijk/node-mideahvac,
+or ESPHome.** All fields: **Hypothesis** — not verified against own captures.
+
+Triggered by extended `0x41/0x21` query (mill1000/midea-msmart Finding 7, see `midea-msmart-mill1000.md`).
+
+`body[1] = 0x01` identifies this sub-page. `srcBuf` = full UART frame; body[N] = srcBuf[N+10].
+
+| body offset | Field | Encoding | Notes |
+|-------------|-------|----------|-------|
+| [1] | Sub-page selector | `0x01` fixed | — |
+| [9..10] | T1 — indoor coil (evaporator) | 16-bit LE × 0.01 °C; negate if body[10]≥0x80 | — |
+| [11..12] | T2 temperature | 16-bit LE × 0.01 °C | — |
+| [13..14] | T3 — outdoor coil (condenser) | 16-bit LE × 0.01 °C | — |
+| [15..16] | T4 — outdoor ambient (= tempOut) | 16-bit LE × 0.01 °C | — |
+| [20] | Compressor current | byte × 0.25 A | — |
+| [21] | Outdoor total current | byte × 0.25 A | — |
+| [22] | Outdoor supply voltage | raw AD value | — |
+| [23] | Indoor actual operating mode | raw | — |
+| [24] | Indoor set fan speed — left fan | raw | — |
+| [25] | Indoor set fan speed — right fan | raw | — |
+| [26] | Indoor fault byte 1 | bit-packed | bit0=env sensor, bit1=pipe sensor, bit2=E2, bit3=DC fan stall, bit4=indoor-outdoor comm, bit5=smart-eye, bit6=display E2, bit7=RF module |
+| [27] | Indoor fault byte 2 | bit-packed | refrigerant leak, dust sensor, humidity sensor, filter stall… |
+| [28] | Indoor fault byte 3 | bit-packed | door fault, cold-air protection, voltage protection… |
+| [29] | Freq-limit state byte 1 | bit-packed | evaporator low-temp limit/protect, condenser high-temp limit/protect… |
+| [30] | Freq-limit state byte 2 | bit-packed | discharge high-temp, remote freq limit, E2 errors… |
+| [32] | Load state | bit-packed | bit0=defrost, bit1=aux heat, bit2=horiz vane L, bit3=horiz vane R, bit4=vert vane L, bit5=vert vane R, bit6=indoor fan run, bit7=purifier |
+| [33] | Outdoor temp query enable | bit0 | — |
+| [35] | Outdoor fault byte 1 | bit-packed | bit0=E2(E51), bit1=T3 sensor(E52), bit2=T4 sensor(E53), bit3=discharge(E54), bit4=suction(E55), bit5=compressor top(P2), bit6=DC fan(E7), bit7=AC current sample |
+| [36] | Outdoor fault byte 2 | bit-packed | MCU-driver comm, compressor current sample, start fault, phase-loss, zero-speed, sync fault, stall, lock |
+| [37] | Outdoor fault byte 3 | bit-packed | detuning, overcurrent(P49), IPM(P0), undervoltage(P10), overvoltage(P11), DC-side voltage(P12), current protection(P81), low pressure |
+| [38] | Outdoor fault byte 4 | bit-packed | discharge high-temp limit/protect(L2/P6), condenser high-temp limit/protect(L1), high/low pressure limit/protect |
+| [39] | Outdoor fault byte 5 | bit-packed | voltage limit, current limit, PFC faults, 341 sync/MCE faults, 3-phase reverse |
+| [40] | Outdoor AC fan state | bit-packed | bit0=low wind, bit1=mid wind, bit2=high wind, bit3=4-way valve |
+| [41] | Outdoor DC fan actual speed | byte × 8 = RPM | — |
+| [42] | EEV (electronic expansion valve) actual position | byte × 8 = steps | — |
+| [43] | Outdoor suction (return air) temperature | raw AD | — |
+| [44] | Outdoor DC bus voltage | raw AD | — |
+| [45] | IPM module temperature | raw (°C direct?) | — |
+| [70] | Left fan actual speed level | raw | — |
+| [71] | Right fan actual speed level | raw | — |
+| [72] | Down fan set speed | raw | — |
+| [73] | Down fan actual speed level | raw | — |
+| [77] | Error code | raw (0–33) | — |
+| [78] | Board fault bits | bit-packed | bit0=indoor-display comm(Eb), bit1=compressor position(P4), bit2=display-relay board comm(Eb1) |
+
+**Additional sub-page 0x01 fields** (validated 2026-03-28 from mill1000/midea-msmart Finding 8,
+see `midea-msmart-mill1000.md`):
+
+| body offset | Field | Encoding | Notes |
+|-------------|-------|----------|-------|
+| [2] | Device status flags | bit-packed | bit7=newWindMode, bit6=smartClean, bit5=sterilize, bit4=newWind, bit3=humidity, bit2=clean, bit1=runStatus, bit0=deviceSetRunStatus |
+| [3] | Device status flags 2 | bit-packed | bit5=AC filter dirty, bit4=elecHeat, bit3=strong, bit2=dry, bit1=wetfilm, bit0=purifyFilter |
+| [4] | Run status flags | bit-packed | bit1=runCurrentStatus, bit0=deviceCurrentRunStatus |
+| [6] | Current run mode | bits[3:0] | Actual operating mode |
+| [17] | Tp temperature | raw AD | Discharge pipe sensor |
+| [18] | Compressor actual frequency | raw Hz | |
+| [19] | Compressor target frequency | raw Hz | |
+| [53-54] | Dry/heat cleanup timer | 16-bit LE | Minutes remaining |
+| [55-56] | CO2 / TVOC value | 16-bit LE | |
+| [57-58] | Dust / PM2.5 | 16-bit LE | |
+| [59] | Mainboard humidity sensor | raw % | |
+| [60-61] | Sterilize run time | 16-bit LE | |
+| [62-63] | Wet film timer | 16-bit LE | |
+| [64-65] | Purify filter timer | 16-bit LE | |
+| [66] | Self-clean actual runtime | raw minutes | |
+| [74] | Humidity setpoint | raw % | |
+| [75-76] | Product code | 16-bit LE | Anti-tamper identifier |
+
+**Cross-references to Group Pages (§3.1.2)**:
+
+| Sub-page 0x01 field | Group page equivalent | Encoding difference |
+|---------------------|-----------------------|---------------------|
+| T1 body[9-10] (16-bit LE x 0.01 C) | Group 1 body[10] `(val-30)/2` | Sub-page: 0.01 C precision, signed. Group 1: 0.5 C steps, offset 30 |
+| T2 body[11-12] | Group 1 body[11] `(val-30)/2` | Same difference |
+| T3 body[13-14] | Group 1 body[12] `(val-50)/2` | Sub-page: 0.01 C. Group 1: offset 50 |
+| T4 body[15-16] | Group 1 body[13] `(val-50)/2` | Sub-page: 0.01 C. Group 1: offset 50 |
+| Indoor fault bytes [26-28] | Group 2 body[6-8] | Same bit layout |
+| Outdoor DC fan speed [41] x8 RPM | Group 3 body[10] x8 RPM | Same encoding |
+| EEV actual position [42] x8 steps | Group 3 body[11] x8 steps | Same encoding |
+| IPM module temperature [45] | Group 3 body[14] | Same (raw C) |
+
+**Temperature encoding asymmetry**: Sub-page 0x01 uses 16-bit LE x 0.01 C (high precision,
+signed), while Group 1 uses single-byte with offset-30 (T1/T2) or offset-50 (T3/T4) divided by 2
+(0.5 C steps). The 0xC0 status response (§4.1) uses yet another encoding: `(raw - 50) / 2` for
+both indoor and outdoor. Three different encodings for the same physical sensors.
+
+---
+
+#### 4.3.2 Extended State Sub-page 0x02 — Status Flags, Timers, Power, Vane Angles, Compressor
+
+Source: mill1000/midea-msmart Finding 8 (see `midea-msmart-mill1000.md`).
+All fields: **Hypothesis** — not verified against own captures.
+
+`body[1] = 0x02` identifies this sub-page.
+
+| body offset | Field | Encoding | Notes |
+|-------------|-------|----------|-------|
+| [1] | Sub-page selector | `0x02` fixed | — |
+| [2..3] | On-timer (minutes) | 16-bit LE | — |
+| [4..5] | Off-timer (minutes) | 16-bit LE | — |
+| [6] | Status flags A | bit-packed | bit7=body-sense, bit6=energy-save, bit5=strong, bit4=refarce-wind, bit3=power-save, bit2=cosy-sleep, bit0=ECO |
+| [7] | Status flags B | bit-packed | bit7=dust, bit6=aux-heat-actual, bit5=dry-actual, bit4=fresh-air, bit3=smart-eye, bit2=natural-wind, bit1=peak-valley, bit0=night-light |
+| [8] | Status flags C | bit-packed | bit7=anti-cold, bit6=child-kick, bit5=sleep(export), bit4=PMV, bit3=display on/off, bit2=self-clean, bit1=no-direct-wind, bit0=8-deg-heat(export) |
+| [9] | Vane swing actual states 1 | bit-packed | bit5-3=UD vane swing (left), bit2=LR vane swing (left), bit1=top vane swing |
+| [10] | Vane swing actual states 2 | bit-packed | bit1=UD vane swing (right), bit0=LR vane swing (right) |
+| [11] | Current humidity (%) | raw | — |
+| [12] | Temperature setpoint (compensated) | `(byte − 30) × 0.5` °C | — |
+| [13..14] | Indoor fan runtime | 16-bit LE (minutes?) | — |
+| [15] | Outdoor fan target speed | byte × 8 = RPM | — |
+| [16] | EEV target position | byte × 8 = steps | — |
+| [17] | Defrost step | 0=none, 1=start, 2=in progress, 3=ending | Key diagnostic |
+| [18] | Outdoor fault extra | bit0=liquid return fault (P92) | — |
+| [19] | Outdoor fault extra 2 | bit1=IGBT sensor fault, bit0=485 fault | — |
+| [20] | Compressor current run time | seconds | — |
+| [21..22] | Compressor cumulative run time | 16-bit LE hours | — |
+| [24] | Max bus voltage (historical) | `byte + 60` V | — |
+| [25] | Min bus voltage (historical) | `byte + 60` V | — |
+| [26] | Max current (historical) | raw | — |
+| [27] | Max T4 (historical) | raw AD | — |
+| [28] | Min T4 (historical) | raw AD | — |
+| [29] | Cumulative fault count | raw | — |
+| [30] | Compressor flux | byte × 8 | — |
+| [45] | Compressor start status | raw | — |
+| [46] | Outdoor power factor | raw ÷ 256 | — |
+| [47..48] | **Outdoor unit power** | 16-bit LE watts | Key energy field |
+| [49] | UD vane cool upper limit | % | — |
+| [50] | UD vane cool lower limit | % | — |
+| [51] | UD vane heat upper limit | % | — |
+| [52] | UD vane heat lower limit | % | — |
+| [53] | UD vane current angle | % | — |
+| [54] | LR vane upper limit | % | — |
+| [55] | LR vane lower limit | % | — |
+| [56] | LR vane current angle | % | — |
+| [57] | Outdoor target compressor frequency | raw | — |
+| [58] | Indoor target fan speed | % | — |
+
+**Additional sub-page 0x02 fields** (validated 2026-03-28 from mill1000/midea-msmart Finding 8,
+see `midea-msmart-mill1000.md`):
+
+| body offset | Field | Encoding | Notes |
+|-------------|-------|----------|-------|
+| [23] | Freq-limit type 2 | raw | Reserved |
+| [31] | Fan flux | byte x 8 | Fan motor magnetic flux |
+| [32] | d-axis current | raw / 64 | FOC d-axis (signed) |
+| [33] | q-axis current | raw / 64 | FOC q-axis (signed) |
+| [34] | Compressor peak current | raw A | |
+| [35] | PFC peak current | raw A | 0-255 A |
+| [36] | Fan peak current | raw x 32 | |
+| [37-38] | Torque adjust angle | 16-bit LE | Motor compensation |
+| [39] | Torque adjust value | byte x 8 | |
+| [40] | AD calibration voltage 1 | raw / 16 | ADC reference |
+| [41] | AD calibration voltage 2 | raw / 16 | |
+| [42] | d-axis voltage | raw / 16 | |
+| [43] | q-axis voltage | raw / 16 | |
+| [44] | PFC switch status | raw | |
+| [59] | Top vane upper limit | % | Top louver (beyond UD/LR) |
+| [60] | Top vane lower limit | % | |
+| [61] | Top vane current angle | % | |
+| [62] | Bottom vane cool upper limit | % | Conditional: only if response length > 71 |
+| [63] | Bottom vane cool lower limit | % | Conditional |
+| [64] | Bottom vane heat upper limit | % | Conditional |
+| [65] | Bottom vane heat lower limit | % | Conditional |
+| [66] | Bottom vane current angle | % | Conditional |
+| [67] | Second humidity sensor | raw % | Lower humidity sensor |
+| [68] | Extended status | bit-packed | bit7=strong, bit6=sterilize, bit5=newWind, bit4=humidity, bit3=clean, bits[2:0]=self-clean stage (0-6) |
+| [69] | Wind-free and panel | bit-packed | bit7=R wind-free, bit6=L wind-free, bit5=UD swing R, bit4=LR swing R, bit3=panel protect, bit2=water tank empty, bit1=LR swing L, bit0=UD swing L |
+
+**Cross-references to Group Pages (§3.1.2)**:
+
+| Sub-page 0x02 field | Group page equivalent | Notes |
+|---------------------|-----------------------|-------|
+| Humidity [11] | Group 5 body[4] | Same (raw %) |
+| Compensated setpoint [12] | Group 5 body[5] | Sub-page: `(byte-30)*0.5`. Group 5: raw (no formula documented) |
+| Indoor fan runtime [13-14] | Group 5 body[6-7] | Both 16-bit LE |
+| Outdoor fan target speed [15] x8 | Group 5 body[8] x8 | Same encoding |
+| EEV target position [16] x8 | Group 5 body[9] x8 | Same encoding |
+| Defrost step [17] | Group 5 body[10] | Same encoding (0-3) |
+| Compressor run time [20] | Group 5 body[13] x64 s | Sub-page: seconds. Group 5: raw x64 seconds |
+| Compressor cumul. time [21-22] | Group 5 body[14-15] | Both 16-bit LE hours |
+| Max/min bus voltage [24-25] | Group 5 body[17-18] | Same (`raw + 60` V) |
+| Max current, max/min T4, fault count [26-29] | Group 6 body[4-7] | Same encoding |
+| Compressor flux [30] x8 | Group 6 body[8] x8 | Same encoding |
+| Vane limits/angles [49-56] | Group 11 body[5-12] | Same (raw %) |
+| Outdoor unit power [47-48] | *No group page equivalent* | Unique to sub-page 0x02 |
+
+**Two query paths to the same diagnostic data**:
+
+| Aspect | Group Pages (§3.1.2) | Extended State (§4.2.3/§4.2.4) |
+|--------|----------------------|--------------------------------|
+| Query | `0x41/0x81/0x01/<page>` | `0x41/0x21` with optCommand=0x03, queryStat=0x02 |
+| Response | 0xC1, body[1]=0x21, one 10-byte group per page | 0xC1, body[1]=0x01/0x02, ~80 bytes per sub-page |
+| Coverage | 8 groups x ~15 fields each | 2 sub-pages, ~80 fields total |
+| Precision | Temperatures: 0.5 C steps | Temperatures: 0.01 C precision (16-bit) |
+| Protocol era | "Classic" — older/standard interface | Extended — newer devices, single-source (mill1000/midea-msmart Finding 7) |
+| Own captures | Groups 1-5 captured on R/T bus (Session 1) | **Not captured** — requires extended query |
+
+---
 ### 4.4 Response 0x93 — Extension Board Status (30 bytes, R/T bus) ← Triggered by: §3.3 (0x93 request)
 
 ```
