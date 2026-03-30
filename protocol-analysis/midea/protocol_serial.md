@@ -174,21 +174,25 @@ as payload data, not a command selector.
 
 ## 3. Commands (Dongle → Appliance)
 
-### 3.1 Command 0x41 — Query Variants
+### 3.1 Command 0x41 — Request Variants (query, write, toggle, command)
 
-The 0x41 command has multiple variants distinguished by **body[1]** (sub-command)
-and **body[2]** (variant selector). Do not conflate with the 0x40 set command.
+The 0x41 command is a multiplex carrier for several request types, distinguished
+by **body[1]** (sub-command) and **body[2]** (variant selector). Not all
+variants are queries — some write data (Follow Me temperature), toggle features
+(display), or request lightweight parameter exchanges. The name "query" is
+historical from community sources where the status query variant is most common.
+Do not conflate with the 0x40 set command.
 
 ### Variant table
 
-| body[1] | body[2] | body[3] | body[4] | Name | Expected response |
-|---------|---------|---------|---------|------|-------------------|
-| `0x81` | `0x00` | `0xFF` | `0x00` | **Status query** | `0xC0` status response |
-| `0x81` | `0x00` | `0xFF` | `0x01` | **Follow Me temperature** (R/T only, `body[5]=T*2+50`) — see §3.1.1, §3.1.4.6 | `0xC0` status response |
-| `0x81` | `0x01` | page ID | `0x00` | **Group dev-param query** (mill1000 Finding 11) | `0xC1` group page response |
-| `0x21` | `0x01` | `0x44` | `0x00` | **Power usage query** (Group 4) | `0xC1` Group 4 power response (BCD) |
-| `0x21` | varies | varies | optCmd | **Extended query** (mill1000 Finding 7, optCommand in body[4]) | `0xC1` extended state |
-| `0x61` | `0x00` | `0xFF` | — | **Display toggle** | — |
+| body[1] | body[2] | body[3] | body[4] | Type | Name | Expected response |
+|---------|---------|---------|---------|------|------|-------------------|
+| `0x81` | `0x00` | `0xFF` | `0x00` | query | **Status query** | `0xC0` status response |
+| `0x81` | `0x00` | `0xFF` | `0x01` | write | **Follow Me temperature** (R/T only, `body[5]=T*2+50`) — see §3.1.1, §3.1.4.6 | `0xC0` status response |
+| `0x81` | `0x01` | page ID | `0x00` | query | **Group dev-param query** (mill1000 Finding 11) | `0xC1` group page response |
+| `0x21` | `0x01` | `0x44` | `0x00` | query | **Power usage query** (Group 4) | `0xC1` Group 4 power response (BCD) |
+| `0x21` | varies | varies | optCmd | mixed | **optCommand requests** (mill1000 Finding 7) — see §3.1.4.3 for per-optCommand type | depends on optCommand |
+| `0x61` | `0x00` | `0xFF` | — | toggle | **Display toggle** | — |
 
 ### Body layout — note on bus path differences
 
@@ -294,7 +298,7 @@ Body (22 bytes, community sources):
   [22] MSG_ID
 ```
 
-#### 3.1.4 optCommand queries (body[4]=optCommand) — Follow Me, extended state, engineering modes
+#### 3.1.4 optCommand requests (body[4]=optCommand) — queries, pushes, and commands
 
 The optCommand mechanism selects query variants (Follow Me temperature push,
 extended state query, engineering modes) via `body[4]`. It appears in two
@@ -369,15 +373,15 @@ On the R/T bus, optCommand=0x01 (Follow Me temperature) was observed in the
 standard 38-byte query (`body[1]=0x81`) — see §3.1.1. The payload encoding
 (`body[5..9]`) is the same in both formats:
 
-| optCommand | Purpose | body[5] | body[6] | body[7] | body[8] | body[9] | Confidence |
-|------------|---------|---------|---------|---------|---------|---------|------------|
-| 0x00 | Sync / normal extended query | 0xFF | 0x00 | 0x00 | 0x00 | 0x00 | Hypothesis |
-| **0x01** | **Follow Me temperature** | `bodyTemp * 2 + 50` | 0x00 | 0x00 | 0x00 | 0x00 | **Consistent** |
-| 0x02 | Special function key | 0xFF | specKey | 0x00 | 0x00 | 0x00 | Hypothesis |
-| **0x03** | **Query extended state** | 0xFF | 0x00 | queryStat | 0x00 | 0x00 | **Consistent** |
-| 0x04 | Installation position | 0xFF | 0x00 | 0x00 | instPos | 0x00 | Hypothesis |
-| 0x05 | Engineering / test mode | 0xFF | 0x00 | 0x00 | 0x00 | testMode | Hypothesis |
-| 0x06 | Max cool/heat freq limit | 0xFF | 0x00 | 0x00 | 0x00 | OR bit 7 | Hypothesis |
+| optCommand | Type | Purpose | body[5] | body[6] | body[7] | body[8] | body[9] | Confidence |
+|------------|------|---------|---------|---------|---------|---------|---------|------------|
+| 0x00 | query | Sync / normal extended query | 0xFF | 0x00 | 0x00 | 0x00 | 0x00 | Hypothesis |
+| **0x01** | **write** | **Follow Me temperature** | `bodyTemp * 2 + 50` | 0x00 | 0x00 | 0x00 | 0x00 | **Consistent** |
+| 0x02 | command | Special function key | 0xFF | specKey | 0x00 | 0x00 | 0x00 | Hypothesis |
+| **0x03** | **query** | **Query extended state** | 0xFF | 0x00 | queryStat | 0x00 | 0x00 | **Consistent** |
+| 0x04 | command | Installation position | 0xFF | 0x00 | 0x00 | instPos | 0x00 | Hypothesis |
+| 0x05 | command | Engineering / test mode | 0xFF | 0x00 | 0x00 | 0x00 | testMode | Hypothesis |
+| 0x06 | command | Max cool/heat freq limit | 0xFF | 0x00 | 0x00 | 0x00 | OR bit 7 | Hypothesis |
 
 Note: optCommand 0x04 places its payload at **body[8]** (not body[7]). optCommand 0x05
 uses **body[9]**. optCommand 0x06 OR's `(maxCoolHeat & 0x01) << 7` into body[9] bit 7.
@@ -416,9 +420,10 @@ Source: mill1000/midea-msmart Finding 7 (see `midea-msmart-mill1000.md`). **Hypo
 | 0x02 | Extended state query | 0xC1 sub-pages 0x01 + 0x02 (see §4.2.3, §4.2.4) |
 | 0x03 | Outdoor-focused query | Unknown response format |
 
-##### 3.1.4.6 Follow Me temperature (body[4]=optCommand 0x01, body[5]=bodyTemp T*2+50) → Response: §4.1 (0xC0)
+##### 3.1.4.6 Follow Me temperature write (body[4]=optCommand 0x01, body[5]=bodyTemp T*2+50) → Response: §4.1 (0xC0)
 
-When Follow Me is enabled (via 0x40 set command body[8] bit 7 = 1), the remote or
+This is a **write** (not a query) — it sends the room temperature to the unit,
+overriding the unit's own thermistor. The unit acknowledges with a 0xC0 response. When Follow Me is enabled (via 0x40 set command body[8] bit 7 = 1), the remote or
 phone periodically sends its measured room temperature using optCommand=0x01.
 
 **Temperature encoding**:
@@ -454,28 +459,22 @@ as the UART extended format. See §3.1.1 for hex example and
 
 The UART and XYE encodings differ. See `protocol_xye.md` §0.4a for the XYE Follow-Me mechanism.
 
-##### 3.1.4.7 Follow Me enable / readback (body[8] bit 7 = Follow Me flag)
+##### 3.1.4.7 Follow Me — cross-command overview
 
-| Direction | Location | Bit | Field | Meaning |
-|-----------|----------|-----|-------|---------|
-| Command (0x40 set) | body[8] | bit 7 | Follow Me (bodySense) | 1 = enable Follow Me |
-| Response (0xC0) | body[8] | bit 7 | Follow Me (bodySense) | 1 = Follow Me active |
-| Response (0xC0) | body[9] | bit 7 | localBodySense | 1 = built-in occupancy sensor active. **Hypothesis** — OQ-17. Own captures: always 0x00 |
+Follow Me uses **two separate commands** working together:
 
-**Three body-sensing feature types** — the source code uses similar-sounding
-names for three distinct features:
+| Step | Command | Field | Type | Section |
+|------|---------|-------|------|---------|
+| 1. Enable | **0x40 Set** (§3.2) | body[8] bit 7 = 1 | write | §3.2 body[8] |
+| 2. Temperature | **0x41 optCommand=0x01** (§3.1.4.6) | body[5] = T*2+50 | write | §3.1.4.6 |
+| Readback | **0xC0 Response** (§4.1) | body[8] bit 7, body[11] = T1 | response | §4.1 |
 
-| Feature | Field name | Location | Function |
-|---------|------------|----------|----------|
-| **Follow Me** | `bodySense` | body[8] bit 7 (SET + RSP) | Overrides the unit's measured temperature with an external value sent via IR remote or serial interface (phone/controller). The unit uses this temperature for its control loop instead of its own thermistor. |
-| **Local body sense** | `localBodySense` | body[9] bit 7 (RSP only) | Occupancy sensor — detects/tracks a person in the room. Exact behavior unknown (acts according to unit settings). Only on models with a built-in sensor. |
-| **Wisdom Eye** | `wisdomEye` | body[9] bit 0 (SET) | Occupancy sensor — detects/tracks a person in the room. Exact behavior unknown. Only on models with a built-in sensor. |
+The enable flag is part of the 0x40 Set command (§3.2), not the 0x41 request.
+The temperature write is an 0x41 optCommand (§3.1.4.6). They are sent as
+separate frames — see `analysis_follow_me_serial.md` for the full lifecycle.
 
-Follow Me is a temperature override mechanism (documented in §3.1.4.6). The
-other two are occupancy sensors — what the unit does when it detects/loses a
-person is unknown from protocol data alone and depends on unit settings and
-model. Our test unit (XtremeSave Blue) does not have a built-in occupancy
-sensor.
+For the three body-sensing feature types (Follow Me vs localBodySense vs
+wisdomEye), see §3.2 body[8]/body[9] field notes.
 
 ##### 3.1.4.8 Hex template (optCommand=0x03, queryStat=0x02, extended state query)
 
@@ -679,7 +678,19 @@ Offset  Offset  Bits        Field
                 bit 4       Low frequency fan (farceWind / low wind)
                 bit 5       Turbo mode (strong) (duplicate, also in byte 10)
                 bit 6       Energy save (energySave)
-                bit 7       Follow Me (bodySense) — confirmed, see §3.1.4.7; OQ-16 resolved
+                bit 7       Follow Me (bodySense) — confirmed; OQ-16 resolved.
+                            Enable via this bit, temperature via §3.1.4.6 (0x41 optCommand=0x01)
+
+**Three body-sensing feature types** — similar-sounding names for distinct features:
+
+| Feature | Field name | Location | Function |
+|---------|------------|----------|----------|
+| **Follow Me** | `bodySense` | body[8] bit 7 (SET + RSP) | Overrides the unit's measured temperature with an external value sent via IR remote or serial interface (phone/controller). The unit uses this temperature for its control loop instead of its own thermistor. Temperature written via 0x41 optCommand=0x01 (§3.1.4.6). |
+| **Local body sense** | `localBodySense` | body[9] bit 7 (RSP only, §4.1) | Occupancy sensor — detects/tracks a person in the room. Exact behavior unknown. Only on models with a built-in sensor. **Hypothesis** — OQ-17. |
+| **Wisdom Eye** | `wisdomEye` | body[9] bit 0 (SET) | Occupancy sensor — detects/tracks a person in the room. Exact behavior unknown. Only on models with a built-in sensor. |
+
+Our test unit (XtremeSave Blue) does not have a built-in occupancy sensor
+(body[9] bit 7 = 0x00 in all captures).
 
   9      19     bit 0       Wise eye / child sleep (NeoAcheron: childSleep)
                 bit 1       Exchange air
