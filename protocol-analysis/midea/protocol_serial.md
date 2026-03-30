@@ -203,9 +203,9 @@ Wi-Fi UART path or to a different firmware generation.
 **Disputed** — the R/T captures show all zeros in those positions. Do not assume
 the Wi-Fi path uses the same values until captured directly.
 
-#### 3.1.1 Status query (body[1]=0x81, body[2]=0x00)
+#### 3.1.1 Status query (body[1]=sub-cmd 0x81, body[2]=variant 0x00) → Response: §4.1 (0xC0)
 
-Triggers a full `0xC0` status response. Captured on R/T bus in Session 1.
+Triggers a full `0xC0` status response (§4.1). Captured on R/T bus in Session 1.
 
 ```
 Body (23 bytes on R/T bus):
@@ -242,7 +242,7 @@ polling cycle while Follow Me is active. It stops during idle periods when
 Follow Me is off but reappears briefly during operator actions (stale
 temperature). See `analysis_follow_me_serial.md` §5 for full evidence.
 
-#### 3.1.2 Capability page query (body[1]=0x81, body[2]=0x01) — Group-Based Dev Params
+#### 3.1.2 Capability page query (body[1]=sub-cmd 0x81, body[2]=variant 0x01, body[3]=pageID) → Response: §4.2 (0xC1 group pages)
 
 Selects a config/capability page for the extension board or wall controller.
 Triggers a `0xC1` group page response (not a `0xC0` status response).
@@ -549,7 +549,7 @@ fields not present in sub-page 0x02.
 
 ---
 
-#### 3.1.3 Power usage query (body[1]=0x21, body[2]=0x01, body[3]=0x44)
+#### 3.1.3 Power usage query (body[1]=sub-cmd 0x21, body[2]=variant 0x01, body[3]=page 0x44) → Response: §4.2.4 (0xC1 Group 4 power)
 
 Triggers a `0xC1` power BCD response. See §4.2.1 for response parsing.
 
@@ -564,7 +564,7 @@ Body (22 bytes, community sources):
   [22] MSG_ID
 ```
 
-#### 3.1.4 optCommand queries — Follow Me, extended state, engineering modes
+#### 3.1.4 optCommand queries (body[4]=optCommand) — Follow Me, extended state, engineering modes
 
 The optCommand mechanism selects query variants (Follow Me temperature push,
 extended state query, engineering modes) via `body[4]`. It appears in two
@@ -577,7 +577,7 @@ frame formats depending on bus:
 
 Confidence: optCommand 0x01 and 0x03 are **Consistent** (multi-source: mill1000/midea-msmart Finding 7 + own R/T captures). All other optCommand values are **Hypothesis** (single source within mill1000/midea-msmart Finding 7, not verified on hardware).
 
-##### 3.1.4.1 UART extended frame layout (24 bytes total)
+##### 3.1.4.1 UART extended frame layout (body[1]=sub-cmd 0x21, 24 bytes)
 
 ```
 Offset  Value               Field
@@ -615,7 +615,7 @@ or 1 (beep). This is one of three independent buzzer mechanisms:
 always (937 0x41 frames, 78 0x40 frames), UART body[1]=0x21 always (11 extended
 frames). The room controller (KJR-120M) beeps locally.
 
-##### 3.1.4.2 Comparison: Standard vs Extended 0x41
+##### 3.1.4.2 Comparison: Standard (body[1]=sub-cmd 0x81) vs Extended (body[1]=sub-cmd 0x21)
 
 | Aspect | Standard 0x41 | Extended 0x41 |
 |--------|---------------|---------------|
@@ -632,7 +632,7 @@ frames). The room controller (KJR-120M) beeps locally.
 format (`body[1]=0x21`) was never observed on the R/T bus (Sessions 3–9).
 See `analysis_follow_me_serial.md` §5 for evidence.
 
-##### 3.1.4.3 optCommand table (body[4])
+##### 3.1.4.3 optCommand table (body[4]=optCommand, body[5..9]=payload)
 
 On the UART bus, optCommand values use the 24-byte extended frame (`body[1]=0x21`).
 On the R/T bus, optCommand=0x01 (Follow Me temperature) was observed in the
@@ -654,7 +654,7 @@ uses **body[9]**. optCommand 0x06 OR's `(maxCoolHeat & 0x01) << 7` into body[9] 
 Source: mill1000/midea-msmart Finding 7 (see `midea-msmart-mill1000.md`).
 optCommand values 0x04-0x06 are single-source and unverified on hardware.
 
-##### 3.1.4.4 Direct C1 sub-page query (CMDTYPE_QUERY_C1_1 / C1_2)
+##### 3.1.4.4 Direct C1 sub-page query (body[1]=sub-page 0x01/0x02, 14 bytes) → Response: §4.3 (0xC1 extended state)
 
 An alternative to optCommand=0x03 — a shorter **14-byte frame** that requests a specific
 C1 sub-page directly by number:
@@ -677,7 +677,7 @@ This bypasses the optCommand/queryStat mechanism entirely. The response is the s
 
 Source: mill1000/midea-msmart Finding 7 (see `midea-msmart-mill1000.md`). **Hypothesis**.
 
-##### 3.1.4.5 queryStat values (body[7] when optCommand=0x03)
+##### 3.1.4.5 queryStat values (body[7]=queryStat when body[4]=optCommand 0x03) → Response: §4.3 (0xC1 extended state)
 
 | queryStat | Purpose | Response |
 |-----------|---------|----------|
@@ -686,7 +686,7 @@ Source: mill1000/midea-msmart Finding 7 (see `midea-msmart-mill1000.md`). **Hypo
 | 0x02 | Extended state query | 0xC1 sub-pages 0x01 + 0x02 (see §4.2.3, §4.2.4) |
 | 0x03 | Outdoor-focused query | Unknown response format |
 
-##### 3.1.4.6 Follow Me temperature (optCommand=0x01)
+##### 3.1.4.6 Follow Me temperature (body[4]=optCommand 0x01, body[5]=bodyTemp T*2+50) → Response: §4.1 (0xC0)
 
 When Follow Me is enabled (via 0x40 set command body[8] bit 7 = 1), the remote or
 phone periodically sends its measured room temperature using optCommand=0x01.
@@ -724,7 +724,7 @@ as the UART extended format. See §3.1.1 for hex example and
 
 The UART and XYE encodings differ. See `protocol_xye.md` §0.4a for the XYE Follow-Me mechanism.
 
-##### 3.1.4.7 Follow Me enable / readback
+##### 3.1.4.7 Follow Me enable / readback (body[8] bit 7 = Follow Me flag)
 
 | Direction | Location | Bit | Field | Meaning |
 |-----------|----------|-----|-------|---------|
@@ -760,7 +760,7 @@ AA 17 AC 00 00 00 00 00 00 03  41 21 00 FF 03 FF 00 02 00 00 00 NN  <CRC> <CHK>
 value but does not decode optCommand names, Follow Me temperature, or queryStat values.
 Enhancement opportunity.
 
-#### 3.1.5 Display toggle (body[1]=0x61)
+#### 3.1.5 Display toggle (body[1]=sub-cmd 0x61)
 
 ```python
 display_toggle_body = [
@@ -899,7 +899,7 @@ Source: mill1000/midea-msmart Finding 14 (see `midea-msmart-mill1000.md`).
 
 ---
 
-### 3.2 Command 0x40 — Set Status
+### 3.2 Command 0x40 — Set Status → Response: §4.1 (0xC0)
 
 ### Body layout (offsets relative to body start = frame offset 10):
 
@@ -1211,7 +1211,7 @@ see `midea-msmart-mill1000.md`):
 
 ---
 
-### 3.3 Command 0x93 — Extension Board / Wall Controller Status
+### 3.3 Command 0x93 — Extension Board / Wall Controller Status → Response: §4.4 (0x93)
 
 Observed on R/T bus (HA/HB via MFB-X, bidirectionalExtensionBoard) in Session 1.
 Appears in both request and response direction. Not documented in any open-source
@@ -1271,7 +1271,7 @@ across captures and may represent per-zone operating status.
 
 ---
 
-### 3.4 Command 0xB5 — Capabilities Query and Response
+### 3.4 Command 0xB5 — Capabilities Query → Response: §4.5 (0xB5)
 
 Two protocol generations exist for capability discovery. The device's `dataType` field
 determines which format is used:
@@ -1451,7 +1451,7 @@ or deviceSN8 variants.
 
 ---
 
-### 3.5 Command 0xB0/0xB1 — Property Protocol (newer devices)
+### 3.5 Command 0xB0/0xB1 — Property Protocol (newer devices) → Response: §4.6 (0xB1)
 
 Source: mill1000/midea-msmart Finding 9 (see `midea-msmart-mill1000.md`).
 All fields: **Hypothesis** — single source within mill1000/midea-msmart Finding 9, not verified against own captures.
@@ -1552,7 +1552,7 @@ decode property IDs by name. Enhancement opportunity.
 
 ## 4. Responses (Appliance → Dongle)
 
-### 4.1 Response 0xC0 — Current AC Status
+### 4.1 Response 0xC0 — Current AC Status ← Triggered by: §3.1.1 (0x41 status query), §3.2 (0x40 set), §3.1.4.6 (Follow Me temp)
 
 The AC responds to 0x40 (set) and 0x41 (query) with a **0xC0** response.
 
@@ -1767,7 +1767,7 @@ data[0x0d]    body[13]    humidity (& 0x7F)
 
 ---
 
-### 4.2 Response 0xC1 — Extended (Group Pages, Power, Extended State)
+### 4.2 Response 0xC1 — Extended (Group Pages, Power, Extended State) ← Triggered by: §3.1.2 (group page query), §3.1.3 (power query), §3.1.4.5 (extended state query)
 
 `body[0] = 0xC1` covers multiple sub-types. **Dispatch by body[1]/body[2] first:**
 
