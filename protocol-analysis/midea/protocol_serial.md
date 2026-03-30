@@ -275,277 +275,7 @@ Page 0x43:  41 81 01 43 00...00 AC
 Note: page 0x45 had 5 response frames in Session 1 but no corresponding `41 81 01 45`
 request was found — possibly a spontaneous / pushed response. **Unknown.**
 
-`0xC1` group page response common header (body[1]=`0x21`, body[2]=`0x01`, body[3]=page echo):
-```
-Page 0x41 response:  C1 21 01 41  [20 data bytes]
-Page 0x42 response:  C1 21 01 42  [20 data bytes]
-Page 0x43 response:  C1 21 01 03  [20 data bytes]  (body[3]=0x03, not 0x43 — see 4b-iii)
-Page 0x45 response:  C1 21 01 45  [16 data bytes]
-```
-
----
-
-##### Group Page 0x41 — Group 1: Base Run Info (R/T bus)
-
-Source: own Session 1 captures (15 frames, 13 unique bodies, R/T bus, 83-second window).
-Field labels from mill1000/midea-msmart (see `midea-msmart-mill1000.md`, Finding 11).
-**Session 6 service menu ground truth** confirms T1, T3, T4 formulas and Tp encoding.
-Cross-session comparison (Sessions 3–8, 329 matched pairs vs XYE byte[22]) confirms Tp.
-
-| Offset | Bytes | Observed values | Field | Encoding | Confidence |
-|--------|-------|-----------------|-------|----------|------------|
-| body[4] | 1 | 0x00, 0x0E, 0x17, 0x20, 0x29 | Compressor actual frequency | raw Hz | Hypothesis |
-| body[5] | 1 | 0x00, 0x0F, 0x1C | Indoor target frequency | raw | Hypothesis |
-| body[6] | 1 | 0x00 or 0x01 | Compressor current | raw (unit unclear) | Hypothesis |
-| body[7] | 1 | 0x01 or 0x02 | Outdoor total current | raw × 4 | Hypothesis |
-| body[8] | 1 | varies | Outdoor supply voltage | raw | Hypothesis |
-| body[9] | 1 | varies | Indoor actual operating mode | raw | Hypothesis |
-| body[10] | 1 | varies | T1 indoor coil temp | (val−30)/2 °C (offset 30) | **Confirmed S6** (raw=0x42→18°C) |
-| body[11] | 1 | varies | T2 temp | (val−30)/2 °C (offset 30) | Hypothesis |
-| body[12] | 1 | varies | T3 outdoor coil temp | (val−50)/2 °C (offset 50) | **Confirmed S6** (raw=0x36→2°C) |
-| body[13] | 1 | varies | T4 outdoor ambient temp | (val−50)/2 °C (offset 50) | **Confirmed S6** (raw=0x3B→4.5°C≈4°C) |
-| body[14] | 1 | 0x1C–0x1E (S1); 0x37–0x4A (S3–S8) | Discharge pipe temp (Tp) | **direct integer °C** | **Confirmed** — S6: raw=0x4A=74→74°C; cross-UART: 329 pairs mean diff −0.02°C |
-| body[15] | 1 | 0x00 | Outdoor DC fan stator flux | raw | Hypothesis |
-| body[16] | 1 | 0x00 | Outdoor voltage (duplicate?) | raw | Hypothesis |
-| body[17] | 1 | 0x00 | Indoor fan stator flux | raw | Hypothesis |
-| body[18..23] | 6 | 0x00 | Beyond Group 1 fields | — | Consistent |
-
-**Previous interpretation corrected**: body[8..9] was previously read as a single
-16-bit LE value (range 991–1515). Finding 11 shows these are **two separate single-byte
-fields** (outdoor voltage + indoor operating mode). Similarly, body[10..13] (previously
-"Unknown — all vary independently") are four individual temperature sensor readings
-(T1–T4) with different offset encodings. body[14] (previously "slow counter") is
-the discharge pipe temperature — the slow increment is consistent with thermal inertia.
-Tp encoding is **direct integer °C**: the outdoor unit MCU applies ucPQTempTab (NTC
-thermistor lookup) internally and transmits the result. The Session 1 low values
-(28–30°C) reflect cold-start warm-up; Sessions 3–8 show 6–74°C under varying load.
-
----
-
-##### Group Page 0x42 — Group 2: Indoor Device Params (R/T bus)
-
-Source: own Session 1 captures, 15 frames, 6 unique bodies.
-Field labels from mill1000/midea-msmart (see `midea-msmart-mill1000.md`, Finding 11).
-All labels **Hypothesis** — single source, not verified at field level against own captures.
-
-```
-Example frames (body[0..25]):
-count=7  C1 21 01 42  00 00 00 00 00 00 00 00 00 01 00 00 00 00 00 00 00 00 00 00  (sentinel)
-count=4  C1 21 01 42  57 57 00 00 00 00 00 00 40 01 00 00 00 00 00 00 00 00 00 00  (18.5/18.5°C)
-count=1  C1 21 01 42  57 4C 00 00 00 00 00 00 40 01 00 00 00 00 00 00 00 00 00 00  (18.5/13.0°C)
-count=1  C1 21 01 42  57 56 00 00 00 00 00 00 40 01 00 00 00 00 00 00 00 00 00 00  (18.5/18.0°C)
-count=1  C1 21 01 42  6B 62 00 00 00 00 00 00 40 01 00 00 00 00 00 00 00 00 00 00  (28.5/24.0°C)
-count=1  C1 21 01 42  6B 6B 00 00 00 00 00 00 40 01 00 00 00 00 00 00 00 00 00 00  (28.5/28.5°C)
-```
-
-**Finding 11 field map (Group 2)** vs own captures — **mismatch**:
-
-Group 2 expects: body[4]=indoor set fan speed (×8 RPM), body[5]=indoor actual fan speed (×8 RPM),
-body[6..8]=indoor fault bytes, body[9..11]=freq-limit bytes, body[12..13]=load state bytes,
-body[14]=E2 param version, body[15..19]=child/smart-eye detection.
-
-Own captures show: body[4..5] = values 0x4C–0x6B consistent with `(val−50)/2` temperature
-encoding (13–28.5 °C), body[12] = 0x40 flag. These values **do not match** Group 2 RPM
-fields (×8 would give 608–856 RPM — plausible but the temperature interpretation also
-fits). The sentinel pattern (body[4]=body[5]=0x00 in 7/15 frames) is unusual for fan speed.
-
-**Status**: Finding 11 Group 2 labels applied provisionally. The R/T bus may use a
-different field layout than the Wi-Fi path for page 0x42. **Disputed** — own captures
-are ambiguous; needs dedicated testing with known fan speed changes.
-
-Previous own-capture analysis (retained for reference):
-
-| Offset | Bytes | Observed values | Own capture label | Confidence |
-|--------|-------|-----------------|-------------------|------------|
-| body[4] | 1 | 0x00 (sentinel) or 0x4C–0x6B | Temperature A: `(val−50)/2` °C; 0x00 = sensor unavailable | Hypothesis |
-| body[5] | 1 | 0x00 (sentinel) or 0x4C–0x6B | Temperature B: `(val−50)/2` °C; 0x00 = sensor unavailable | Hypothesis |
-| body[6..11] | 6 | 0x00 constant | Reserved / unused | Consistent |
-| body[12] | 1 | 0x00 (sentinel) or 0x40 | Data-valid flag: 0x40 when temperature data present | Hypothesis |
-| body[13] | 1 | 0x00 (sentinel) or 0x01 | Correlated with body[12]; meaning unknown | Hypothesis |
-| body[14..23] | 10 | 0x00 constant | Reserved / unused | Consistent |
-
-**Note**: `0x42/0x00` = `prevent_straight_wind` in the 0xB1 property protocol is a
-**different bus protocol layer** — no direct field mapping to R/T bus group pages. **Disputed**.
-
----
-
-##### Group Page 0x43 — Group 3: Outdoor Device Params (R/T bus)
-
-Source: own Session 1 captures, 14 frames, 7 unique bodies. All responses have
-body[3]=`0x03`, not `0x43` — the page ID is not echoed directly.
-Field labels from mill1000/midea-msmart (see `midea-msmart-mill1000.md`, Finding 11).
-
-```
-Example frames (body[0..25]):
-count=5  C1 21 01 03  00 00 00 00 00 08 00 1B 72 AF B3 00 00 00 00 00 00 00 00 00  (sentinel temp)
-count=2  C1 21 01 03  00 00 00 00 00 08 17 32 72 AC B3 00 39 00 00 00 00 00 00 00
-count=2  C1 21 01 03  00 00 00 00 00 08 4C 3E 72 AC B3 00 39 00 00 00 00 00 00 00
-count=2  C1 21 01 03  00 00 00 00 00 08 61 3C 72 AD B3 00 00 00 00 00 00 00 00 00
-```
-
-**body[3] anomaly explained**: body[3]=`0x03` → `0x03 & 0x0F = 3` = Group 3. The group
-dispatch works correctly despite the non-echoed page ID. Finding 11 confirms the
-dispatch uses `body[3] & 0x0F`, not the full byte.
-
-**Finding 11 field map (Group 3)** vs own captures:
-
-| Offset | Bytes | Observed | Finding 11 field | Encoding | Fit with captures | Confidence |
-|--------|-------|----------|------------------|----------|-------------------|------------|
-| body[4..8] | 5 | 0x00 constant | Outdoor device state 1-5 | 8-bit packed flags | Consistent (no outdoor faults) | Hypothesis |
-| body[9] | 1 | 0x08 constant | Outdoor device state 6 | 8-bit packed flags | Consistent (bit3=4-way valve?) | Hypothesis |
-| body[10] | 1 | 0x00/0x17/0x4C/0x61 | Outdoor DC fan speed | raw × 8 RPM → 0/184/608/776 RPM | Plausible | Hypothesis |
-| body[11] | 1 | 0x1B–0x3E | EEV position | raw × 8 steps → 216–496 steps | Plausible | Hypothesis |
-| body[12] | 1 | 0x72 constant | Outdoor return air temp | raw AD value (=114) | Plausible | Hypothesis |
-| body[13] | 1 | 0xA9–0xB3 | Outdoor DC bus voltage | raw (169–179) | Plausible for DC bus | Hypothesis |
-| body[14] | 1 | 0xB3 constant | IPM module temp | raw °C (=179?) | High for °C — **Disputed** | Disputed |
-| body[15] | 1 | 0x00 | Outdoor load state | raw | Consistent (idle) | Hypothesis |
-| body[16] | 1 | 0x00/0x39 | Outdoor target compressor freq | raw Hz (0/57) | Plausible | Hypothesis |
-| body[17..23] | 7 | 0x00 | Beyond Group 3 fields | — | Consistent | — |
-
-**Previous interpretation corrected**: body[10..11] were previously labeled as temperatures
-using `(val−50)/2`. Finding 11 shows they are outdoor DC fan speed (×8 RPM) and EEV
-position (×8 steps). body[12] (0x72=114) was "unknown constant" — now identified as outdoor
-return air temperature (raw AD, not `(val-50)/2`). body[14] (0xB3=179) as IPM temperature
-seems too high for °C — may be a raw AD value requiring a lookup table. **Disputed**.
-
-**Note**: `0x43/0x00` = `gentle_wind_sense` / `prevent_straight_wind_flag` in 0xB1
-property protocol is a **different bus protocol layer**. **Disputed**.
-
----
-
-##### Group Page 0x45 — Group 5: Extended Params (R/T bus)
-
-Source: own Session 1 captures, 5 frames, 5 unique bodies. No corresponding
-`41 81 01 45` request found — possible spontaneous/pushed response.
-Field labels from mill1000/midea-msmart (see `midea-msmart-mill1000.md`, Finding 11).
-
-```
-Example frames (body[0..22], 23 bytes total):
-count=1  C1 21 01 45  00 4A 26 1B 00 1B 00 00 00 00 33 07 00 B7 88 00 04 79 6B
-count=1  C1 21 01 45  00 4A 26 1B 00 1B 00 00 00 00 33 07 00 B7 88 00 DF 0E FB
-count=1  C1 21 01 45  00 52 26 1B 00 1B 00 00 00 00 33 07 00 B7 88 00 25 08 B3
-count=1  C1 21 01 45  00 50 26 1B 61 3E 00 00 00 00 33 07 00 B7 88 00 4D 7A 97
-count=1  C1 21 01 45  00 50 26 1B 61 3E 00 00 00 00 33 07 00 B7 88 00 9E CF F1
-```
-
-**Finding 11 field map (Group 5)** vs own captures:
-
-| Offset | Bytes | Observed | Finding 11 field | Encoding | Fit with captures | Confidence |
-|--------|-------|----------|------------------|----------|-------------------|------------|
-| body[4] | 1 | 0x00 | Humidity | raw % | Consistent (0% = sensor idle?) | Hypothesis |
-| body[5] | 1 | 0x4A/0x50/0x52 | Compensated temp setpoint (Tsc) | raw | 74/80/82 — plausible raw Tsc | Hypothesis |
-| body[6] | 1 | 0x26 | Indoor fan runtime (lo) | 16-bit LE with body[7] | 0x1B26 = 6950 min ≈ 116 h | Hypothesis |
-| body[7] | 1 | 0x1B | Indoor fan runtime (hi) | | — | Hypothesis |
-| body[8] | 1 | 0x00/0x61 | Outdoor fan target speed | raw ×8 → 0/776 RPM | Plausible | Hypothesis |
-| body[9] | 1 | 0x1B/0x3E | EEV target angle | raw ×8 → 216/496 steps | Plausible (correlated with body[8]) | Hypothesis |
-| body[10] | 1 | 0x00 | Defrost step | 0=none | Consistent | Hypothesis |
-| body[11] | 1 | 0x00 | Outdoor state 7 (reserved) | raw | Consistent | Hypothesis |
-| body[12] | 1 | 0x00 | Outdoor state 8 (reserved) | raw | Consistent | Hypothesis |
-| body[13] | 1 | 0x00 | Compressor run time | raw ×64 s | Consistent (idle) | Hypothesis |
-| body[14] | 1 | 0x33 | Compressor cumul. time (lo) | 16-bit LE with body[15] | 0x0733 = 1843 h | Hypothesis |
-| body[15] | 1 | 0x07 | Compressor cumul. time (hi) | | — | Hypothesis |
-| body[16] | 1 | 0x00 | Freq-limit type 2 | raw | Consistent | Hypothesis |
-| body[17] | 1 | 0xB7 | Max bus voltage | raw + 60 → 243 V | Plausible (≈240V mains) | Hypothesis |
-| body[18] | 1 | 0x88 | Min bus voltage | raw + 60 → 196 V | Plausible (sag during startup) | Hypothesis |
-| body[19] | 1 | 0x00 | Beyond Group 5 fields | — | — | — |
-| body[20..22] | 3 | Varies | Frame tail (CRC/checksum area) | not protocol data | Hypothesis |
-
-**Previous unknowns now decoded**: The constant pattern `26 1B ... 33 07 00 B7 88` is
-actually: indoor fan runtime = 6950 min, compressor cumulative runtime = 1843 h,
-max voltage = 243V, min voltage = 196V — all plausible historical counters for a unit
-in service. body[5] (0x4A–0x52) previously guessed as temperature is actually the
-compensated setpoint (Tsc) — a raw internal value, not `(val-50)/2`.
-
-##### Group Page 0x40 — Group 0: Power-On / Run Time Counters
-
-Source: mill1000/midea-msmart Finding 11 (see `midea-msmart-mill1000.md`).
-**Not observed in own captures.** All fields: **Hypothesis**.
-
-`body[3] & 0x0F == 0`. Response contains three sets of day/hour/minute/second counters.
-
-| body[] | Field | Encoding | Notes |
-|--------|-------|----------|-------|
-| [4-5] | Power-on days | 16-bit BE | Time since last power-on |
-| [6] | Power-on hours | raw | |
-| [7] | Power-on minutes | raw | |
-| [8] | Power-on seconds | raw | |
-| [9-10] | Total worked days | 16-bit BE | Cumulative lifetime |
-| [11] | Total worked hours | raw | |
-| [12] | Total worked minutes | raw | |
-| [13] | Total worked seconds | raw | |
-| [14-15] | Current worked days | 16-bit BE | Current session |
-| [16] | Current worked hours | raw | |
-| [17] | Current worked minutes | raw | |
-| [18] | Current worked seconds | raw | |
-
-**Cross-reference**: The A1 heartbeat (§5.2) also carries `curWorkedDay/Hour/Min` at
-body[9-12], but those fields are not implemented on Q11 (always zero). Group 0 may
-provide the same data via the group page path.
-
-**Note**: Days use **16-bit big-endian** byte order — verify whether this is consistent
-with the 16-bit **little-endian** used in Group 5 (indoor fan runtime, compressor time).
-
----
-
-##### Group Page 0x46 — Group 6: Extended Diagnostics
-
-Source: mill1000/midea-msmart Finding 11 (see `midea-msmart-mill1000.md`).
-**Not observed in own captures.** All fields: **Hypothesis**.
-
-`body[3] & 0x0F == 6`. Contains historical peak values and motor control diagnostics.
-
-| body[] | Field | Encoding | Notes |
-|--------|-------|----------|-------|
-| [4] | Max current (historical) | raw | Peak compressor current |
-| [5] | Max T4 temp (historical) | raw | Peak outdoor ambient |
-| [6] | Min T4 temp (historical) | raw | Lowest outdoor ambient |
-| [7] | Cumulative fault count | raw | Lifetime fault counter |
-| [8] | Compressor flux | raw x 8 | Stator magnetic flux |
-| [9] | Fan flux | raw x 8 | Fan motor magnetic flux |
-| [10] | d-axis current | raw x 64 | FOC d-axis component |
-| [11] | q-axis current | raw x 64 | FOC q-axis component |
-| [12] | Compressor peak current | raw | |
-| [13] | PFC peak current | raw | Power factor correction |
-| [14] | Fan peak current | raw | |
-| [15-16] | Torque adjust angle | 16-bit LE | Motor torque compensation |
-| [17] | Torque adjust value | raw x 8 | |
-| [18] | AD calibration voltage 1 | raw x 16 | ADC reference calibration |
-
-**Cross-reference**: Fields [4]-[7] (max current, max/min T4, fault count) overlap with
-Extended State sub-page 0x02 (§4.2.4) body[26]-[29]. Same data, different query path.
-
----
-
-##### Group Page 0x4B — Group 11: Louver / Vane Angles
-
-Source: mill1000/midea-msmart Finding 11 (see `midea-msmart-mill1000.md`).
-**Not observed in own captures.** All fields: **Hypothesis**.
-
-`body[3] & 0x0F == 11` (0x0B). Contains vane/louver swing states and angle limits.
-
-| body[] | Field | Encoding | Notes |
-|--------|-------|----------|-------|
-| [4] bits[1:0] | UD vane swing state | 2-bit | Up-down swing active |
-| [4] bits[3:2] | LR vane swing state | 2-bit | Left-right swing active |
-| [4] bits[5:4] | Top vane swing state | 2-bit | Top louver swing active |
-| [5] | UD vane cool upper limit | raw % | |
-| [6] | UD vane cool lower limit | raw % | |
-| [7] | UD vane heat upper limit | raw % | |
-| [8] | UD vane heat lower limit | raw % | |
-| [9] | UD vane current angle | raw % | Actual position |
-| [10] | LR vane upper limit | raw % | |
-| [11] | LR vane lower limit | raw % | |
-| [12] | LR vane current angle | raw % | Actual position |
-| [13] | Top vane upper limit | raw % | |
-| [14] | Top vane lower limit | raw % | |
-| [15] | Top vane current angle | raw % | Actual position |
-
-**Cross-reference**: Vane angle fields overlap with Extended State sub-page 0x02 (§4.2.4)
-body[49]-[56] (UD/LR vane cool/heat limits and current angles). Group 11 adds top vane
-fields not present in sub-page 0x02.
-
-**Dissector note**: The dissector's `group_page_names` table already lists Group 11 as
-"Wind Blade Control" but no field-level parsing is implemented.
+For group page response field details, see §4.2 (0xC1 Group Pages).
 
 ---
 
@@ -1784,7 +1514,143 @@ top-level sub-type, now unified under the group page dispatcher.
 
 > Do not call all 0xC1 frames "Power Response" — this is incorrect for group-page and extended-state variants.
 
-#### 4.2.1 Power Usage Response — BCD kWh (body[3]=0x44)
+`0xC1` group page response common header (body[1]=`0x21`, body[2]=`0x01`, body[3]=page echo):
+```
+Page 0x41 response:  C1 21 01 41  [20 data bytes]
+Page 0x42 response:  C1 21 01 42  [20 data bytes]
+Page 0x43 response:  C1 21 01 03  [20 data bytes]  (body[3]=0x03, not 0x43 — see Group 3 note)
+Page 0x45 response:  C1 21 01 45  [16 data bytes]
+```
+
+#### 4.2.1 Group 1 (body[3]=0x41) — Base Run Info (R/T bus) ← Triggered by: §3.1.2
+
+Source: own Session 1 captures (15 frames, 13 unique bodies, R/T bus, 83-second window).
+Field labels from mill1000/midea-msmart (see `midea-msmart-mill1000.md`, Finding 11).
+**Session 6 service menu ground truth** confirms T1, T3, T4 formulas and Tp encoding.
+Cross-session comparison (Sessions 3–8, 329 matched pairs vs XYE byte[22]) confirms Tp.
+
+| Offset | Bytes | Observed values | Field | Encoding | Confidence |
+|--------|-------|-----------------|-------|----------|------------|
+| body[4] | 1 | 0x00, 0x0E, 0x17, 0x20, 0x29 | Compressor actual frequency | raw Hz | Hypothesis |
+| body[5] | 1 | 0x00, 0x0F, 0x1C | Indoor target frequency | raw | Hypothesis |
+| body[6] | 1 | 0x00 or 0x01 | Compressor current | raw (unit unclear) | Hypothesis |
+| body[7] | 1 | 0x01 or 0x02 | Outdoor total current | raw × 4 | Hypothesis |
+| body[8] | 1 | varies | Outdoor supply voltage | raw | Hypothesis |
+| body[9] | 1 | varies | Indoor actual operating mode | raw | Hypothesis |
+| body[10] | 1 | varies | T1 indoor coil temp | (val−30)/2 °C (offset 30) | **Confirmed S6** (raw=0x42→18°C) |
+| body[11] | 1 | varies | T2 temp | (val−30)/2 °C (offset 30) | Hypothesis |
+| body[12] | 1 | varies | T3 outdoor coil temp | (val−50)/2 °C (offset 50) | **Confirmed S6** (raw=0x36→2°C) |
+| body[13] | 1 | varies | T4 outdoor ambient temp | (val−50)/2 °C (offset 50) | **Confirmed S6** (raw=0x3B→4.5°C≈4°C) |
+| body[14] | 1 | 0x1C–0x1E (S1); 0x37–0x4A (S3–S8) | Discharge pipe temp (Tp) | **direct integer °C** | **Confirmed** — S6: raw=0x4A=74→74°C; cross-UART: 329 pairs mean diff −0.02°C |
+| body[15] | 1 | 0x00 | Outdoor DC fan stator flux | raw | Hypothesis |
+| body[16] | 1 | 0x00 | Outdoor voltage (duplicate?) | raw | Hypothesis |
+| body[17] | 1 | 0x00 | Indoor fan stator flux | raw | Hypothesis |
+| body[18..23] | 6 | 0x00 | Beyond Group 1 fields | — | Consistent |
+
+**Previous interpretation corrected**: body[8..9] was previously read as a single
+16-bit LE value (range 991–1515). Finding 11 shows these are **two separate single-byte
+fields** (outdoor voltage + indoor operating mode). Similarly, body[10..13] (previously
+"Unknown — all vary independently") are four individual temperature sensor readings
+(T1–T4) with different offset encodings. body[14] (previously "slow counter") is
+the discharge pipe temperature — the slow increment is consistent with thermal inertia.
+Tp encoding is **direct integer °C**: the outdoor unit MCU applies ucPQTempTab (NTC
+thermistor lookup) internally and transmits the result. The Session 1 low values
+(28–30°C) reflect cold-start warm-up; Sessions 3–8 show 6–74°C under varying load.
+
+---
+
+#### 4.2.2 Group 2 (body[3]=0x42) — Indoor Device Params (R/T bus) ← Triggered by: §3.1.2
+
+Source: own Session 1 captures, 15 frames, 6 unique bodies.
+Field labels from mill1000/midea-msmart (see `midea-msmart-mill1000.md`, Finding 11).
+All labels **Hypothesis** — single source, not verified at field level against own captures.
+
+```
+Example frames (body[0..25]):
+count=7  C1 21 01 42  00 00 00 00 00 00 00 00 00 01 00 00 00 00 00 00 00 00 00 00  (sentinel)
+count=4  C1 21 01 42  57 57 00 00 00 00 00 00 40 01 00 00 00 00 00 00 00 00 00 00  (18.5/18.5°C)
+count=1  C1 21 01 42  57 4C 00 00 00 00 00 00 40 01 00 00 00 00 00 00 00 00 00 00  (18.5/13.0°C)
+count=1  C1 21 01 42  57 56 00 00 00 00 00 00 40 01 00 00 00 00 00 00 00 00 00 00  (18.5/18.0°C)
+count=1  C1 21 01 42  6B 62 00 00 00 00 00 00 40 01 00 00 00 00 00 00 00 00 00 00  (28.5/24.0°C)
+count=1  C1 21 01 42  6B 6B 00 00 00 00 00 00 40 01 00 00 00 00 00 00 00 00 00 00  (28.5/28.5°C)
+```
+
+**Finding 11 field map (Group 2)** vs own captures — **mismatch**:
+
+Group 2 expects: body[4]=indoor set fan speed (×8 RPM), body[5]=indoor actual fan speed (×8 RPM),
+body[6..8]=indoor fault bytes, body[9..11]=freq-limit bytes, body[12..13]=load state bytes,
+body[14]=E2 param version, body[15..19]=child/smart-eye detection.
+
+Own captures show: body[4..5] = values 0x4C–0x6B consistent with `(val−50)/2` temperature
+encoding (13–28.5 °C), body[12] = 0x40 flag. These values **do not match** Group 2 RPM
+fields (×8 would give 608–856 RPM — plausible but the temperature interpretation also
+fits). The sentinel pattern (body[4]=body[5]=0x00 in 7/15 frames) is unusual for fan speed.
+
+**Status**: Finding 11 Group 2 labels applied provisionally. The R/T bus may use a
+different field layout than the Wi-Fi path for page 0x42. **Disputed** — own captures
+are ambiguous; needs dedicated testing with known fan speed changes.
+
+Previous own-capture analysis (retained for reference):
+
+| Offset | Bytes | Observed values | Own capture label | Confidence |
+|--------|-------|-----------------|-------------------|------------|
+| body[4] | 1 | 0x00 (sentinel) or 0x4C–0x6B | Temperature A: `(val−50)/2` °C; 0x00 = sensor unavailable | Hypothesis |
+| body[5] | 1 | 0x00 (sentinel) or 0x4C–0x6B | Temperature B: `(val−50)/2` °C; 0x00 = sensor unavailable | Hypothesis |
+| body[6..11] | 6 | 0x00 constant | Reserved / unused | Consistent |
+| body[12] | 1 | 0x00 (sentinel) or 0x40 | Data-valid flag: 0x40 when temperature data present | Hypothesis |
+| body[13] | 1 | 0x00 (sentinel) or 0x01 | Correlated with body[12]; meaning unknown | Hypothesis |
+| body[14..23] | 10 | 0x00 constant | Reserved / unused | Consistent |
+
+**Note**: `0x42/0x00` = `prevent_straight_wind` in the 0xB1 property protocol is a
+**different bus protocol layer** — no direct field mapping to R/T bus group pages. **Disputed**.
+
+---
+
+#### 4.2.3 Group 3 (body[3]=0x43/0x03) — Outdoor Device Params (R/T bus) ← Triggered by: §3.1.2
+
+Source: own Session 1 captures, 14 frames, 7 unique bodies. All responses have
+body[3]=`0x03`, not `0x43` — the page ID is not echoed directly.
+Field labels from mill1000/midea-msmart (see `midea-msmart-mill1000.md`, Finding 11).
+
+```
+Example frames (body[0..25]):
+count=5  C1 21 01 03  00 00 00 00 00 08 00 1B 72 AF B3 00 00 00 00 00 00 00 00 00  (sentinel temp)
+count=2  C1 21 01 03  00 00 00 00 00 08 17 32 72 AC B3 00 39 00 00 00 00 00 00 00
+count=2  C1 21 01 03  00 00 00 00 00 08 4C 3E 72 AC B3 00 39 00 00 00 00 00 00 00
+count=2  C1 21 01 03  00 00 00 00 00 08 61 3C 72 AD B3 00 00 00 00 00 00 00 00 00
+```
+
+**body[3] anomaly explained**: body[3]=`0x03` → `0x03 & 0x0F = 3` = Group 3. The group
+dispatch works correctly despite the non-echoed page ID. Finding 11 confirms the
+dispatch uses `body[3] & 0x0F`, not the full byte.
+
+**Finding 11 field map (Group 3)** vs own captures:
+
+| Offset | Bytes | Observed | Finding 11 field | Encoding | Fit with captures | Confidence |
+|--------|-------|----------|------------------|----------|-------------------|------------|
+| body[4..8] | 5 | 0x00 constant | Outdoor device state 1-5 | 8-bit packed flags | Consistent (no outdoor faults) | Hypothesis |
+| body[9] | 1 | 0x08 constant | Outdoor device state 6 | 8-bit packed flags | Consistent (bit3=4-way valve?) | Hypothesis |
+| body[10] | 1 | 0x00/0x17/0x4C/0x61 | Outdoor DC fan speed | raw × 8 RPM → 0/184/608/776 RPM | Plausible | Hypothesis |
+| body[11] | 1 | 0x1B–0x3E | EEV position | raw × 8 steps → 216–496 steps | Plausible | Hypothesis |
+| body[12] | 1 | 0x72 constant | Outdoor return air temp | raw AD value (=114) | Plausible | Hypothesis |
+| body[13] | 1 | 0xA9–0xB3 | Outdoor DC bus voltage | raw (169–179) | Plausible for DC bus | Hypothesis |
+| body[14] | 1 | 0xB3 constant | IPM module temp | raw °C (=179?) | High for °C — **Disputed** | Disputed |
+| body[15] | 1 | 0x00 | Outdoor load state | raw | Consistent (idle) | Hypothesis |
+| body[16] | 1 | 0x00/0x39 | Outdoor target compressor freq | raw Hz (0/57) | Plausible | Hypothesis |
+| body[17..23] | 7 | 0x00 | Beyond Group 3 fields | — | Consistent | — |
+
+**Previous interpretation corrected**: body[10..11] were previously labeled as temperatures
+using `(val−50)/2`. Finding 11 shows they are outdoor DC fan speed (×8 RPM) and EEV
+position (×8 steps). body[12] (0x72=114) was "unknown constant" — now identified as outdoor
+return air temperature (raw AD, not `(val-50)/2`). body[14] (0xB3=179) as IPM temperature
+seems too high for °C — may be a raw AD value requiring a lookup table. **Disputed**.
+
+**Note**: `0x43/0x00` = `gentle_wind_sense` / `prevent_straight_wind_flag` in 0xB1
+property protocol is a **different bus protocol layer**. **Disputed**.
+
+---
+
+#### 4.2.4 Group 4 (body[3]=0x44) — Power Usage Response — BCD kWh ← Triggered by: §3.1.3
 
 body[0] = `0xC1`, body[3] = `0x44`.
 
@@ -1799,6 +1665,144 @@ Four power fields, each BCD-encoded. `bcd(b) = ((b >> 4) & 0xF) * 10 + (b & 0xF)
 
 Note: nibbles > 9 (e.g. 0xA=10, 0xD=13, 0xF=15) appear in the data and are treated
 as their hex integer value by `bcd()` — effectively hexadecimal digit encoding, not strict BCD.
+
+---
+
+#### 4.2.5 Group 5 (body[3]=0x45) — Extended Params (R/T bus) ← Triggered by: §3.1.2
+
+Source: own Session 1 captures, 5 frames, 5 unique bodies. No corresponding
+`41 81 01 45` request found — possible spontaneous/pushed response.
+Field labels from mill1000/midea-msmart (see `midea-msmart-mill1000.md`, Finding 11).
+
+```
+Example frames (body[0..22], 23 bytes total):
+count=1  C1 21 01 45  00 4A 26 1B 00 1B 00 00 00 00 33 07 00 B7 88 00 04 79 6B
+count=1  C1 21 01 45  00 4A 26 1B 00 1B 00 00 00 00 33 07 00 B7 88 00 DF 0E FB
+count=1  C1 21 01 45  00 52 26 1B 00 1B 00 00 00 00 33 07 00 B7 88 00 25 08 B3
+count=1  C1 21 01 45  00 50 26 1B 61 3E 00 00 00 00 33 07 00 B7 88 00 4D 7A 97
+count=1  C1 21 01 45  00 50 26 1B 61 3E 00 00 00 00 33 07 00 B7 88 00 9E CF F1
+```
+
+**Finding 11 field map (Group 5)** vs own captures:
+
+| Offset | Bytes | Observed | Finding 11 field | Encoding | Fit with captures | Confidence |
+|--------|-------|----------|------------------|----------|-------------------|------------|
+| body[4] | 1 | 0x00 | Humidity | raw % | Consistent (0% = sensor idle?) | Hypothesis |
+| body[5] | 1 | 0x4A/0x50/0x52 | Compensated temp setpoint (Tsc) | raw | 74/80/82 — plausible raw Tsc | Hypothesis |
+| body[6] | 1 | 0x26 | Indoor fan runtime (lo) | 16-bit LE with body[7] | 0x1B26 = 6950 min ≈ 116 h | Hypothesis |
+| body[7] | 1 | 0x1B | Indoor fan runtime (hi) | | — | Hypothesis |
+| body[8] | 1 | 0x00/0x61 | Outdoor fan target speed | raw ×8 → 0/776 RPM | Plausible | Hypothesis |
+| body[9] | 1 | 0x1B/0x3E | EEV target angle | raw ×8 → 216/496 steps | Plausible (correlated with body[8]) | Hypothesis |
+| body[10] | 1 | 0x00 | Defrost step | 0=none | Consistent | Hypothesis |
+| body[11] | 1 | 0x00 | Outdoor state 7 (reserved) | raw | Consistent | Hypothesis |
+| body[12] | 1 | 0x00 | Outdoor state 8 (reserved) | raw | Consistent | Hypothesis |
+| body[13] | 1 | 0x00 | Compressor run time | raw ×64 s | Consistent (idle) | Hypothesis |
+| body[14] | 1 | 0x33 | Compressor cumul. time (lo) | 16-bit LE with body[15] | 0x0733 = 1843 h | Hypothesis |
+| body[15] | 1 | 0x07 | Compressor cumul. time (hi) | | — | Hypothesis |
+| body[16] | 1 | 0x00 | Freq-limit type 2 | raw | Consistent | Hypothesis |
+| body[17] | 1 | 0xB7 | Max bus voltage | raw + 60 → 243 V | Plausible (≈240V mains) | Hypothesis |
+| body[18] | 1 | 0x88 | Min bus voltage | raw + 60 → 196 V | Plausible (sag during startup) | Hypothesis |
+| body[19] | 1 | 0x00 | Beyond Group 5 fields | — | — | — |
+| body[20..22] | 3 | Varies | Frame tail (CRC/checksum area) | not protocol data | Hypothesis |
+
+**Previous unknowns now decoded**: The constant pattern `26 1B ... 33 07 00 B7 88` is
+actually: indoor fan runtime = 6950 min, compressor cumulative runtime = 1843 h,
+max voltage = 243V, min voltage = 196V — all plausible historical counters for a unit
+in service. body[5] (0x4A–0x52) previously guessed as temperature is actually the
+compensated setpoint (Tsc) — a raw internal value, not `(val-50)/2`.
+
+#### 4.2.6 Group 0 (body[3]=0x40) — Power-On / Run Time Counters
+
+Source: mill1000/midea-msmart Finding 11 (see `midea-msmart-mill1000.md`).
+**Not observed in own captures.** All fields: **Hypothesis**.
+
+`body[3] & 0x0F == 0`. Response contains three sets of day/hour/minute/second counters.
+
+| body[] | Field | Encoding | Notes |
+|--------|-------|----------|-------|
+| [4-5] | Power-on days | 16-bit BE | Time since last power-on |
+| [6] | Power-on hours | raw | |
+| [7] | Power-on minutes | raw | |
+| [8] | Power-on seconds | raw | |
+| [9-10] | Total worked days | 16-bit BE | Cumulative lifetime |
+| [11] | Total worked hours | raw | |
+| [12] | Total worked minutes | raw | |
+| [13] | Total worked seconds | raw | |
+| [14-15] | Current worked days | 16-bit BE | Current session |
+| [16] | Current worked hours | raw | |
+| [17] | Current worked minutes | raw | |
+| [18] | Current worked seconds | raw | |
+
+**Cross-reference**: The A1 heartbeat (§5.2) also carries `curWorkedDay/Hour/Min` at
+body[9-12], but those fields are not implemented on Q11 (always zero). Group 0 may
+provide the same data via the group page path.
+
+**Note**: Days use **16-bit big-endian** byte order — verify whether this is consistent
+with the 16-bit **little-endian** used in Group 5 (indoor fan runtime, compressor time).
+
+---
+
+#### 4.2.7 Group 6 (body[3]=0x46) — Extended Diagnostics
+
+Source: mill1000/midea-msmart Finding 11 (see `midea-msmart-mill1000.md`).
+**Not observed in own captures.** All fields: **Hypothesis**.
+
+`body[3] & 0x0F == 6`. Contains historical peak values and motor control diagnostics.
+
+| body[] | Field | Encoding | Notes |
+|--------|-------|----------|-------|
+| [4] | Max current (historical) | raw | Peak compressor current |
+| [5] | Max T4 temp (historical) | raw | Peak outdoor ambient |
+| [6] | Min T4 temp (historical) | raw | Lowest outdoor ambient |
+| [7] | Cumulative fault count | raw | Lifetime fault counter |
+| [8] | Compressor flux | raw x 8 | Stator magnetic flux |
+| [9] | Fan flux | raw x 8 | Fan motor magnetic flux |
+| [10] | d-axis current | raw x 64 | FOC d-axis component |
+| [11] | q-axis current | raw x 64 | FOC q-axis component |
+| [12] | Compressor peak current | raw | |
+| [13] | PFC peak current | raw | Power factor correction |
+| [14] | Fan peak current | raw | |
+| [15-16] | Torque adjust angle | 16-bit LE | Motor torque compensation |
+| [17] | Torque adjust value | raw x 8 | |
+| [18] | AD calibration voltage 1 | raw x 16 | ADC reference calibration |
+
+**Cross-reference**: Fields [4]-[7] (max current, max/min T4, fault count) overlap with
+Extended State sub-page 0x02 (§4.3.2) body[26]-[29]. Same data, different query path.
+
+---
+
+#### 4.2.8 Group 11 (body[3]=0x4B) — Louver / Vane Angles
+
+Source: mill1000/midea-msmart Finding 11 (see `midea-msmart-mill1000.md`).
+**Not observed in own captures.** All fields: **Hypothesis**.
+
+`body[3] & 0x0F == 11` (0x0B). Contains vane/louver swing states and angle limits.
+
+| body[] | Field | Encoding | Notes |
+|--------|-------|----------|-------|
+| [4] bits[1:0] | UD vane swing state | 2-bit | Up-down swing active |
+| [4] bits[3:2] | LR vane swing state | 2-bit | Left-right swing active |
+| [4] bits[5:4] | Top vane swing state | 2-bit | Top louver swing active |
+| [5] | UD vane cool upper limit | raw % | |
+| [6] | UD vane cool lower limit | raw % | |
+| [7] | UD vane heat upper limit | raw % | |
+| [8] | UD vane heat lower limit | raw % | |
+| [9] | UD vane current angle | raw % | Actual position |
+| [10] | LR vane upper limit | raw % | |
+| [11] | LR vane lower limit | raw % | |
+| [12] | LR vane current angle | raw % | Actual position |
+| [13] | Top vane upper limit | raw % | |
+| [14] | Top vane lower limit | raw % | |
+| [15] | Top vane current angle | raw % | Actual position |
+
+**Cross-reference**: Vane angle fields overlap with Extended State sub-page 0x02 (§4.3.2)
+body[49]-[56] (UD/LR vane cool/heat limits and current angles). Group 11 adds top vane
+fields not present in sub-page 0x02.
+
+**Dissector note**: The dissector's `group_page_names` table already lists Group 11 as
+"Wind Blade Control" but no field-level parsing is implemented.
+
+---
 
 ## 5. Notifications (Mainboard → Dongle, unsolicited)
 
