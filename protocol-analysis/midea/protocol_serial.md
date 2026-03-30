@@ -730,18 +730,9 @@ def parse_power_group4(body):
 
 ---
 
-#### 4.2.2 Group Page Response — R/T Bus Group-Based Dev Params (body[1]=0x21, body[2]=0x01)
+### 4.3 Response 0xC1 — Extended State (body[1]=0x01 or 0x02) ← Triggered by: §3.1.4.4 (direct C1 query), §3.1.4.5 (queryStat=0x02)
 
-These are "device development parameter" group pages, dispatched by `body[3] & 0x0F`
-as group number (see mill1000/midea-msmart, `midea-msmart-mill1000.md`,
-Finding 11). Field-level documentation for each observed page is in **§3.1.2**
-(Group Page sub-sections). The dissector calls `decode_c1_group1()` for
-page 0x41 (Group 1: base run info); pages 0x42, 0x43, and 0x45 show raw hex with a
-page label.
-
----
-
-#### 4.2.3 Extended State Sub-page 0x01 — Sensor Temperatures, Fault Flags, Operating State
+#### 4.3.1 Extended State Sub-page 0x01 — Sensor Temperatures, Fault Flags, Operating State
 
 Source: mill1000/midea-msmart Finding 8 (see `midea-msmart-mill1000.md`). **Not present in dudanov/MideaUART, reneklootwijk/node-mideahvac,
 or ESPHome.** All fields: **Hypothesis** — not verified against own captures.
@@ -831,7 +822,7 @@ both indoor and outdoor. Three different encodings for the same physical sensors
 
 ---
 
-#### 4.2.4 Extended State Sub-page 0x02 — Status Flags, Timers, Power, Vane Angles, Compressor
+#### 4.3.2 Extended State Sub-page 0x02 — Status Flags, Timers, Power, Vane Angles, Compressor
 
 Source: mill1000/midea-msmart Finding 8 (see `midea-msmart-mill1000.md`).
 All fields: **Hypothesis** — not verified against own captures.
@@ -967,37 +958,7 @@ Poll (msg_type=0x03):  93 00 80 84 00...00 17
 Set  (msg_type=0x02):  93 80 80 84 00...00 B2
 ```
 
-### Response body (30 bytes, R/T bus)
-
-```
-[0]   0x93
-[1]   0x00
-[2]   0x00
-[3]   0x84 / 0x94 / 0x00  (varies — possibly a status code)
-[4..8]   0x00
-[9]   0x10
-[10]  0x30
-[11]  0x05
-[12]  0x00
-[13]  0x02
-[14]  0x30
-[15]  0x0E
-[16]  0x00
-[17]  0xBC  (constant across all responses)
-[18]  0xD6  (constant)
-[19]  0x60 / 0x64  (varies slightly)
-[20..23]  0x00
-[24..27]  0x80 0x80 0x80 0x80  (4-zone status? all 0x80 = nominal?)
-[28..29]  0x00
-```
-
-Captured responses:
-```
-55 BC 28 AC ... C1 21 01 41 00 00 00 00 00 10 30 05 00 02 30 0E 00 BC D6 60 00 00 00 00 80 80 80 80 00 00
-```
-
-Field meanings are **Unknown**. The four `0x80` bytes at body[24..27] are consistent
-across captures and may represent per-zone operating status.
+For response body format, see §4.4.
 
 ---
 
@@ -1801,6 +1762,40 @@ fields not present in sub-page 0x02.
 
 **Dissector note**: The dissector's `group_page_names` table already lists Group 11 as
 "Wind Blade Control" but no field-level parsing is implemented.
+
+---
+
+### 4.4 Response 0x93 — Extension Board Status (30 bytes, R/T bus) ← Triggered by: §3.3 (0x93 request)
+
+```
+[0]   0x93
+[1]   0x00
+[2]   0x00
+[3]   0x84 / 0x94 / 0x00  (varies — possibly a status code)
+[4..8]   0x00
+[9]   0x10
+[10]  0x30
+[11]  0x05
+[12]  0x00
+[13]  0x02
+[14]  0x30
+[15]  0x0E
+[16]  0x00
+[17]  0xBC  (constant across all responses)
+[18]  0xD6  (constant)
+[19]  0x60 / 0x64  (varies slightly)
+[20..23]  0x00
+[24..27]  0x80 0x80 0x80 0x80  (4-zone status? all 0x80 = nominal?)
+[28..29]  0x00
+```
+
+Captured responses:
+```
+55 BC 28 AC ... C1 21 01 41 00 00 00 00 00 10 30 05 00 02 30 0E 00 BC D6 60 00 00 00 00 80 80 80 80 00 00
+```
+
+Field meanings are **Unknown**. The four `0x80` bytes at body[24..27] are consistent
+across captures and may represent per-zone operating status.
 
 ---
 
